@@ -1,0 +1,1 @@
+INSERT INTO flow_definition_revisions (flow_id, revision, name, graph_json, blackboard_defaults_json, blackboard_bindings_json, editor_metadata_json, automatic_enabled, workspace_mapping_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)

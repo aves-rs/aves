@@ -1,0 +1,73 @@
+# general
+.ignore
+.DS_store
+.direnv
+
+# Rust
+target
+target/
+**/*.rs.bk
+*.pdb
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage
+lib-cov
+coverage
+*.lcov
+
+# Compiled binary addons (https://nodejs.org/api/addons.html)
+build/
+build
+
+# various cache
+.cache
+
+# node-waf configuration
+.lock-wscript
+
+# dotenv environment variables file
+.env.test
+.env.dev
+.env.local
+.env.development
+
+# rust stuff
+notes.txt
+
+# vscode
+.vscode/*
+!.vscode/tasks.json
+!.vscode/settings.json
+
+# JetBrains
+.idea/
+
+# my stuff (whoever i may be)
+.mine/
+
+# agent stuff
+.opencode/
+.opencode
+opencode.jsonc
+.tmp/
+.tmp
+.claude/
+.cortexkit/
+.delta/
+.docs/external/
+ARCHITECTURE.md
+STRUCTURE.md

@@ -1,0 +1,22 @@
+[package]
+name = "aves_macros"
+version = "0.5.0"
+repository = "https://github.com/aves-rs/aves"
+description = "Procedural macros for the Aves async application runtime"
+authors = { workspace = true }
+edition = { workspace = true }
+keywords = ["aves", "macros", "rpc", "async"]
+categories = ["development-tools::procedural-macro-helpers"]
+readme = "../README.md"
+publish = ["crates-io"]
+include = ["Cargo.toml", "src/**"]
+rust-version = "1.97"
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }

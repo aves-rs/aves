@@ -1,0 +1,1 @@
+SELECT request_id, connection_id, provider_message_id, destination, request_text, expires_at, flow_execution_id, flow_node_id, status, provider_receipt, decided_at, outstanding_edit FROM permission_requests WHERE request_id = ?1;

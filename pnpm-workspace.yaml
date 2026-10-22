@@ -1,0 +1,23 @@
+packages:
+  - "pkg/hades"
+
+packageConfigs:
+  "pkg/hades":
+    saveExact: true
+
+allowBuilds:
+  "@evilmartians/lefthook-installer": true
+
+ignoredBuiltDependencies:
+  - "@evilmartians/lefthook-installer"
+
+minimumReleaseAgeExclude:
+  - '@turbo/darwin-64@2.10.12'
+  - '@turbo/darwin-arm64@2.10.12'
+  - '@turbo/linux-64@2.10.12'
+  - '@turbo/linux-arm64@2.10.12'
+  - '@turbo/windows-64@2.10.12'
+  - '@turbo/windows-arm64@2.10.12'
+  - '@tanstack/query-core@5.102.5'
+  - '@tanstack/react-query@5.102.5'
+  - turbo@2.10.12

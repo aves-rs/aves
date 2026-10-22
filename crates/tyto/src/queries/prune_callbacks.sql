@@ -1,0 +1,1 @@
+DELETE FROM permission_callbacks WHERE EXISTS (SELECT 1 FROM messaging_connections c WHERE c.id = permission_callbacks.connection_id AND permission_callbacks.received_at + c.retention_seconds <= ?1) OR (NOT EXISTS (SELECT 1 FROM messaging_connections c WHERE c.id = permission_callbacks.connection_id) AND permission_callbacks.expires_at <= ?1);

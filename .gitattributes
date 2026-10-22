@@ -1,0 +1,7 @@
+.agents/** linguist-documentation
+.cursor/** linguist-documentation
+docs/** linguist-documentation
+
+.github/** linguist-vendored
+.husky/** linguist-vendored
+.vscode/** linguist-vendored

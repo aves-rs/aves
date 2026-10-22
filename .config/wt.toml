@@ -1,0 +1,37 @@
+[[pre-start]]
+direnv = "direnv allow"
+agents_config = "ln -sf {{ repo_path }}/opencode.jsonc opencode.jsonc"
+agents_tmp = "ln -sf {{ repo_path }}/.tmp .tmp"
+
+# Post-Start: Runs in BACKGROUND after worktree creation (parallel)
+# Use for: dev servers, file watchers, background builds
+[post-start]
+rust = "pnpm zedy:r"
+typescript = "pnpm zedy:t"
+
+# Post-Switch: Runs in BACKGROUND after every switch (parallel)
+# Use for: terminal tab naming, tmux window titles, IDE notifications
+[post-switch]
+title = "echo -ne '\\033]0;{{ branch }}\\007'"
+
+# Pre-Commit: Runs before committing during merge, BLOCKS (fail-fast)
+# Use for: formatters, linters, quick checks
+#
+# [pre-commit]
+# lint = "pnpm lint"
+
+# Pre-Merge: Runs before merging to target, BLOCKS (fail-fast)
+# Use for: tests, build verification
+#
+# [pre-merge]
+# lint = "pnpm lint"
+
+# Post-Merge: Runs after successful merge, BLOCKS
+# Use for: deployment, notifications
+[post-merge]
+message = "echo 'Merged {{ branch }} to {{ target }}'"
+
+# Pre-Remove: Runs before worktree removal, BLOCKS (fail-fast)
+# Use for: cleanup, stopping services
+[pre-remove]
+message = "echo 'Removed {{ branch }}'"

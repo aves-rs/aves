@@ -1,0 +1,1 @@
+DELETE FROM inbound_messages WHERE EXISTS (SELECT 1 FROM messaging_connections c WHERE c.id = inbound_messages.connection_id AND inbound_messages.received_at + c.retention_seconds <= ?1) OR (NOT EXISTS (SELECT 1 FROM messaging_connections c WHERE c.id = inbound_messages.connection_id) AND inbound_messages.expires_at <= ?1);

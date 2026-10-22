@@ -1,0 +1,57 @@
+[package]
+name = "aves-corv"
+version = "0.5.0"
+repository = "https://github.com/aves-rs/aves"
+description = "Specialized discussion domain for the Aves async application runtime"
+authors = { workspace = true }
+edition = { workspace = true }
+keywords = ["async", "runtime", "actors", "rpc", "workflow"]
+categories = ["asynchronous"]
+readme = "README.md"
+publish = ["crates-io"]
+include = ["Cargo.toml", "README.md", "src/**", "migrations/**"]
+rust-version = "1.97"
+license = "Apache-2.0"
+
+[lib]
+name = "corv"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+
+[build-dependencies]
+
+[dev-dependencies]
+# internal
+aves = { path = "../aves", version = "=0.5.0", features = ["test-support"] }
+
+# external
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+
+[dependencies]
+# internal
+aves = { path = "../aves", version = "=0.5.0" }
+
+# external
+agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp"] }
+async-trait = { workspace = true }
+axum08 = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+rmcp = { workspace = true }
+rspc = { workspace = true }
+schemars = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+specta = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+turso = { workspace = true }
+uuid = { workspace = true }
+yaml_serde = { workspace = true }

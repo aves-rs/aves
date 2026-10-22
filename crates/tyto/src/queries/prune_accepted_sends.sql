@@ -1,0 +1,1 @@
+DELETE FROM accepted_sends WHERE EXISTS (SELECT 1 FROM messaging_connections c WHERE c.id = accepted_sends.connection_id AND accepted_sends.received_at + c.retention_seconds <= ?1) OR (NOT EXISTS (SELECT 1 FROM messaging_connections c WHERE c.id = accepted_sends.connection_id) AND accepted_sends.expires_at <= ?1);

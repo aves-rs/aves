@@ -1,0 +1,104 @@
+[workspace]
+members = [
+  "crates/aves",
+  "crates/aves/macros",
+  "crates/corv",
+  "crates/kea",
+  "crates/tyto",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Aves Authors <engineering@sluice.trade>"]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+agent-client-protocol = { version = "=3.4.0" }
+async-imap = { version = "=0.12.0", default-features = false, features = [
+  "runtime-tokio",
+  "tokio",
+] }
+async-trait = { version = "=0.1.92" }
+axum = { version = "=0.7.9" } # limited by rspc-axum's version
+axum08 = { package = "axum", version = "=0.8.9", default-features = false, features = [
+  "http1",
+  "json",
+  "tokio",
+] }
+base64 = { version = "=0.23.1" }
+bonsai-bt = { version = "=0.14.0" }
+chrono = { version = "=0.4.45", features = ["serde"] }
+croner = { version = "=4.0.1" }
+futures-util = { version = "=0.3.34" }
+iroh = { version = "=1.4.1" }
+iroh-blobs = { version = "=0.103.1", default-features = false, features = ["fs-store"] }
+iroh-docs = { version = "=0.101.0", default-features = false, features = ["fs-store"] }
+iroh-gossip = { version = "=0.101.0" }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rust_crypto"] }
+keyring = { version = "=4.2.0", features = ["v1"] }
+keyring-core = { version = "=1.0.1" }
+lettre = { version = "=0.11.23", default-features = false, features = [
+  "tokio1",
+  "tokio1-native-tls",
+  "smtp-transport",
+  "builder",
+] }
+mail-parser = { version = "=0.11.9" }
+native-tls = { version = "=0.2.18" }
+oxc = { version = "=0.155.0", features = [
+  "codegen",
+  "semantic",
+  "transformer",
+] }
+pkcs8 = { version = "=0.11.0", features = ["alloc"] }
+rand = { version = "=0.10.3" }
+proc-macro2 = { version = "=1.0.107" }
+quote = { version = "=1.0.47" }
+syn = { version = "=3.0.9", features = ["full"] }
+rmcp = { version = "=3.6.0", features = [
+  "macros",
+  "server",
+  "transport-io",
+  "transport-streamable-http-server",
+] }
+rspc = { version = "=0.4.1", features = [
+  "typescript",
+] } # when this goes up, seee specta and specta-typescript
+rspc-axum = { version = "=0.3.0" }
+rust_decimal = { version = "=1.43.0" }
+schemars = { version = "=1.2.3" }
+semver = { version = "=1.0.28" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154" }
+sha2 = { version = "=0.11.1" }
+slack-morphism = { version = "=2.31.0", default-features = false, features = [
+  "hyper",
+] }
+specta = { version = "=2.0.0-rc.22", features = [ # rspc allows no higher
+  "derive",
+  "serde_json",
+] }
+teloxide-core = { version = "=0.13.0", default-features = false, features = [
+  "rustls",
+] }
+tempfile = { version = "=3.27.0" }
+thiserror = { version = "=2.0.21" }
+tokio = { version = "=1.53.1", features = ["full"] } # 1.54.0 was yanked :shrug:
+tokio-native-tls = { version = "=0.3.1" }
+tokio-stream = { version = "=0.1.19" }
+tokio-util = { version = "=0.7.20" }
+tower = { version = "=0.5.3" }
+toml = { version = "=1.1.8" }
+tracing = { version = "=0.1.44" }
+turbovault-core = { version = "=4.0.1" }
+turbovault-parser = { version = "=4.0.1" }
+turbovault-tools = { version = "=4.0.1" }
+turbovault-vault = { version = "=4.0.1" }
+turso = { version = "=0.8.3", default-features = false }
+url = { version = "=2.5.8" }
+uuid = { version = "=1.28.0", features = ["serde", "v4"] }
+wasmtime = { version = "=50.0.0" }
+wasmtime-wasi = { version = "=50.0.0", features = ["p1"] }
+yaml_serde = { version = "=0.10.7" }
+zeroize = { version = "=1.9.1", features = ["derive"] }

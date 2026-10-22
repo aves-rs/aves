@@ -1,0 +1,74 @@
+[package]
+name = "aves"
+version = "0.5.0"
+repository = "https://github.com/aves-rs/aves"
+description = "Typed async application runtime with domain messaging, RPC, and durable workflow automation"
+authors = { workspace = true }
+edition = { workspace = true }
+keywords = ["async", "runtime", "actors", "rpc", "workflow"]
+categories = ["asynchronous"]
+readme = "README.md"
+publish = ["crates-io"]
+include = ["Cargo.toml", "README.md", "src/**"]
+rust-version = "1.97"
+license = "Apache-2.0"
+
+[lib]
+name = "aves"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["keyring", "wasm-tests"]
+# Runs tests that require an available desktop OS keyring; headless CI disables default features.
+keyring = []
+# Runs tests that execute the QuickJS-in-Wasmtime guest; headless CI disables default features.
+wasm-tests = []
+# Exposes test fixtures used by downstream crate test builds.
+test-support = []
+
+[build-dependencies]
+
+[dev-dependencies]
+keyring-core = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+
+[dependencies]
+# internal
+aves_macros = { path = "macros", version = "=0.5.0" }
+
+# external
+async-trait = { workspace = true }
+axum = { workspace = true }
+bonsai-bt = { workspace = true }
+oxc = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+croner = { workspace = true }
+futures-util = { workspace = true }
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-docs = { workspace = true }
+iroh-gossip = { workspace = true }
+jsonwebtoken = { workspace = true }
+keyring = { workspace = true }
+pkcs8 = { workspace = true }
+rspc = { workspace = true }
+rand = { workspace = true }
+rust_decimal = { workspace = true }
+rspc-axum = { workspace = true }
+sha2 = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+specta = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+turso = { workspace = true }
+uuid = { workspace = true }
+toml = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+zeroize = { workspace = true }

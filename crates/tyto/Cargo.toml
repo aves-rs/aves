@@ -1,0 +1,59 @@
+[package]
+name = "aves-tyto"
+version = "0.5.0"
+repository = "https://github.com/aves-rs/aves"
+description = "Specialized messaging domain for the Aves async application runtime"
+authors = { workspace = true }
+edition = { workspace = true }
+keywords = ["async", "runtime", "actors", "rpc", "workflow"]
+categories = ["asynchronous"]
+readme = "README.md"
+publish = ["crates-io"]
+include = ["Cargo.toml", "README.md", "src/**", "migrations/**"]
+rust-version = "1.97"
+license = "Apache-2.0"
+
+[lib]
+name = "tyto"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+
+[build-dependencies]
+
+[dev-dependencies]
+# internal
+aves = { path = "../aves", version = "=0.5.0", features = ["test-support"] }
+
+# external
+tempfile = { workspace = true }
+
+[dependencies]
+# internal
+aves = { path = "../aves", version = "=0.5.0" }
+aves-kea = { path = "../kea", version = "=0.5.0" }  # needed for "save to" functionality
+
+# external
+async-imap = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+lettre = { workspace = true }
+mail-parser = { workspace = true }
+native-tls = { workspace = true }
+rspc = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slack-morphism = { workspace = true }
+specta = { workspace = true }
+teloxide-core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-native-tls = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+turso = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }

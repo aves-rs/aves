@@ -1,0 +1,1 @@
+INSERT INTO flow_node_executions (execution_id, node_execution_id, flow_id, revision, node_id, status, state_json, inputs_json, outputs_json, started_at, updated_at, completed_at, error_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)

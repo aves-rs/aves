@@ -1,0 +1,1 @@
+SELECT execution_id, flow_id, revision, blackboard_json, workspace_roots_json, reconstruction_state_json, scratchpad_json, observer_state_json, started_at, workspace_checkpoint_json, workspace_entries_json, imported_workspace_root_json FROM flow_executions ORDER BY started_at

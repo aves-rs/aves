@@ -7,9 +7,9 @@ authors = { workspace = true }
 edition = { workspace = true }
 keywords = ["aves", "macros", "rpc", "async"]
 categories = ["development-tools::procedural-macro-helpers"]
-readme = "../README.md"
+readme = "../../../README.md"
 publish = ["crates-io"]
-include = ["Cargo.toml", "src/**"]
+include = ["Cargo.toml", "../../../README.md", "src/**"]
 rust-version = "1.97"
 license = "Apache-2.0"
 

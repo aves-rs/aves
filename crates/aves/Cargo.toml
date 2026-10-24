@@ -9,7 +9,7 @@ keywords = ["async", "runtime", "actors", "rpc", "workflow"]
 categories = ["asynchronous"]
 readme = "README.md"
 publish = ["crates-io"]
-include = ["Cargo.toml", "README.md", "src/**"]
+include = ["Cargo.toml", "../../README.md", "src/**"]
 rust-version = "1.97"
 license = "Apache-2.0"
 

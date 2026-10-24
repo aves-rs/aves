@@ -6,8 +6,7 @@ agents_tmp = "ln -sf {{ repo_path }}/.tmp .tmp"
 # Post-Start: Runs in BACKGROUND after worktree creation (parallel)
 # Use for: dev servers, file watchers, background builds
 [post-start]
-rust = "pnpm zedy:r"
-typescript = "pnpm zedy:t"
+rust = "cargo check && cargo test"
 
 # Post-Switch: Runs in BACKGROUND after every switch (parallel)
 # Use for: terminal tab naming, tmux window titles, IDE notifications

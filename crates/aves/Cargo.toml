@@ -7,7 +7,7 @@ authors = { workspace = true }
 edition = { workspace = true }
 keywords = ["async", "runtime", "actors", "rpc", "workflow"]
 categories = ["asynchronous"]
-readme = "README.md"
+readme = "../../README.md"
 publish = ["crates-io"]
 include = ["Cargo.toml", "../../README.md", "src/**"]
 rust-version = "1.97"

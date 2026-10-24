@@ -29,7 +29,7 @@ jobs:
           rustflags: ""
           components: clippy,rustfmt
           cache: true
-          cache-shared-key: sluice-v1
+          cache-shared-key: aves-v1
           cache-workspace-crates: true
           cache-on-failure: true
 

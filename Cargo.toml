@@ -14,7 +14,7 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
-agent-client-protocol = { version = "=3.4.0" }
+agent-client-protocol = { version = "=3.5.0" }
 async-imap = { version = "=0.12.0", default-features = false, features = [
   "runtime-tokio",
   "tokio",
@@ -29,7 +29,7 @@ axum08 = { package = "axum", version = "=0.8.9", default-features = false, featu
 base64 = { version = "=0.23.1" }
 bonsai-bt = { version = "=0.14.0" }
 chrono = { version = "=0.4.45", features = ["serde"] }
-croner = { version = "=4.0.1" }
+croner = { version = "=4.0.2" }
 futures-util = { version = "=0.3.34" }
 iroh = { version = "=1.4.1" }
 iroh-blobs = { version = "=0.103.1", default-features = false, features = ["fs-store"] }
@@ -56,7 +56,7 @@ rand = { version = "=0.10.3" }
 proc-macro2 = { version = "=1.0.107" }
 quote = { version = "=1.0.47" }
 syn = { version = "=3.0.9", features = ["full"] }
-rmcp = { version = "=3.6.0", features = [
+rmcp = { version = "=3.7.0", features = [
   "macros",
   "server",
   "transport-io",
@@ -72,7 +72,7 @@ semver = { version = "=1.0.28" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154" }
 sha2 = { version = "=0.11.1" }
-slack-morphism = { version = "=2.31.0", default-features = false, features = [
+slack-morphism = { version = "=2.31.1", default-features = false, features = [
   "hyper",
 ] }
 specta = { version = "=2.0.0-rc.22", features = [ # rspc allows no higher
@@ -84,7 +84,7 @@ teloxide-core = { version = "=0.13.0", default-features = false, features = [
 ] }
 tempfile = { version = "=3.27.0" }
 thiserror = { version = "=2.0.21" }
-tokio = { version = "=1.53.1", features = ["full"] } # 1.54.0 was yanked :shrug:
+tokio = { version = "=1.54.1", features = ["full"] }
 tokio-native-tls = { version = "=0.3.1" }
 tokio-stream = { version = "=0.1.19" }
 tokio-util = { version = "=0.7.20" }
@@ -97,7 +97,7 @@ turbovault-tools = { version = "=4.0.1" }
 turbovault-vault = { version = "=4.0.1" }
 turso = { version = "=0.8.3", default-features = false }
 url = { version = "=2.5.8" }
-uuid = { version = "=1.28.0", features = ["serde", "v4"] }
+uuid = { version = "=1.29.0", features = ["serde", "v4"] }
 wasmtime = { version = "=50.0.0" }
 wasmtime-wasi = { version = "=50.0.0", features = ["p1"] }
 yaml_serde = { version = "=0.10.7" }

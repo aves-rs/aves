@@ -31,7 +31,7 @@ use domain::{DiscussKernelServices, DiscussProviderConfigSudoServiceImpl, Discus
 
 pub use boot::DiscussBootOptions;
 pub use domain::{DiscussDomain, DiscussStreamingService};
-pub use elicitation::DiscussElicitationAnswer;
+pub use elicitation::{DiscussElicitationAnswer, DiscussElicitationClassification};
 pub use library::{
     AgentDefinition, AgentId, AgentRole, AgentSummary, AssetLibrary, CommandDefinition, CommandId, CommandSummary,
     SkillBundleFile, SkillDefinition, SkillId, SkillSummary, TeamDefinition, TeamSummary,
@@ -46,6 +46,7 @@ pub use messages::{
     dispatch_stop_server, rpc_router, send_new_session,
 };
 pub use types::{
-    DiscussError, DiscussMcpStatus, DiscussPermissionOption, DiscussSessionSetup, DiscussStreamEvent,
-    DiscussTerminalAuthMethod, ElicitationRequestId, PermissionRequestId, ProviderRuntimeState, SluiceSessionId,
+    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussError, DiscussMcpStatus,
+    DiscussPermissionOption, DiscussSessionSetup, DiscussStreamEvent, DiscussTerminalAuthMethod, DiscussUtilityPayload,
+    ElicitationRequestId, PermissionRequestId, ProviderRuntimeState, SluiceSessionId,
 };

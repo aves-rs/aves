@@ -626,29 +626,31 @@ impl<DomainError> From<ResponseProjectionError> for GeneratedCallError<DomainErr
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(feature = "keyring")]
+    use std::sync::atomic::AtomicBool;
+
     use serde::Serialize;
     use specta::Type;
     use thiserror::Error;
-
-    use crate::bus::BusRpcContext;
-
-    use super::super::context::ConstructionFacade;
-    use super::super::domains::{DomainCallbacks, DomainDescriptorFactory, DomainFuture, dispatch_lifecycle_request};
-    use super::*;
-
-    #[cfg(feature = "keyring")]
-    use std::sync::atomic::AtomicBool;
 
     #[cfg(feature = "keyring")]
     use tokio::sync::oneshot;
     #[cfg(feature = "keyring")]
     use uuid::Uuid;
 
-    #[cfg(feature = "keyring")]
-    use super::super::context::ConstructionInputs;
+    use crate::bus::BusRpcContext;
+
     #[cfg(feature = "keyring")]
     use crate::bus::{EventBus, OpaqueRequestEnvelope, TransportBindings};
 
+    use super::super::context::ConstructionFacade;
+    use super::super::domains::{DomainCallbacks, DomainDescriptorFactory, DomainFuture};
+    use super::*;
+
+    #[cfg(feature = "keyring")]
+    use super::super::context::ConstructionInputs;
+    #[cfg(feature = "keyring")]
+    use super::super::domains::dispatch_lifecycle_request;
     #[cfg(feature = "keyring")]
     use super::{DomainDescriptor, Runtime, RuntimeOptions};
 

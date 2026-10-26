@@ -174,9 +174,11 @@ impl GuestRpcBindingsHandle {
 }
 
 #[cfg(test)]
+#[cfg(feature = "keyring")]
 struct FixedTestBindings(Value);
 
 #[cfg(test)]
+#[cfg(feature = "keyring")]
 impl ErasedGuestRpcBindings for FixedTestBindings {
     fn call_value<'a>(&'a self, _operation: &'a str, _input: Value) -> ErasedCallFuture<'a> {
         Box::pin(async move { Ok(self.0.clone()) })
@@ -184,6 +186,7 @@ impl ErasedGuestRpcBindings for FixedTestBindings {
 }
 
 #[cfg(test)]
+#[cfg(feature = "keyring")]
 impl GuestRpcBindingsHandle {
     pub(super) fn fixed_test_response(value: Value) -> Self {
         Self(Arc::new(FixedTestBindings(value)))

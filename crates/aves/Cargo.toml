@@ -1,6 +1,6 @@
 [package]
 name = "aves"
-version = "0.5.8"
+version = "0.6.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Typed async application runtime with domain messaging, RPC, and durable workflow automation"
 authors = { workspace = true }

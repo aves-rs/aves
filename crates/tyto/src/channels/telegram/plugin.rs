@@ -38,6 +38,14 @@ impl MessagingPlugin for TelegramPlugin {
         Ok(())
     }
 
+    async fn verify_remote(
+        &mut self,
+        settings: &MessagingConfig,
+        credentials: &MessagingCredentials,
+    ) -> Result<(), MessagingError> {
+        super::connection::verify_remote(settings, credentials).await
+    }
+
     async fn listen(
         &mut self,
         tx: mpsc::Sender<InboundEvent>,

@@ -87,6 +87,32 @@ impl MessagingPlugin for PendingChannel {
         }
     }
 
+    async fn verify_remote(
+        &mut self,
+        settings: &MessagingConfig,
+        credentials: &MessagingCredentials,
+    ) -> Result<(), MessagingError> {
+        self.connect_attempts += 1;
+        if matches!(credentials, MessagingCredentials::Telegram { token } if token.as_str() == "block-probe") {
+            std::future::pending().await
+        }
+        if matches!(credentials, MessagingCredentials::Telegram { token } if token.as_str().starts_with("fail-") && self.connect_attempts <= token.trim_start_matches("fail-").parse::<usize>().unwrap_or(1))
+        {
+            return Err(MessagingError::ChannelConnectionFailed {
+                listener_type: ListenerType::Telegram,
+                message: "temporary connection failure".to_owned(),
+            });
+        }
+        if settings.telegram.is_some() && matches!(credentials, MessagingCredentials::Telegram { .. }) {
+            Ok(())
+        } else {
+            Err(MessagingError::ChannelConnectionFailed {
+                listener_type: ListenerType::Telegram,
+                message: "Telegram settings or credentials are missing".to_owned(),
+            })
+        }
+    }
+
     async fn send(
         &mut self,
         _sender: &MessagingSenderConfig,
@@ -556,6 +582,66 @@ async fn pending_send_does_not_block_another_actor_request() {
             .await
             .unwrap(),
         MessagingResponse::Subscriptions { .. }
+    ));
+}
+
+#[tokio::test]
+async fn pending_connection_probe_does_not_block_another_actor_request_or_require_saved_connection() {
+    let sources = Arc::new(Sources(Mutex::new(Vec::new())));
+    let mut actor = actor_for(sources).await;
+    let credential_id = SpectaUuid(Uuid::new_v4());
+    actor.credentials.insert(
+        credential_id,
+        MessagingCredentials::Telegram {
+            token: Zeroizing::new("block-probe".to_owned()),
+        },
+    );
+    let (reply_to, mut reply) = tokio::sync::oneshot::channel();
+    actor
+        .handle_message(MessagingRequest {
+            payload: MessagingRequestPayload::TestConnection {
+                transport: ConnectionTransport::Telegram(TelegramConfig::default()),
+                credential_id,
+            },
+            reply_to,
+        })
+        .await;
+    assert!(matches!(
+        reply.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        request(&mut actor, MessagingRequestPayload::List)
+            .await
+            .unwrap(),
+        MessagingResponse::Subscriptions { .. }
+    ));
+    assert!(matches!(
+        reply.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn test_connection_without_supplied_credential_fails_immediately() {
+    let sources = Arc::new(Sources(Mutex::new(Vec::new())));
+    let mut actor = actor_for(sources).await;
+    let credential_id = SpectaUuid(Uuid::new_v4());
+    let error = request(
+        &mut actor,
+        MessagingRequestPayload::TestConnection {
+            transport: ConnectionTransport::Telegram(TelegramConfig::default()),
+            credential_id,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        MessagingError::ChannelConnectionFailed {
+            listener_type: ListenerType::Telegram,
+            ..
+        }
     ));
 }
 

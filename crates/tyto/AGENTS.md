@@ -5,38 +5,34 @@ Tyto never depends on Poseidon or knows how the embedding application stores cre
 
 ## Ownership
 
-- `actor.rs`: Actor state (credentials, listeners, inflows, channels), lifecycle
-  (`new`/`start_server`/`stop_server`/`run` select loop), worker schedule, lazy `store()`,
-  and reconciliation plugin. Four private `#[path]` child modules own the rest:
-  - `connections.rs`: public request routing (`handle_message`), connection CRUD handlers,
-    Send dispatch setup
-  - `listeners.rs`: `reconcile`, `desired_connections`, inflow management, `run_inflow`,
-    subscriber dispatch, `dispatch_messages`
-  - `flows.rs`: MessageNode/PermissionNode command handling, callback arbitration,
-    expiry scanning, provider edits, `run_interactive_send`
-  - `delivery.rs`: `send_message` (Aves retry), Knowledge handoff, history event handlers
-    (inbound/interaction/send completion)
-- `domain.rs`: generic runtime registration, Flow trigger validation, and the privileged
-  `MessagingRuntimeService` (`SupplyCredential` / `RemoveCredential`).
-- `handle.rs`: generated service routing and source-event forwarding.
-- `messages.rs`: request/response envelopes, broadcast events, and generated RPC types.
-- `types.rs`: non-secret settings, trigger configuration, `MessagingCredentials`,
-  `MessagingSenderConfig` (Email/Slack/Telegram variants), `PersistencePolicy`,
-  `MessagingSendError`, `MessagingError` (stable `subscription` domain), `RetentionDuration`,
-  `ConnectionRecord`, `NewConnection`, `EditConnection`, and provider config types.
-- `database.rs`: `MessageStore` — `messages.db` query interface (connection CRUD, history
-  writes, permission lifecycle, retention prune). The actor is the sole caller and writer.
-- `src/migrations.rs` registers the SQL in `migrations/` (a peer of `src/`) with
-  Aves `MigrationRunner` for `messages.db` (`__peitho_migrations`).
-- `queries/`: SQL for connection CRUD, history writes, permission lifecycle, and the two-mode
-  retention prune (`prune_expired` / `prune_callbacks` / `prune_accepted_sends`).
+- `actor.rs`: Actor state (credentials, listeners, inflows, channels), lifecycle (`new`/`start_server`/`stop_server`/`run` select loop), worker schedule, lazy `store()`, reconcile orchestration, `handle_message` public request routing, and credential supply/remove handlers inline.
+- `connections.rs`: Connection CRUD handlers (`create_connection`, `update_connection`, `delete_connection`, `set_connection_enabled`, `list_connections`) and `start_test_connection` pre-save verification probe.
+- `reconciliation.rs`: `reconcile`, `desired_connections`, `reconcile_inflows`, inflow management (`run_inflow`, `start_inflows`), subscriber dispatch (`dispatch_messages`), Flow trigger listener attachment (`trigger_inventory`, `desired_listeners`, `attach_listeners`, `remove_stale_listeners`).
+- `sender.rs`: `prepare_send` connection/credential/transport resolution, Send dispatch setup (`start_send`).
+- `delivery.rs`: `send_message` (Aves retry), Knowledge handoff, history event handlers (inbound/interaction/send completion).
+- `flow_nodes.rs`: MessageNode/PermissionNode command routing (`handle_node_command`) and shared `NodeSetupError`.
+- `messaging_nodes.rs`: MessageNode start/tick/cancel implementation.
+- `permission_node.rs`: PermissionNode start/tick/cancel, interactive send, permission-request persistence.
+- `permission_callbacks.rs`: Permission callback arbitration (`handle_interaction`), provider edit dispatch, expiry scanning.
+- `domain.rs`: Generic runtime registration, Flow trigger validation, and the privileged `MessagingRuntimeService` (`SupplyCredential` / `RemoveCredential`).
+- `handle.rs`: Generated service routing and source-event forwarding.
+- `messages.rs`: Request/response envelopes, broadcast events, and generated RPC types.
+- `types.rs`: Non-secret settings, trigger configuration, `MessagingCredentials`, `MessagingSenderConfig` (Email/Slack/Telegram variants), `PersistencePolicy`, `MessagingSendError`, `MessagingError` (stable `subscription` domain), `RetentionDuration`, `ConnectionRecord`, `NewConnection`, `EditConnection`, and provider config types.
+- `database.rs`: `MessageStore` — `messages.db` query interface (connection CRUD, history writes, permission lifecycle, retention prune). The actor is the sole caller and writer.
+- `src/migrations.rs` registers the SQL in `migrations/` (a peer of `src/`) with Aves `MigrationRunner` for `messages.db` (`__peitho_migrations`).
+- `queries/`: SQL for connection CRUD, history writes, permission lifecycle, and the two-mode retention prune (`prune_expired` / `prune_callbacks` / `prune_accepted_sends`).
 - `registrations.rs`: `NodeKindRegistration` for `MessageNode` and `PermissionNode`.
-- `channels/mod.rs`: contract-only — the stateful `MessagingPlugin` trait
-  (`connect` / `send` / `send_metadata_schema` / `listen` / `subscribe` / `send_interactive` /
-  `edit_interactive`), the `MessagingSubscription` target/ACL policy, `for_kind` selector,
-  and the `CHANNEL_MESSAGE_BUFFER_SIZE` constant. No provider branching, retry, or persistence.
-- `channels/{email,slack,telegram}/`: per-provider module with
-  `connection.rs` / `subscription.rs` / `filter.rs` / `send.rs` / `helpers.rs` / `mod.rs`.
+- `channels/mod.rs`: Contract-only — the stateful `MessagingPlugin` trait (`connect` / `verify_remote` / `send` / `send_metadata_schema` / `listen` / `subscribe` / `send_interactive` / `edit_interactive`), the `MessagingSubscription` target/ACL policy, `for_kind` selector, and the `CHANNEL_MESSAGE_BUFFER_SIZE` constant.
+- `channels/{email,slack,telegram}/`: Per-provider module with `plugin.rs` (MessagingPlugin impl) / `connection.rs` / `subscribe.rs` / `filter.rs` / `send.rs` / `helpers.rs` / `mod.rs` (composition, re-exports plugin).
+
+### connect vs verify_remote
+
+`connect` may prepare local provider state or authenticate a subset of transports (e.g., IMAP-only when SMTP is also configured), but does not exercise every configured transport end-to-end:
+- **Slack**: calls `configure(settings, credentials)` to build the local `SlackClient` (plugin.rs:42-50); does not verify tokens.
+- **Telegram**: builds the `Bot` client locally; does not call the Bot API.
+- **Email**: opens an authenticated IMAP login session (only when IMAP is configured); SMTP-only send paths skip IMAP entirely.
+
+`verify_remote` is the only authoritative all-configured authentication probe. It exercises every configured transport end-to-end without retaining connection state: IMAP login plus SMTP authentication (Email), `auth_test` plus `apps_connections_open` (Slack), and `get_me` (Telegram). The `MessagingPlugin` trait requires both methods.
 
 ## `messages.db` ownership
 
@@ -186,19 +182,23 @@ enablement, revision selection, and local ownership admission.
 
 ## Crate exports
 
-Minimal: `MessagingDomain`, `MessagingRuntimeService`, `messaging_trigger_registry`,
-`MessagingBroadcast`, `RemoveCredentialInput`, `SupplyCredentialInput`, `SuccessOutput`,
-`messaging_operation_descriptors_with_root_error`, `rpc_router`, `MessagingCredentials`,
-`MessagingError`, `SubscriptionTriggerConfig`. Wire types (`ConnectionRecord`,
-`MessagingSenderConfig`, `NormalizedMessage`, `ListenerType`, provider configs, etc.)
-are accessible through generated RPC/TS bindings but not direct `tyto::` Rust exports.
-Everything else stays private.
+Minimal: `MessagingDomain`, `MessagingRuntimeService`, `messaging_trigger_registry`, `MessagingBroadcast`, `RemoveCredentialInput`, `SupplyCredentialInput`, `SuccessOutput`, `messaging_operation_descriptors_with_root_error`, `rpc_router`, `MessagingCredentials`, `MessagingError`, `SubscriptionTriggerConfig`. Wire types (MessagingSenderConfig, NormalizedMessage) are accessible through generated RPC/TS bindings but not direct tyto:: Rust exports.
+
+**Consumer reexports** (delivered 2026-10-29): The following symbols are reexported at the crate root for embedding applications:
+- Connection DTOs: `ConnectionRecord`, `NewConnection`, `EditConnection`, `ConnectionTransport`
+- Provider configs: `EmailConfig`, `SlackConfig`, `TelegramConfig`
+- Enums: `RetentionDuration`, `ListenerType`
+- Connection CRUD dispatchers: `ListConnectionsInput`, `ConnectionsOutput`, `dispatch_list_connections`, `CreateConnectionInput`, `ConnectionOutput`, `dispatch_create_connection`, `UpdateConnectionInput`, `dispatch_update_connection`, `SetConnectionEnabledInput`, `dispatch_set_connection_enabled`, `DeleteConnectionInput`, `dispatch_delete_connection`
+- TestConnection: `TestConnectionInput`, `dispatch_test_connection` (pre-save credential verification)
+
+Implementation modules (`actor`, `channels`, `connections`, `database`, ...) stay private; only consumer contracts move to the root.
 
 ## Testing
 
 Tests live in `src/actor/tests.rs` (actor + nested types tests); provider helper tests
 remain co-located. Follow repository code/test standards. Use `cargo test --package aves-tyto`
-for unit coverage; protocol tests must not require live providers.
+for unit coverage; protocol tests MUST NOT exercise live external providers — use mocks
+exclusively; live credentials are prohibited.
 
 ## Related
 

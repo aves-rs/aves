@@ -1,5 +1,9 @@
 use chrono::Utc;
 use serde_json::{Value, from_str, to_string};
+use std::time::Duration;
+use tokio::spawn;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 use aves::flow::{
@@ -36,6 +40,44 @@ impl Actor {
             .await?;
         let _ = self.reconcile().await;
         Ok(MessagingResponse::Connection { connection: record })
+    }
+
+    pub(super) async fn start_test_connection(
+        &self,
+        reply_to: oneshot::Sender<Result<MessagingResponse, MessagingError>>,
+        transport: ConnectionTransport,
+        credential_id: SpectaUuid,
+    ) {
+        let listener_type = transport.provider();
+        let Some(credentials) = self.credentials.get(&credential_id).cloned() else {
+            let _ = reply_to.send(Err(MessagingError::ChannelConnectionFailed {
+                listener_type,
+                message: "configured credential is not available".to_owned(),
+            }));
+            return;
+        };
+        let settings = transport.messaging_config();
+        let mut plugin = Self::reconciliation_plugin(&transport);
+        spawn(async move {
+            let result = match timeout(Duration::from_secs(60), plugin.verify_remote(&settings, &credentials)).await {
+                Ok(Ok(())) => Ok(MessagingResponse::Success),
+                Ok(Err(MessagingError::ChannelConnectionFailed { message, .. }))
+                    if message.to_ascii_lowercase().contains("timeout")
+                        || message.to_ascii_lowercase().contains("timed out") =>
+                {
+                    Err(MessagingError::ChannelConnectionFailed {
+                        listener_type,
+                        message: format!("connection verification timed out: {message}"),
+                    })
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(MessagingError::ChannelConnectionFailed {
+                    listener_type,
+                    message: "connection verification timed out after 60 seconds".to_owned(),
+                }),
+            };
+            let _ = reply_to.send(result);
+        });
     }
 
     pub(super) async fn list_connections(&mut self) -> Result<MessagingResponse, MessagingError> {

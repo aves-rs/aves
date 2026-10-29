@@ -12,7 +12,7 @@ use aves::utils::uuid::SpectaUuid;
 
 use super::domain::MessagingDomain;
 use super::types::{
-    ConnectionRecord, EditConnection, MessagingCredentials, MessagingError, MessagingSendReceipt,
+    ConnectionRecord, ConnectionTransport, EditConnection, MessagingCredentials, MessagingError, MessagingSendReceipt,
     MessagingSenderConfig, NewConnection, NormalizedMessage,
 };
 
@@ -49,6 +49,14 @@ pub enum MessagingRequestPayload {
     /// Creates a persisted messaging connection.
     #[operation(name = "createConnection", kind = "mutation", response = ConnectionOutput, response_variant = "Connection")]
     CreateConnection { input: NewConnection },
+
+    /// Tests a proposed transport using a credential already supplied through the runtime service.
+    /// Success confirms remote authentication only, not destination permissions or future delivery.
+    #[operation(name = "testConnection", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    TestConnection {
+        transport: ConnectionTransport,
+        credential_id: SpectaUuid,
+    },
 
     /// Updates a persisted messaging connection.
     #[operation(name = "updateConnection", kind = "mutation", response = ConnectionOutput, response_variant = "Connection")]

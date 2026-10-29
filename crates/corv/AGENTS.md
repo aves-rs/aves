@@ -67,6 +67,15 @@ Corv owns Discuss on the Aves runtime. Named for Corvidae (ravens/crows), the pl
 - [Discuss Domain Architecture](../../docs/architecture/corv/discuss-domain.md)
 - [MCP-over-ACP Tooling](../../docs/concepts/mcp-over-acp-tooling.md)
 
+## Consumer reexports
+
+The following symbols are reexported from the Corv crate root for embedding applications:
+- `DiscussSettings` (from `boot.rs`)
+- `AcpProvider`, `ProviderRuntimeStatus`, `ProviderRuntimeFailure`, `CleanupWarning` (from `types.rs`)
+- Provider operation DTOs and dispatchers: `ListProvidersInput`, `ProvidersListOutput`, `dispatch_list_providers`, `AddProviderInput`, `SuccessOutput`, `dispatch_add_provider`, `RemoveProviderInput`, `ProviderRemoveSuccessOutput`, `dispatch_remove_provider` (generated from `messages.rs` declarations)
+
+Implementation modules remain private; only consumer contracts are reexported. Provider-config lifecycle operations remain privileged as declared.
+
 ## Extraction and verification
 
 Preserve `Discuss*` Rust names, `discuss.*` RPC/config/error identities, `discuss.db`, `__discuss_migrations`, migration versions/SQL, workspace paths, and existing tests. The crate rename is not a domain or storage rename. Keep implementation modules private and re-export only concrete consumer contracts from `src/lib.rs`; do not publish unused DTO/helper/privileged-service aliases. `DiscussBootOptions.library` is required. Listing, upgrades, retention, and provider renderers use that catalog; never consult an ambient application registry.

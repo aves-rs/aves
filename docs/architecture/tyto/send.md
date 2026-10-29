@@ -1,7 +1,7 @@
 ---
 title: Tyto Send Architecture
 type: architecture
-updated: 2026-10-23
+updated: 2026-10-29
 references:
   - crates/tyto/AGENTS.md
   - crates/tyto/src/messages.rs
@@ -92,7 +92,9 @@ and the late-receipt edit path.
 
 - Email Send is SMTP-only — no IMAP prerequisite; `EmailPlugin::connect`
   short-circuits to send-only mode when `smtp_server` is set and
-  `imap_server` is absent.
+  `imap_server` is absent. The Send path reuses the shared SMTP builder
+  `build_smtp_transport` (defined in `channels/email/send.rs`, imported by
+  `channels/email/connection.rs`) for consistency with `TestConnection`.
 - Slack Send uses the bot token from the supplied credential via
   `SlackPlugin::send`.
 - Outbound Knowledge persistence is fire-and-forget with a 30s timeout;
@@ -104,7 +106,7 @@ and the late-receipt edit path.
 ## Related
 
 - [Tyto Credential Supply Architecture](credentials.md)
-- [Tyto Connection Architecture](connection.md)
+- [Tyto Connection Architecture](connection.md) — includes `TestConnection` pre-save verification
 - [Tyto Subscription Architecture](subscriptions.md)
 - [Messaging Send and Persistence](../../concepts/messaging-send-and-persistence.md)
 - [Tyto AGENTS.md](../../../crates/tyto/AGENTS.md)

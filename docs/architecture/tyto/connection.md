@@ -1,9 +1,10 @@
 ---
 title: Tyto Connection Architecture
 type: architecture
-updated: 2026-10-23
+updated: 2026-10-29
 references:
   - crates/tyto/AGENTS.md
+  - crates/tyto/src/lib.rs
   - crates/tyto/src/database.rs
   - crates/tyto/src/actor.rs
   - crates/tyto/src/connections.rs
@@ -17,7 +18,9 @@ references:
   - crates/tyto/src/queries/delete_connection.sql
   - crates/tyto/src/queries/mark_deleted_for_connection.sql
   - crates/tyto/src/channels/mod.rs
+  - crates/tyto/src/channels/email/plugin.rs
   - crates/tyto/src/channels/email/connection.rs
+  - crates/tyto/src/channels/email/send.rs
   - crates/tyto/src/channels/slack/connection.rs
   - crates/tyto/src/channels/telegram/connection.rs
 ---
@@ -36,14 +39,15 @@ the retired `(listener_type, credential_id, config_key)` tuple is gone.
   `CHANNEL_MESSAGE_BUFFER_SIZE` constant. No provider branching, validation,
   retry, or persistence lives here.
 - Each provider module (`channels/{email,slack,telegram}/`) owns:
+  - `plugin.rs` — the `MessagingPlugin` impl and provider-specific state.
   - `connection.rs` — authenticated transport from non-secret settings plus
     the supplied credential.
-  - `subscription.rs` — one unfiltered inflow for the authenticated
+  - `subscribe.rs` — one unfiltered inflow for the authenticated
     bot/mailbox.
   - `filter.rs` — target/ACL normalization and per-subscription filtering.
   - `send.rs` — `Send`-only outbound path.
   - `helpers.rs` — reusable utilities.
-  - `mod.rs` — the `MessagingPlugin` impl and provider-specific state.
+  - `mod.rs` — composition: re-exports `plugin` and declares submodules.
 
 ## `messages.db` as connection authority
 
@@ -62,8 +66,7 @@ The retired `peitho` Config section, `ReloadSettings`, `listChannelConfigs`,
 
 Public connection bus ops: `listConnections`, `createConnection`,
 `updateConnection`, `setConnectionEnabled`, `deleteConnection`. Connection CRUD
-handlers live in `connections.rs` (a private `#[path]` child of `actor.rs`); the
-actor is the sole writer; every mutation runs `reconcile` afterward so the inflow
+handlers live in `connections.rs`; the actor is the sole writer; every mutation runs `reconcile` afterward so the inflow
 set matches enabled DB state. `reconcile` and `run_inflow` live in `reconciliation.rs`.
 
 ## Data flow
@@ -109,10 +112,38 @@ the SQLite connection single-writer and the retention prune consistent.
    remain in Flow until manually removed. History rows for the deleted
    connection remain until the orphan-fallback prune path removes them.
 
+## Pre-save connection verification
+
+`TestConnection` is a public bus operation (wire name `testConnection`) that verifies credentials authenticate remotely against every configured transport **before** any connection record is saved. Input: proposed `ConnectionTransport` plus `credential_id` identifying credentials already supplied through `MessagingRuntimeService`. Success returns existing `SuccessOutput`; failure returns existing `MessagingError::ChannelConnectionFailed`. Exported: `TestConnectionInput`, `dispatch_test_connection`.
+
+**Execution model:** On-loop credential lookup (missing credential fails immediately); off-loop `verify_remote` spawn with direct oneshot reply; single overall 60-second deadline; single attempt (no retry). A dropped caller does not cancel the probe — it runs to deadline, reply send fails quietly, temporary plugin/clients/sessions drop. Concurrent requests spawn independent probes. No `MessageStore` access, no connection-row reads/writes, no `reconcile`, no listener/inflow changes, no history writes, no broadcasts, no message sends.
+
+**Authentication semantics:** Email verifies IMAP and SMTP when both supplied (SMTP-only when IMAP absent); Slack verifies both bot token (`auth_test`) and app token (`apps_connections_open`); Telegram verifies bot token (`get_me`). Authentication success does NOT prove destination permissions or future message delivery — the input carries no destination. Secrets stay in the supplied-credential map; error messages follow existing redaction conventions and never embed token/password content.
+
+**Provider SDK auth behavior:** Lettre SMTP `test_connection` authenticates during connection acquisition before NOOP (configured credentials trigger `auth`). Slack `auth_test` verifies Web API token identity; `apps_connections_open` checks app token scope (WebSocket URL deliberately not opened). Telegram `get_me` tests bot authentication. Versioned sources: [lettre 0.11.23 AsyncSmtpTransport::test_connection](https://docs.rs/crate/lettre/0.11.23/source/src/transport/smtp/async_transport.rs) (lines 314-322, 485-497), [slack-morphism 2.31.1 auth_test](https://docs.rs/crate/slack-morphism/2.31.1/source/src/api/auth.rs), [slack-morphism 2.31.1 apps_connections_open](https://docs.rs/crate/slack-morphism/2.31.1/source/src/api/apps.rs), [teloxide-core 0.13.0 get_me](https://docs.rs/crate/teloxide-core/0.13.0/source/src/requests/requester.rs). See also [external documentation](../../external/navigation.md) for additional SDK details.
+
+**Shared SMTP builder:** Email SMTP probe reuses `build_smtp_transport` (defined in `channels/email/send.rs`, imported by `channels/email/connection.rs`) — behavior-preserving sharing, unchanged Send semantics. IMAP probe reuses existing login connect. No new SMTP protocol code.
+
+**Accepted constraints:** Telegram `api_url` override: Tyto accepts non-base overrides; SDK path construction can panic for syntactically valid non-hierarchical URLs (e.g., `mailto:`). Accepted NO FIX. Mock coverage gaps exercise the mock entry directly, not the live network; accepted as sufficient coverage.
+
+**connect vs verify_remote contrast:** `connect` may prepare local provider state or authenticate a subset of transports (e.g., IMAP-only when SMTP is also configured), but does not exercise every configured transport end-to-end. `verify_remote` is the only authoritative all-configured authentication probe (see [Tyto AGENTS.md](../../../crates/tyto/AGENTS.md#connect-vs-verify_remote)).
+
+## Pre-save connection verification workflow
+
+The embedding application verifies credentials authenticate remotely against every configured transport **before** any connection record is saved:
+
+1. Supply the proposed credentials through the privileged `MessagingRuntimeService::supply_credential`.
+2. Call the generated `dispatch_test_connection` with the proposed `ConnectionTransport` and the supplied `credential_id`.
+3. Inspect the result: success returns existing `SuccessOutput`; failure returns existing `MessagingError::ChannelConnectionFailed`.
+4. Optionally save or create the connection record through the public bus ops.
+
+`testConnection` does not save anything; it only probes authentication. The credential stays in the supplied-credential map until explicitly removed.
+
 ## Related
 
 - [Tyto Credential Supply Architecture](credentials.md)
 - [Tyto Subscription Architecture](subscriptions.md)
 - [Tyto Send Architecture](send.md)
 - [Messaging Send and Persistence](../../concepts/messaging-send-and-persistence.md)
+- [External Documentation](../../external/navigation.md)
 - [Tyto AGENTS.md](../../../crates/tyto/AGENTS.md)

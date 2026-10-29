@@ -14,7 +14,7 @@ Keep the existing context truthful, small, and navigable. Prefer removing an obs
 | Agent process | `.agents/skills/` |
 | Durable session facts | `ctx_memory` |
 
-`docs/navigation.md` indexes architecture, concepts, guides, and standards. A doc not linked there cannot be discovered. There is currently no `docs/external/` tree; do not assume one exists.
+`docs/navigation.md` indexes architecture, concepts, guides, and standards. A doc not linked there cannot be discovered. The `docs/external/` tree caches third-party library documentation; see `docs/external/navigation.md` for its index.
 
 ## Maintain
 

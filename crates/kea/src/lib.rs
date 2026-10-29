@@ -15,4 +15,4 @@ pub use messages::{
     CreateKnowledgeInput, KnowledgeBroadcast, UpsertDataInput, dispatch_create_knowledge, dispatch_upsert_data,
     rpc_router,
 };
-pub use types::{CreateKnowledgeRequest, KnowledgeError, UpsertDataRequest};
+pub use types::{CreateKnowledgeRequest, KnowledgeConfig, KnowledgeError, UpsertDataRequest};

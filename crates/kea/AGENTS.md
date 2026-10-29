@@ -21,6 +21,8 @@ Kea owns the Knowledge domain on the Aves runtime. Notes live in one TurboVault-
 
 Source modules live under `src/`; `src/lib.rs` exposes only the domain marker and the concrete contracts needed by consumers. Keep actors, handlers, implementation types, and migrations private. Preserve the `knowledge` RPC/config/error identities and existing storage paths.
 
+**Consumer reexports** (delivered 2026-10-29): `KnowledgeConfig` is reexported from the Kea crate root for embedding applications. Implementation modules remain private; only consumer contracts are reexported.
+
 Primary tests live in `src/actor/tests.rs`; `data.rs` and `documents.rs` have co-located `#[cfg(test)] mod tests`. `messages.rs` and `handle.rs` have no tests. Target them with `cargo test --package aves-kea`. Tests use Aves's `test-support` feature for existing bus-envelope fixtures.
 
 See [Knowledge Domain Architecture](../../docs/architecture/kea/knowledge-domain.md) for cross-package RPC ownership. Follow the repository code and test standards. This file is the local authority for the Knowledge domain.

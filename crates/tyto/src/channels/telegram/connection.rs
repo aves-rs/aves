@@ -1,10 +1,15 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use teloxide_core::Bot;
+use teloxide_core::requests::Requester;
+use tokio::time::timeout;
 use url::Url;
 
 use crate::messages::ListenerType;
 use crate::types::{MessagingConfig, MessagingCredentials, MessagingError, MessagingSubscriptionError, TelegramConfig};
+
+use super::helpers::REQUEST_DEADLINE_SECS;
 
 /// Builds the Telegram transport from settings and supplied credentials.
 pub(super) fn configure(
@@ -43,6 +48,35 @@ fn prepare(config: &TelegramConfig) -> Result<Arc<Bot>, MessagingError> {
         message: error.to_string(),
     })?;
     Ok(Arc::new(bot))
+}
+
+/// Verify Telegram credentials by calling getMe without retaining connection state.
+pub(super) async fn verify_remote(
+    settings: &MessagingConfig,
+    credentials: &MessagingCredentials,
+) -> Result<(), MessagingError> {
+    let bot = configure(settings, credentials)?;
+    timeout(Duration::from_secs(REQUEST_DEADLINE_SECS), bot.get_me())
+        .await
+        .map_err(|_| connection_failure("Telegram request timed out"))?
+        .map_err(|error| {
+            // RequestError Display can include the tokenized Bot API URL; never expose it.
+            let message = match error {
+                teloxide_core::errors::RequestError::Api(teloxide_core::errors::ApiError::InvalidToken) => {
+                    "Telegram rejected the bot token"
+                }
+                _ => "Telegram request failed",
+            };
+            connection_failure(message)
+        })?;
+    Ok(())
+}
+
+fn connection_failure(message: &str) -> MessagingError {
+    MessagingError::ChannelConnectionFailed {
+        listener_type: ListenerType::Telegram,
+        message: message.to_owned(),
+    }
 }
 
 fn build_bot(token: &str, api_url: Option<&str>) -> Result<Bot, MessagingSubscriptionError> {

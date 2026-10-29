@@ -1,7 +1,7 @@
 ---
 title: Aves Engineering Navigation
 type: reference
-updated: 2026-10-23
+updated: 2026-10-29
 references:
   - AGENTS.md
   - crates/aves/AGENTS.md
@@ -65,3 +65,13 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 | [Adding a Flow Node Kind](guides/adding-a-flow-node-kind.md) | Implementing a node registration |
 | [Aves Domain RPC](guides/aves-domain-rpc.md) | Publishing generated RPC operations |
 | [Stale Named References](guides/stale-named-references.md) | Diagnosing missing Tyto connections |
+
+## External Documentation Cache
+
+Third-party library documentation with versioned official source URLs. Verify freshness before reuse; pinned dependency versions in Cargo.lock are authoritative.
+
+| File | Library | Version | Use when |
+|---|---|---|---|
+| [External Navigation](external/navigation.md) | Multiple | Various | Third-party SDK docs index |
+| [lettre/test_connection.md](external/lettre/test_connection.md) | lettre | 0.11.23 | SMTP `test_connection` authentication behavior |
+| [slack-morphism/slackclienthttpconnector-mock.md](external/slack-morphism/slackclienthttpconnector-mock.md) | slack-morphism | 2.31.1 | `SlackClientHttpConnector` trait for mock implementations |

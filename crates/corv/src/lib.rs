@@ -29,7 +29,7 @@ mod test_library;
 
 use domain::{DiscussKernelServices, DiscussProviderConfigSudoServiceImpl, DiscussStreamingServiceImpl};
 
-pub use boot::DiscussBootOptions;
+pub use boot::{DiscussBootOptions, DiscussSettings};
 pub use domain::{DiscussDomain, DiscussStreamingService};
 pub use elicitation::{DiscussElicitationAnswer, DiscussElicitationClassification};
 pub use library::{
@@ -39,14 +39,17 @@ pub use library::{
 pub use mcp::discuss_mcp_domains;
 pub use mcp_http::run_mcp;
 pub use messages::{
-    AnswerElicitationInput, AnswerPermissionInput, CancelElicitationInput, CancelSessionInput, CancelTurnInput,
-    DiscussBroadcast, DiscussResponse, DisposeInspectorInput, GetServerStatusInput, NewSessionInput,
-    ReserveInspectorInput, SendUserTurnInput, StartInspectorInput, StartServerInput, StopServerInput,
-    discuss_operation_descriptors_with_root_error, dispatch_get_server_status, dispatch_start_server,
-    dispatch_stop_server, rpc_router, send_new_session,
+    AddProviderInput, AnswerElicitationInput, AnswerPermissionInput, CancelElicitationInput, CancelSessionInput,
+    CancelTurnInput, DiscussBroadcast, DiscussResponse, DisposeInspectorInput, GetServerStatusInput,
+    ListProvidersInput, NewSessionInput, ProviderRemoveSuccessOutput, ProvidersListOutput, RemoveProviderInput,
+    ReserveInspectorInput, SendUserTurnInput, StartInspectorInput, StartServerInput, StopServerInput, SuccessOutput,
+    discuss_operation_descriptors_with_root_error, dispatch_add_provider, dispatch_get_server_status,
+    dispatch_list_providers, dispatch_remove_provider, dispatch_start_server, dispatch_stop_server, rpc_router,
+    send_new_session,
 };
 pub use types::{
-    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussError, DiscussMcpStatus,
-    DiscussPermissionOption, DiscussSessionSetup, DiscussStreamEvent, DiscussTerminalAuthMethod, DiscussUtilityPayload,
-    ElicitationRequestId, PermissionRequestId, ProviderRuntimeState, SluiceSessionId,
+    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, AcpProvider, CleanupWarning, DiscussError,
+    DiscussMcpStatus, DiscussPermissionOption, DiscussSessionSetup, DiscussStreamEvent, DiscussTerminalAuthMethod,
+    DiscussUtilityPayload, ElicitationRequestId, PermissionRequestId, ProviderRuntimeFailure, ProviderRuntimeState,
+    ProviderRuntimeStatus, SluiceSessionId,
 };

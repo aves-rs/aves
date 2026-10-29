@@ -27,7 +27,12 @@
 
         # rust versions
         rustToolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
-          extensions = [ "rust-src" ];
+          extensions = [
+            "rust-src"
+            "clippy"
+            "rustfmt"
+            "rust-analyzer"
+          ];
         };
 
         rustNativeDeps = with pkgs; [

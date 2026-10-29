@@ -1,6 +1,6 @@
 [package]
 name = "aves-kea"
-version = "0.5.8"
+version = "0.6.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Specialized knowledge domain for the Aves async application runtime"
 authors = { workspace = true }
@@ -24,14 +24,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # internal
-aves = { path = "../aves", version = "=0.5.8", features = ["test-support"] }
+aves = { path = "../aves", version = "=0.6.0", features = ["test-support"] }
 
 # external
 tempfile = { workspace = true }
 
 [dependencies]
 # internal
-aves = { path = "../aves", version = "=0.5.8" }
+aves = { path = "../aves", version = "=0.6.0" }
 
 # external
 chrono = { workspace = true }

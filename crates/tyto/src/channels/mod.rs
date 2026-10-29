@@ -70,6 +70,13 @@ pub(super) trait MessagingPlugin: Send + Sync {
         credentials: &MessagingCredentials,
     ) -> Result<(), MessagingError>;
 
+    /// Verify remote access using the proposed transport settings and supplied credentials.
+    async fn verify_remote(
+        &mut self,
+        settings: &MessagingConfig,
+        credentials: &MessagingCredentials,
+    ) -> Result<(), MessagingError>;
+
     /// Send a normalized message using provider sender configuration and connected state.
     async fn send(
         &mut self,

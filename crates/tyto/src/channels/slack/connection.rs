@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use slack_morphism::prelude::{
-    SlackApiToken, SlackApiTokenType, SlackApiTokenValue, SlackClient, SlackClientHyperConnector,
-    SlackClientHyperHttpsConnector,
+    SlackApiAppsConnectionOpenRequest, SlackApiToken, SlackApiTokenType, SlackApiTokenValue, SlackClient,
+    SlackClientHyperConnector, SlackClientHyperHttpsConnector,
 };
 use tokio::time::timeout;
 
@@ -59,6 +59,37 @@ where
             timeout: format!("{deadline:?}"),
         })?
         .map_err(|error| slack_connection(format!("Slack Socket Mode listen_for failed: {error}")))
+}
+
+/// Verify both Slack credentials through HTTP API calls without starting Socket Mode.
+pub(super) async fn verify_remote(
+    settings: &MessagingConfig,
+    credentials: &MessagingCredentials,
+) -> Result<(), MessagingError> {
+    let connection = configure(settings, credentials)?;
+
+    connection
+        .client
+        .open_session(&connection.bot_token)
+        .auth_test()
+        .await
+        .map_err(|_| connection_failure("Slack rejected the bot token or auth_test failed"))?;
+
+    connection
+        .client
+        .open_session(&connection.token)
+        .apps_connections_open(&SlackApiAppsConnectionOpenRequest {})
+        .await
+        .map_err(|_| connection_failure("Slack rejected the app token or apps.connections.open failed"))?;
+
+    Ok(())
+}
+
+fn connection_failure(message: &str) -> MessagingError {
+    MessagingError::ChannelConnectionFailed {
+        listener_type: ListenerType::Slack,
+        message: message.to_owned(),
+    }
 }
 
 fn prepare(config: &SlackConfig) -> Result<Arc<SlackConnection>, MessagingError> {

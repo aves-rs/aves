@@ -1,8 +1,10 @@
 ---
 title: Discuss Domain Architecture
 type: architecture
-updated: 2026-10-23
+updated: 2026-10-29
 references:
+  - crates/corv/AGENTS.md
+  - crates/corv/src/lib.rs
   - crates/corv/src/actor.rs
   - crates/corv/src/agent_nodes.rs
   - crates/corv/src/session.rs
@@ -88,6 +90,16 @@ SQL lives in `crates/corv/migrations/`, a peer of `src/`; `src/migration.rs` reg
 ## Legacy Job tables
 
 Migrations `0037_discuss_jobs` (and follow-ons) still create `discuss_jobs` / `discuss_job_runs`. No readers or writers. Automation is Aves Flow.
+
+## Consumer reexport surface
+
+The following symbols are reexported from the Corv crate root for embedding applications (verified against `crates/corv/src/lib.rs`):
+
+- `DiscussSettings` (from `boot.rs`)
+- `AcpProvider`, `ProviderRuntimeStatus`, `ProviderRuntimeFailure`, `CleanupWarning` (from `types.rs`)
+- Provider operation DTOs and dispatchers: `ListProvidersInput`, `ProvidersListOutput`, `dispatch_list_providers`, `AddProviderInput`, `SuccessOutput`, `dispatch_add_provider`, `RemoveProviderInput`, `ProviderRemoveSuccessOutput`, `dispatch_remove_provider` (generated from `messages.rs` declarations)
+
+Implementation modules remain private; only consumer contracts are reexported. Provider-config lifecycle operations remain privileged as declared.
 
 ## Related
 

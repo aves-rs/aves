@@ -11,6 +11,8 @@ use tokio_native_tls::{TlsConnector, TlsStream};
 use crate::messages::ListenerType;
 use crate::types::{EmailConfig, MessagingConfig, MessagingCredentials, MessagingError, MessagingSubscriptionError};
 
+use super::send::build_smtp_transport;
+
 pub(super) type ImapConnection = Arc<Mutex<Option<ImapSession>>>;
 pub(super) type ImapSession = Session<TlsStream<TcpStream>>;
 
@@ -103,6 +105,55 @@ pub(super) async fn connect(config: &EmailConfig) -> Result<ImapSession, Messagi
     Ok(session)
 }
 
+/// Authenticates every configured remote email transport without selecting a mailbox or sending mail.
+pub(super) async fn verify_remote(
+    settings: &MessagingConfig,
+    credentials: &MessagingCredentials,
+) -> Result<(), MessagingError> {
+    let MessagingCredentials::Email { username, password } = credentials else {
+        return Err(connection_failed("credential protocol does not match the listener"));
+    };
+    let mut config = settings
+        .email
+        .clone()
+        .ok_or_else(|| connection_failed("Email config block is missing"))?;
+    config.username = Some(username.clone());
+    config.password = Some(password.clone());
+    if config.imap_server.is_none() && config.smtp_server.is_none() {
+        return Err(connection_failed("Email requires an IMAP or SMTP server"));
+    }
+
+    if config.imap_server.is_some() {
+        prepare(&config)?;
+        let session = connect(&config).await.map_err(|error| match error {
+            MessagingSubscriptionError::Authentication { .. } => connection_failed("IMAP authentication rejected"),
+            _ => connection_failed("IMAP connectivity probe failed"),
+        })?;
+        drop(session);
+    }
+    if config.smtp_server.is_some() {
+        let transport = build_smtp_transport(&config, (username, password))
+            .map_err(|_| connection_failed("SMTP transport configuration is invalid"))?;
+        match timeout(Duration::from_secs(30), transport.test_connection()).await {
+            Err(_) => return Err(connection_failed("SMTP connection probe timed out")),
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Err(connection_failed("SMTP server rejected connection probe")),
+            Ok(Err(error)) if error.is_response() && error.is_permanent() => {
+                return Err(connection_failed("SMTP authentication rejected"));
+            }
+            Ok(Err(_)) => return Err(connection_failed("SMTP connectivity probe failed")),
+        }
+    }
+    Ok(())
+}
+
+fn connection_failed(message: &str) -> MessagingError {
+    MessagingError::ChannelConnectionFailed {
+        listener_type: ListenerType::Email,
+        message: message.to_owned(),
+    }
+}
+
 /// Validates the required IMAP server and credentials without taking ownership.
 fn prepare(config: &EmailConfig) -> Result<(), MessagingError> {
     config
@@ -159,4 +210,50 @@ pub(super) fn email_timeout(operation: &str, timeout: Duration) -> MessagingSubs
 #[cfg(test)]
 pub(super) fn test_prepare(config: &EmailConfig) -> Result<(), MessagingError> {
     prepare(config)
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn verify_remote_rejects_wrong_credential_without_network() {
+        let error = verify_remote(
+            &MessagingConfig {
+                email: Some(EmailConfig {
+                    smtp_server: Some("127.0.0.1".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &MessagingCredentials::Telegram {
+                token: "secret-token".to_owned().into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, MessagingError::ChannelConnectionFailed { message, .. } if message == "credential protocol does not match the listener")
+        );
+        assert!(!error.to_string().contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn verify_remote_rejects_no_configured_server_without_network() {
+        let credentials = MessagingCredentials::Email {
+            username: "user@example.com".to_owned().into(),
+            password: "secret-password".to_owned().into(),
+        };
+        let error = verify_remote(
+            &MessagingConfig {
+                email: Some(EmailConfig::default()),
+                ..Default::default()
+            },
+            &credentials,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, MessagingError::ChannelConnectionFailed { .. }));
+        assert!(!error.to_string().contains("secret-password"));
+    }
 }

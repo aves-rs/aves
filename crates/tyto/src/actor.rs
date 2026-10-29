@@ -188,7 +188,7 @@ impl Actor {
         })
     }
 
-    /// Routes a public request and replies immediately unless Send is handed off.
+    /// Routes a public request and replies immediately unless Send or TestConnection is handed off.
     async fn handle_message(&mut self, request: MessagingRequest) {
         let result = match request.payload {
             MessagingRequestPayload::StartServer => self.start_server().await,
@@ -208,6 +208,14 @@ impl Actor {
             }
             MessagingRequestPayload::ListConnections => self.list_connections().await,
             MessagingRequestPayload::CreateConnection { input } => self.create_connection(input).await,
+            MessagingRequestPayload::TestConnection {
+                transport,
+                credential_id,
+            } => {
+                self.start_test_connection(request.reply_to, transport, credential_id)
+                    .await;
+                return;
+            }
             MessagingRequestPayload::UpdateConnection { id, input } => self.update_connection(id, input).await,
             MessagingRequestPayload::SetConnectionEnabled { connection_id, enabled } => {
                 self.set_connection_enabled(connection_id, enabled).await

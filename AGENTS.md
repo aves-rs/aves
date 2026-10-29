@@ -16,6 +16,7 @@ This repository contains the reusable Aves runtime and three optional domain cra
 - Applications supply domain composition, root broadcasts/errors, transport bindings, and any content or credential providers. Do not import the trading application into these crates.
 - Preserve existing wire, migration, and storage identities unless a change explicitly calls for a migration. Package names do not rename domain contracts.
 - Prefer private implementation modules, concrete shared utility imports, and typed generated service contracts. Do not widen production APIs for tests.
+- **Never test against live external providers (Email, Slack, Telegram, etc.); always use mocks exclusively; no live credentials or network calls in automated tests.**
 
 ## Workflow
 

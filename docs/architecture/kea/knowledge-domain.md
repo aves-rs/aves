@@ -1,9 +1,10 @@
 ---
 title: Knowledge Domain Architecture
 type: architecture
-updated: 2026-10-23
+updated: 2026-10-29
 references:
   - crates/kea/AGENTS.md
+  - crates/kea/src/lib.rs
   - crates/kea/src/actor.rs
   - crates/kea/src/data.rs
   - crates/kea/src/domain.rs
@@ -31,6 +32,10 @@ Kea owns Knowledge and depends on the Aves runtime; Aves has no dependency on Ke
 Kea opens `config_dir/knowledge.db` with Aves's database API and tracks versions in `__knowledge_migrations`. Existing migrations live in `crates/kea/migrations/`, beside `src/`. Migration 2 is retained for already-deployed databases; migration 3 drops the former note, keyword, chunk, job, and embedding tables and creates `knowledge_data`. Existing database-backed notes are discarded, not imported into the directory. After migrations, `DataStore::open` calls the shared `aves::utils::database::maintain_database` helper, which checkpoints the WAL and conditionally reclaims free space (VACUUM only when the helper's thresholds are met). `KnowledgeDomain::stop` dispatches an internal `StopRuntime` request to the actor, which calls `DataStore::maintain_db` — the same helper — before acknowledging shutdown. There is no central database registry; each database owner invokes the shared helper at its own lifecycle boundaries.
 
 `knowledge_data` holds an exact case-sensitive key, a validated JSON object, and one UTC last-write timestamp. Upsert replaces the entire object; get and delete target an exact key and return not-found on absence. List returns keys and timestamps with inclusive RFC3339 date bounds, deterministic newest-first order, and limit/offset pagination.
+
+## Consumer reexport surface
+
+`KnowledgeConfig` is reexported from the Kea crate root for embedding applications (verified against `crates/kea/src/lib.rs`). Implementation modules (actor, handlers, migrations) remain private; only consumer contracts are reexported.
 
 ## Related
 

@@ -25,22 +25,8 @@ pub(super) async fn send(
 ) -> Result<MessagingSendReceipt, MessagingSendError> {
     let email = build_email(sender, message)?;
 
-    let host = settings
-        .smtp_server
-        .as_deref()
-        .ok_or_else(|| terminal(MessagingSendErrorCode::Validation, "SMTP server is missing"))?;
-    let port = settings.smtp_port.unwrap_or(587);
-    let credentials = Credentials::new(credentials.0.to_string(), credentials.1.to_string());
-    let transport = if port == 465 {
-        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
-    } else {
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
-    }
-    .map_err(|error| terminal(MessagingSendErrorCode::Validation, &error.to_string()))?
-    .port(port)
-    .credentials(credentials)
-    .timeout(Some(SEND_TIMEOUT))
-    .build();
+    let transport = build_smtp_transport(settings, credentials)
+        .map_err(|error| terminal(MessagingSendErrorCode::Validation, &error))?;
 
     let response = timeout(SEND_TIMEOUT, transport.send(email))
         .await
@@ -58,6 +44,29 @@ pub(super) async fn send(
             response.message().collect::<Vec<_>>().join(" ")
         ),
     })
+}
+
+pub(super) fn build_smtp_transport(
+    settings: &EmailConfig,
+    credentials: (&Zeroizing<String>, &Zeroizing<String>),
+) -> Result<AsyncSmtpTransport<Tokio1Executor>, String> {
+    let host = settings
+        .smtp_server
+        .as_deref()
+        .ok_or_else(|| "SMTP server is missing".to_owned())?;
+    let port = settings.smtp_port.unwrap_or(587);
+    let credentials = Credentials::new(credentials.0.to_string(), credentials.1.to_string());
+    let transport = if port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
+    }
+    .map_err(|error| error.to_string())?
+    .port(port)
+    .credentials(credentials)
+    .timeout(Some(SEND_TIMEOUT))
+    .build();
+    Ok(transport)
 }
 
 fn build_email(sender: &EmailSenderConfig, message: &NormalizedMessage) -> Result<Message, MessagingSendError> {

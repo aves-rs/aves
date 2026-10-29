@@ -14,7 +14,7 @@ use crate::types::{
     MessagingSubscriptionError, NormalizedMessage,
 };
 
-use super::connection::{ImapConnection, configure, connect};
+use super::connection::{ImapConnection, configure, connect, verify_remote};
 use super::send::send;
 use super::subscribe::{listen, run_filters};
 
@@ -61,6 +61,14 @@ impl MessagingPlugin for EmailPlugin {
             self.credentials = Some((username.clone(), password.clone()));
         }
         Ok(())
+    }
+
+    async fn verify_remote(
+        &mut self,
+        settings: &MessagingConfig,
+        credentials: &MessagingCredentials,
+    ) -> Result<(), MessagingError> {
+        verify_remote(settings, credentials).await
     }
 
     async fn listen(

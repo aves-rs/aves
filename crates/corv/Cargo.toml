@@ -24,7 +24,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # internal
-aves = { path = "../aves", version = "=0.6.0", features = ["test-support"] }
+aves = { path = "../aves", version = "=0.6.2", features = ["test-support"] }
 
 # external
 tempfile = { workspace = true }
@@ -32,7 +32,7 @@ tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves = { path = "../aves", version = "=0.6.0" }
+aves = { path = "../aves", version = "=0.6.2" }
 
 # external
 agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp"] }

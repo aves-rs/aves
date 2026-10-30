@@ -1,6 +1,9 @@
 use iroh::SecretKey;
 use keyring::Entry;
 
+#[cfg(all(target_os = "linux", feature = "keyring", not(test)))]
+use zbus_secret_service_keyring_store::cred::Wrapper;
+
 use super::types::AvesAuthError;
 
 const MACHINE_IDENTITY_ENTRY: &str = "auth-machine-identity";
@@ -33,7 +36,28 @@ impl MachineIdentityKeyring {
 
         let entry = Entry::new(namespace, MACHINE_IDENTITY_ENTRY)?;
         let secret_key = Self::load_or_create_entry(&entry)?;
+        #[cfg(all(target_os = "linux", feature = "keyring"))]
+        Self::refresh_label(&entry, namespace);
         Ok(Self { secret_key })
+    }
+
+    /// Derive the display label from the embedding application's namespace.
+    #[cfg(all(target_os = "linux", feature = "keyring", not(test)))]
+    fn refresh_label(entry: &Entry, namespace: &str) {
+        let mut application = namespace.chars();
+        let first = application.next().expect("validated nonempty namespace");
+        let label = format!("{}{} - Machine Identity", first.to_uppercase(), application.as_str());
+        let result = entry.inner.get_credential().and_then(|entry| {
+            if let Some(credential) = entry.as_any().downcast_ref::<Wrapper>()
+                && credential.get_label()? != label
+            {
+                credential.set_label(&label)?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            tracing::warn!("Could not update machine identity keyring display label");
+        }
     }
 
     #[cfg(test)]

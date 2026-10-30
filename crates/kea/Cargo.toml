@@ -24,14 +24,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # internal
-aves = { path = "../aves", version = "=0.6.0", features = ["test-support"] }
+aves = { path = "../aves", version = "=0.6.2", features = ["test-support"] }
 
 # external
 tempfile = { workspace = true }
 
 [dependencies]
 # internal
-aves = { path = "../aves", version = "=0.6.0" }
+aves = { path = "../aves", version = "=0.6.2" }
 
 # external
 chrono = { workspace = true }

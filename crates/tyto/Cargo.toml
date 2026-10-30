@@ -1,6 +1,6 @@
 [package]
 name = "aves-tyto"
-version = "0.6.2"
+version = "0.6.3"
 repository = "https://github.com/aves-rs/aves"
 description = "Specialized messaging domain for the Aves async application runtime"
 authors = { workspace = true }
@@ -24,15 +24,15 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # internal
-aves = { path = "../aves", version = "=0.6.2", features = ["test-support"] }
+aves = { path = "../aves", version = "=0.6.3", features = ["test-support"] }
 
 # external
 tempfile = { workspace = true }
 
 [dependencies]
 # internal
-aves = { path = "../aves", version = "=0.6.2" }
-aves-kea = { path = "../kea", version = "=0.6.2" }  # needed for "save to" functionality
+aves = { path = "../aves", version = "=0.6.3" }
+aves-kea = { path = "../kea", version = "=0.6.3" }  # needed for "save to" functionality
 
 # external
 async-imap = { workspace = true }

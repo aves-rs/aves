@@ -102,3 +102,4 @@ wasmtime = { version = "=50.0.0" }
 wasmtime-wasi = { version = "=50.0.0", features = ["p1"] }
 yaml_serde = { version = "=0.10.7" }
 zeroize = { version = "=1.9.1", features = ["derive"] }
+zbus-secret-service-keyring-store = { version = "=1.0.0" }

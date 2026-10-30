@@ -1,6 +1,6 @@
 [package]
 name = "aves_macros"
-version = "0.6.2"
+version = "0.6.3"
 repository = "https://github.com/aves-rs/aves"
 description = "Procedural macros for the Aves async application runtime"
 authors = { workspace = true }

@@ -1,6 +1,6 @@
 [package]
 name = "aves"
-version = "0.6.2"
+version = "0.6.3"
 repository = "https://github.com/aves-rs/aves"
 description = "Typed async application runtime with domain messaging, RPC, and durable workflow automation"
 authors = { workspace = true }
@@ -21,7 +21,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["keyring", "wasm-tests"]
 # Runs tests that require an available desktop OS keyring; headless CI disables default features.
-keyring = []
+keyring = ["dep:zbus-secret-service-keyring-store"]
 # Runs tests that execute the QuickJS-in-Wasmtime guest; headless CI disables default features.
 wasm-tests = []
 # Exposes test fixtures used by downstream crate test builds.
@@ -36,7 +36,7 @@ tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves_macros = { path = "macros", version = "=0.6.2" }
+aves_macros = { path = "macros", version = "=0.6.3" }
 
 # external
 async-trait = { workspace = true }
@@ -72,3 +72,6 @@ toml = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 zeroize = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { workspace = true, optional = true }

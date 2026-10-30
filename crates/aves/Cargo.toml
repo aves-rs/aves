@@ -1,6 +1,6 @@
 [package]
 name = "aves"
-version = "0.6.0"
+version = "0.6.2"
 repository = "https://github.com/aves-rs/aves"
 description = "Typed async application runtime with domain messaging, RPC, and durable workflow automation"
 authors = { workspace = true }
@@ -36,7 +36,7 @@ tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves_macros = { path = "macros", version = "=0.5.0" }
+aves_macros = { path = "macros", version = "=0.6.2" }
 
 # external
 async-trait = { workspace = true }

@@ -1,6 +1,6 @@
 [package]
 name = "aves-corv"
-version = "0.6.0"
+version = "0.6.2"
 repository = "https://github.com/aves-rs/aves"
 description = "Specialized discussion domain for the Aves async application runtime"
 authors = { workspace = true }

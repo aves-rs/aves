@@ -6,6 +6,8 @@ use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
 use aves::auth::Jwt;
 use aves::bus::{BusControlError, BusMcpEndpoint, BusSudoService, CloseMcpInput, OpenMcpInput};
 
+const MCP_REGISTRATION_HEADER: &str = "X-Sluice-Mcp-Registration";
+
 /// A bus-owned MCP listener lease used by one ACP worker.
 ///
 /// Discuss only retains the bus-provided endpoint descriptors. The bus actor
@@ -106,6 +108,24 @@ pub(super) fn endpoint_to_acp_descriptor(endpoint: &BusMcpEndpoint, worker_jwt: 
             format!("Bearer {}", worker_jwt.as_str()),
         )]),
     )
+}
+
+/// Marks HTTP descriptors with a registration generation so a Provider that
+/// skips identical re-registrations accepts them again.
+pub(super) fn descriptors_for_registration(descriptors: &[McpServer], generation: u64) -> Vec<McpServer> {
+    descriptors
+        .iter()
+        .cloned()
+        .map(|descriptor| match descriptor {
+            McpServer::Http(mut server) => {
+                server
+                    .headers
+                    .push(HttpHeader::new(MCP_REGISTRATION_HEADER, generation.to_string()));
+                McpServer::Http(server)
+            }
+            descriptor => descriptor,
+        })
+        .collect()
 }
 
 #[cfg(test)]

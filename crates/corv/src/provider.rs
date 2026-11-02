@@ -743,6 +743,7 @@ impl Actor {
                     callback_routes,
                     mcp_acp,
                     mcp_http,
+                    ..
                 } => {
                     supervisor.chat_sessions.clear();
                     connection.take();

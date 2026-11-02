@@ -253,26 +253,28 @@ impl Actor {
         };
         let launch_server = plugins::for_agent(key).launch_server(agent_spec.server());
         let agent = Self::acp_agent_from_server(&launch_server)?;
-        let (callback_router, callback_routes, shared_connection, shared_mcp_capabilities) = self
-            .provider_supervisors
-            .get(key)
-            .and_then(|supervisor| match &supervisor.resources {
-                ProviderSupervisorResources::Shared {
-                    connection: Some(connection),
-                    callback_router,
-                    callback_routes,
-                    mcp_acp,
-                    mcp_http,
-                    ..
-                } => Some((
-                    callback_router.clone(),
-                    callback_routes.clone(),
-                    Some(connection.clone()),
-                    Some((*mcp_acp, *mcp_http)),
-                )),
-                ProviderSupervisorResources::Shared { .. } | ProviderSupervisorResources::Isolated { .. } => None,
-            })
-            .unwrap_or_else(|| (Arc::new(Mutex::new(CallbackRouter::default())), None, None, None));
+        let (callback_router, callback_routes, shared_connection, shared_mcp_capabilities, shared_mcp_registrations) =
+            self.provider_supervisors
+                .get(key)
+                .and_then(|supervisor| match &supervisor.resources {
+                    ProviderSupervisorResources::Shared {
+                        connection: Some(connection),
+                        callback_router,
+                        callback_routes,
+                        mcp_acp,
+                        mcp_http,
+                        mcp_registrations,
+                        ..
+                    } => Some((
+                        callback_router.clone(),
+                        callback_routes.clone(),
+                        Some(connection.clone()),
+                        Some((*mcp_acp, *mcp_http)),
+                        Some(mcp_registrations.clone()),
+                    )),
+                    ProviderSupervisorResources::Shared { .. } | ProviderSupervisorResources::Isolated { .. } => None,
+                })
+                .unwrap_or_else(|| (Arc::new(Mutex::new(CallbackRouter::default())), None, None, None, None));
         let configured_defaults = config_settings_from_value(agent_spec.default_session_config());
         let conn = self.persistence.acquire_connection().await?;
         let agent_defaults = if transient_connectivity {
@@ -322,6 +324,7 @@ impl Actor {
         let agents_workspace = session_cwd.unwrap_or_else(|| self.agents_workspace.clone());
         let bus_service = self.bus_service.clone();
         let auth_service = self.auth_service.clone();
+        let shared_mcp_registrations = shared_mcp_registrations.filter(|_| node_token.is_none());
         let (worker_jwt, worker_jti) = if let Some(node_token) = node_token {
             (node_token, None)
         } else {
@@ -387,6 +390,7 @@ impl Actor {
             callback_routes,
             shared_connection,
             shared_mcp_capabilities,
+            shared_mcp_registrations,
         };
         let join_handle = tokio::spawn(run_session_worker_with_reporting(
             agent,

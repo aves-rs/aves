@@ -1,8 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use agent_client_protocol::schema::v1::{
-    CreateElicitationResponse, ElicitationAction, ElicitationMode, ListSessionsRequest, NewSessionResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionConfigOptionValue, SessionId,
+    CreateElicitationResponse, ElicitationAction, ElicitationMode, ListSessionsRequest, McpServer, NewSessionResponse,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest, SessionConfigOptionValue, SessionId,
     SetSessionConfigOptionRequest,
 };
 use agent_client_protocol::{
@@ -29,7 +29,7 @@ use super::config::merged_config_preferences;
 use super::database::{PersistenceJob, enqueue_persistence_job, enqueue_utility_persistence, spawn_persistence_queue};
 use super::elicitation::content_to_sdk_answer;
 use super::mcp_direct::McpAcpShim;
-use super::mcp_relay::{McpHttpLease, endpoint_to_acp_descriptor};
+use super::mcp_relay::{McpHttpLease, descriptors_for_registration, endpoint_to_acp_descriptor};
 use super::plugins::{self, DiscussAgentPlugin, PluginCaptureState};
 use super::session::{
     AgentNodeTerminalState, AttachedInspectorReaders, McpAcpCapabilityWarningState, McpTransportSelection,
@@ -40,7 +40,9 @@ use super::session::{
     open_configured_session, provider_sessions_from_schema, publish_mcp_status, select_mcp_transport,
     spawn_inspector_reader_reap, terminal_auth_methods,
 };
-use super::supervisor::{CallbackEvent, CallbackRouteRegistry, CallbackRouteTarget, CallbackRouter};
+use super::supervisor::{
+    CallbackEvent, CallbackRouteRegistry, CallbackRouteTarget, CallbackRouter, McpRegistrationClaim,
+};
 use super::types::{
     DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload, DiscussError,
     DiscussPermissionOption, DiscussStreamEvent, DiscussUtilityPayload, DiscussUtilityUpdate, PendingPermission,
@@ -135,6 +137,7 @@ pub(super) async fn run_connected_session(
         mcp_handlers,
         mcp_http_lease,
         mcp_descriptors,
+        mut mcp_claim,
         opened,
     } = setup;
     let mut session = opened.session;
@@ -245,6 +248,9 @@ pub(super) async fn run_connected_session(
                 match command {
                     None | Some(WorkerCommand::Stop) => break,
                     Some(WorkerCommand::SendUserTurn { text, reply }) => {
+                        if awaiting_turn && let Some(claim) = &mut mcp_claim {
+                            refresh_stale_mcp_registration(&session, &agents_workspace, &mcp_descriptors, claim).await;
+                        }
                         handle_send_user_turn(
                             &mut session,
                             text,
@@ -368,6 +374,35 @@ async fn teardown_connected_worker(
     }
     drop(persistence_queue);
     let _ = persistence_drain.await;
+}
+
+/// Re-registers this session's MCP endpoints when the shared Provider's
+/// workspace registration still points at an ended session's endpoints.
+async fn refresh_stale_mcp_registration(
+    session: &WorkerSession,
+    agents_workspace: &Path,
+    mcp_descriptors: &[McpServer],
+    claim: &mut McpRegistrationClaim,
+) {
+    if !claim.is_stale() {
+        return;
+    }
+    let request = ResumeSessionRequest::new(session.session_id().clone(), agents_workspace.to_path_buf())
+        .mcp_servers(descriptors_for_registration(mcp_descriptors, claim.next_generation()));
+    match session
+        .connection()
+        .send_request(request)
+        .block_task()
+        .await
+    {
+        Ok(_) => {
+            claim.reclaim();
+            tracing::info!(target: "application_acp", acp_session_id = %session.session_id(), "re-registered stale shared MCP endpoints");
+        }
+        Err(error) => {
+            tracing::warn!(target: "application_acp", ?error, acp_session_id = %session.session_id(), "could not re-register stale shared MCP endpoints");
+        }
+    }
 }
 
 async fn list_provider_sessions(session: &WorkerSession) -> Result<Vec<ProviderSessionInfo>, DiscussError> {
@@ -494,6 +529,7 @@ struct WorkerSessionSetup {
     mcp_handlers: Vec<DynamicHandlerGuard<Agent>>,
     mcp_http_lease: Option<McpHttpLease>,
     mcp_descriptors: Vec<agent_client_protocol::schema::v1::McpServer>,
+    mcp_claim: Option<McpRegistrationClaim>,
     opened: OpenedWorkerSession,
 }
 
@@ -522,6 +558,11 @@ async fn prepare_worker_session(
     )
     .await?;
     let provisioned_mcp = !mcp_descriptors.is_empty();
+    let mcp_claim = params
+        .shared_mcp_registrations
+        .as_ref()
+        .filter(|_| provisioned_mcp)
+        .map(|registrations| registrations.claim(&params.agents_workspace, params.sluice_session_id));
     let opened = open_worker_session(
         connection,
         &params.agents_workspace,
@@ -551,6 +592,7 @@ async fn prepare_worker_session(
         mcp_handlers,
         mcp_http_lease,
         mcp_descriptors,
+        mcp_claim,
         opened,
     })
 }

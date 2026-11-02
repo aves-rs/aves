@@ -40,6 +40,7 @@ use super::plugins::{self, ConfigSettings};
 use super::storage::DiscussPersistence;
 use super::supervisor::{
     CallbackEvent, CallbackRouteRegistry, CallbackRouteTarget, CallbackRouter, ElicitationCorrelationId,
+    SharedMcpRegistrations,
 };
 use super::types::{
     DiscussConfigOption, DiscussError, DiscussMcpStatus, DiscussStreamEvent, ElicitationRequestId, PendingElicitation,
@@ -125,6 +126,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
     pub(super) shared_connection: Option<ConnectionTo<Agent>>,
     pub(super) shared_mcp_capabilities: Option<(bool, bool)>,
+    pub(super) shared_mcp_registrations: Option<SharedMcpRegistrations>,
 }
 
 pub(super) struct WorkerReady {

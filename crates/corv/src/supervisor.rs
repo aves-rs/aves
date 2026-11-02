@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as SyncMutex, MutexGuard};
 
 use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, RequestPermissionRequest, RequestPermissionResponse, SessionId,
@@ -194,6 +195,72 @@ impl CallbackRouter {
     }
 }
 
+/// Session whose live MCP endpoints a shared Provider uses for each workspace.
+///
+/// Shared Providers may register MCP servers per workspace rather than per
+/// session, so the newest session's endpoints serve every session in that
+/// workspace until its worker ends.
+#[derive(Clone, Default)]
+pub(super) struct SharedMcpRegistrations(Arc<SyncMutex<HashMap<PathBuf, SluiceSessionId>>>);
+
+impl SharedMcpRegistrations {
+    /// Record that this session's endpoints now serve `workspace`.
+    pub(super) fn claim(&self, workspace: &Path, sluice_session_id: SluiceSessionId) -> McpRegistrationClaim {
+        let claim = McpRegistrationClaim {
+            registrations: self.clone(),
+            workspace: workspace.to_path_buf(),
+            sluice_session_id,
+            generation: 0,
+        };
+        claim.reclaim();
+        claim
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, SluiceSessionId>> {
+        self.0.lock().expect("shared MCP registration lock")
+    }
+}
+
+/// One worker's MCP registration in a shared Provider workspace.
+///
+/// Dropping the claim, including on worker abort, marks the workspace stale
+/// when this session's endpoints were the ones in use.
+pub(super) struct McpRegistrationClaim {
+    registrations: SharedMcpRegistrations,
+    workspace: PathBuf,
+    sluice_session_id: SluiceSessionId,
+    generation: u64,
+}
+
+impl McpRegistrationClaim {
+    /// Whether no live session's endpoints serve this workspace.
+    pub(super) fn is_stale(&self) -> bool {
+        !self.registrations.lock().contains_key(&self.workspace)
+    }
+
+    /// Advance the registration generation used to make a re-registration distinct.
+    pub(super) fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// Record that this session's endpoints serve the workspace again.
+    pub(super) fn reclaim(&self) {
+        self.registrations
+            .lock()
+            .insert(self.workspace.clone(), self.sluice_session_id);
+    }
+}
+
+impl Drop for McpRegistrationClaim {
+    fn drop(&mut self) {
+        let mut registrations = self.registrations.lock();
+        if registrations.get(&self.workspace) == Some(&self.sluice_session_id) {
+            registrations.remove(&self.workspace);
+        }
+    }
+}
+
 /// Internal lifecycle phases used to claim Provider transitions in the actor.
 ///
 /// The public projection intentionally collapses `Idle` and `Stopping` into
@@ -224,6 +291,7 @@ pub(super) enum ProviderSupervisorResources {
         mcp_http: bool,
         callback_router: Arc<Mutex<CallbackRouter>>,
         callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
+        mcp_registrations: SharedMcpRegistrations,
     },
     Isolated {
         child_sessions: HashSet<SluiceSessionId>,
@@ -252,6 +320,7 @@ impl ProviderSupervisor {
                 mcp_http: false,
                 callback_router: Arc::new(Mutex::new(CallbackRouter::default())),
                 callback_routes: None,
+                mcp_registrations: SharedMcpRegistrations::default(),
             },
             ConnectionStrategy::Isolated => ProviderSupervisorResources::Isolated {
                 child_sessions: HashSet::new(),

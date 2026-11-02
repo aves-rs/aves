@@ -1,5 +1,8 @@
 extern crate self as aves;
 
+#[cfg(all(test, target_os = "linux", feature = "keyring"))]
+use zbus_secret_service_keyring_store as _;
+
 mod migrations;
 
 pub mod auth;

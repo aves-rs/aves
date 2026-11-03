@@ -38,7 +38,7 @@ jobs:
 
       - name: Build packages
         run: |
-          cargo check
+          cargo check --locked
 
       - name: Analyze packages
         run: |

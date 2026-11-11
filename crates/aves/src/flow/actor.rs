@@ -24,6 +24,7 @@ use super::cron::FlowTriggerRecord;
 use super::database::{ExecutionDocumentLink, FlowStore};
 use super::files::seed_workspace_seeds;
 use super::graph::{FlowGraph, GraphNode};
+use super::hook::{FlowAppCheckpoint, FlowAppHookContext, FlowAppLandingContext, FlowAppWorkspaceHook};
 use super::mailbox::{MailboxMessage, TerminalResult, TerminalStatus, TokenExpired};
 use super::mcp::FlowMcpPorts;
 use super::messages::{
@@ -79,6 +80,8 @@ pub(super) struct ActorDependencies {
     pub(super) node_registration_supply: NodeRegistrationSupply,
     /// The workspace source service for the Flow actor.
     pub(super) workspace_source_service: ServiceReader<dyn FlowWorkspaceSourceService>,
+    /// Optional embedding-application workspace lifecycle integration.
+    pub(super) app_workspace_hook: Option<Arc<dyn FlowAppWorkspaceHook>>,
     /// The retention completed runs for the Flow actor.
     pub(super) retention_completed_runs: u32,
     /// Test only fixture
@@ -100,6 +103,8 @@ pub(super) struct Actor {
     pub(super) mcp_ports: FlowMcpPorts,
     /// The workspace source service for the Flow actor.
     pub(super) workspace_source_service: ServiceReader<dyn FlowWorkspaceSourceService>,
+    /// Optional embedding-application workspace lifecycle integration.
+    pub(super) app_workspace_hook: Option<Arc<dyn FlowAppWorkspaceHook>>,
     /// The flow definitions for the Flow actor.
     pub(super) definitions: HashMap<FlowId, FlowDefinition>,
     /// The lifecycle adapter for the Flow actor.
@@ -162,6 +167,7 @@ impl Actor {
             node_registrations,
             node_registration_supply,
             workspace_source_service,
+            app_workspace_hook,
             sync_services,
             mobility_service,
             retention_completed_runs,
@@ -221,7 +227,15 @@ impl Actor {
             .filter(|snapshot| !snapshot.execution.status.is_terminal())
             .filter(|snapshot| mobility.permits_local_work(snapshot.execution.flow_id))
         {
-            match Self::restore_execution(snapshot, &store, &workspace, &node_registry).await {
+            match Self::restore_execution(
+                snapshot,
+                &store,
+                &workspace,
+                &node_registry,
+                app_workspace_hook.as_ref(),
+            )
+            .await
+            {
                 Ok((id, state)) => {
                     execution.insert(id, state);
                 }
@@ -247,6 +261,7 @@ impl Actor {
                 mcp_ports: mcp_ports.clone(),
             },
             workspace_source_service,
+            app_workspace_hook,
             definitions,
             mobility,
             mobility_service,
@@ -586,6 +601,25 @@ impl Actor {
         let (execution_root, imported_workspace_root) = self
             .prepare_start_workspace(execution_id, &graph, &definition, &pulse, invocation_kind)
             .await?;
+        if let Some(hook) = &self.app_workspace_hook {
+            let context = FlowAppHookContext {
+                execution_id,
+                flow_id: definition.flow_id,
+                definition_revision: definition.revision,
+                execution_root: execution_root.clone(),
+                invocation_kind,
+            };
+            if let Err(source) = hook.takeoff(context).await {
+                if let Err(cleanup_error) = self
+                    .workspace
+                    .discard_unlinked_execution(execution_id)
+                    .await
+                {
+                    tracing::warn!(error = ?cleanup_error, "failed to discard unlinked Flow execution after takeoff failure");
+                }
+                return Err(FlowError::AppWorkspaceTakeoff { source });
+            }
+        }
         let document = self.workspace.create_execution_document().await?;
         let mut tick_loop = FlowTickLoop::compile(
             &graph,
@@ -612,6 +646,7 @@ impl Actor {
             execution_root,
             graph_nodes(&graph.ast().root),
             document,
+            invocation_kind,
         )
         .await?;
         Ok(execution_id)
@@ -721,6 +756,7 @@ impl Actor {
         execution_root: PathBuf,
         node_envelopes: HashMap<super::types::FlowNodeId, FlowNode>,
         document: ExecutionDocumentLink,
+        invocation_kind: FlowInvocationKind,
     ) -> Result<(), FlowError> {
         let pending_dispatches = first_tick.dispatches;
         let reconstruction = first_tick.reconstruction;
@@ -728,14 +764,33 @@ impl Actor {
         let blackboard_snapshot = tick_loop.blackboard().values().clone();
         let scratchpad = tick_loop.scratchpad_snapshot();
         let nodes = tick_loop.node_snapshots();
-        let (workspace_checkpoint, workspace_entries) = self
-            .workspace
-            .capture_checkpoint(execution_id, &execution_root, &document, &BTreeMap::new(), 0)
-            .await?;
+        let app_checkpoint = if let Some(hook) = &self.app_workspace_hook {
+            hook.checkpoint(FlowAppHookContext {
+                execution_id,
+                flow_id: definition.flow_id,
+                definition_revision: definition.revision,
+                execution_root: execution_root.clone(),
+                invocation_kind,
+            })
+            .await
+            .map_err(|source| FlowError::AppWorkspaceCheckpoint { source })?
+        } else {
+            FlowAppCheckpoint::Flow
+        };
+        let (workspace_checkpoint, workspace_entries) = if app_checkpoint == FlowAppCheckpoint::App {
+            (None, BTreeMap::new())
+        } else {
+            let (checkpoint, entries) = self
+                .workspace
+                .capture_checkpoint(execution_id, &execution_root, &document, &BTreeMap::new(), 0)
+                .await?;
+            (Some(checkpoint), entries)
+        };
         let snapshot = FlowExecutionSnapshot {
             execution_id,
             flow_id: definition.flow_id,
             revision: definition.revision,
+            invocation_kind,
             status: FlowExecutionStatus::Active,
             started_at: started_at.clone(),
             completed_at: None,
@@ -747,7 +802,7 @@ impl Actor {
                 blackboard: blackboard_snapshot,
                 code_roots: code_roots.clone(),
                 state_roots: state_roots.clone(),
-                workspace_checkpoint: Some(workspace_checkpoint.clone()),
+                workspace_checkpoint: workspace_checkpoint.clone(),
                 workspace_entries: workspace_entries.clone(),
                 imported_workspace_root: imported_workspace_root.clone(),
                 reconstruction,
@@ -771,7 +826,7 @@ impl Actor {
         self.execution.insert(
             execution_id,
             ExecutionState {
-                active: ActiveExecution::new(definition.flow_id, definition.revision, started_at),
+                active: ActiveExecution::new(definition.flow_id, definition.revision, started_at, invocation_kind),
                 nodes: node_envelopes,
                 tick_loop,
                 pending_start_reply: None,
@@ -781,7 +836,7 @@ impl Actor {
                 code_roots,
                 state_roots,
                 workspace_entries,
-                workspace_checkpoint: Some(workspace_checkpoint),
+                workspace_checkpoint,
                 imported_workspace_root: imported_workspace_root.clone(),
                 workspace_mappings: definition.workspace_mappings,
                 checkpoint_sequence: 0,
@@ -1001,6 +1056,7 @@ impl Actor {
         store: &FlowStore,
         workspace: &WorkspaceStore,
         node_registry: &FlowNodeRegistry,
+        app_workspace_hook: Option<&Arc<dyn FlowAppWorkspaceHook>>,
     ) -> Result<(FlowExecutionId, ExecutionState), FlowError> {
         let id = snapshot.execution.execution_id;
         let document = store.load_execution_document(id).await?;
@@ -1012,6 +1068,26 @@ impl Actor {
         let root = workspace
             .restore_execution_workspace(snapshot, &graph, &document, node_registry)
             .await?;
+        if let Some(hook) = app_workspace_hook {
+            if snapshot.workspace_checkpoint.is_none() {
+                workspace
+                    .write_trigger(
+                        &root,
+                        snapshot.blackboard.get("pulse").unwrap_or(&Value::Null),
+                        snapshot.execution.invocation_kind,
+                    )
+                    .await?;
+            }
+            hook.restore(FlowAppHookContext {
+                execution_id: id,
+                flow_id: snapshot.execution.flow_id,
+                definition_revision: snapshot.execution.revision,
+                execution_root: root.clone(),
+                invocation_kind: snapshot.execution.invocation_kind,
+            })
+            .await
+            .map_err(|source| FlowError::AppWorkspaceRestore { source })?;
+        }
         Ok((
             id,
             ExecutionState {
@@ -1019,6 +1095,7 @@ impl Actor {
                     snapshot.execution.flow_id,
                     snapshot.execution.revision,
                     snapshot.execution.started_at.clone(),
+                    snapshot.execution.invocation_kind,
                 ),
                 nodes: graph_nodes(&graph.ast().root),
                 tick_loop: FlowTickLoop::restore(&graph, node_registry, snapshot, root)?,
@@ -1072,6 +1149,7 @@ impl Actor {
                 execution_id: *execution_id,
                 flow_id: state.active.flow_id(),
                 revision: state.active.revision(),
+                invocation_kind: state.active.invocation_kind(),
                 status: if state.abort_pending {
                     FlowExecutionStatus::Aborting
                 } else {
@@ -1280,6 +1358,17 @@ impl Actor {
     }
 
     async fn finalize_abort(&mut self, execution_id: FlowExecutionId) -> Result<(), FlowError> {
+        let correlations = self
+            .execution
+            .get(&execution_id)
+            .map(|state| {
+                state
+                    .pending_terminal_persistence
+                    .values()
+                    .map(|pending| pending.correlation.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut durable = {
             let state = self
                 .execution
@@ -1306,6 +1395,9 @@ impl Actor {
 
         let snapshot = durable.execution.clone();
         self.snapshot_store.save(&durable).await?;
+
+        self.land_execution_best_effort(&snapshot, correlations)
+            .await;
 
         self.terminal_executions.push(snapshot.clone());
         self.revoke_execution_tokens_best_effort(execution_id).await;
@@ -1334,6 +1426,30 @@ impl Actor {
     pub(super) async fn revoke_execution_tokens_best_effort(&mut self, execution_id: FlowExecutionId) {
         if let Err(error) = self.revoke_execution_tokens(execution_id).await {
             tracing::warn!(%execution_id, %error, "Flow terminal token cleanup failed after durable terminalization");
+        }
+    }
+
+    pub(super) async fn land_execution_best_effort(
+        &self,
+        snapshot: &FlowExecutionSnapshot,
+        correlations: Vec<LifecycleCorrelation>,
+    ) {
+        let Some(hook) = &self.app_workspace_hook else {
+            return;
+        };
+        let context = FlowAppLandingContext {
+            execution: FlowAppHookContext {
+                execution_id: snapshot.execution_id,
+                flow_id: snapshot.flow_id,
+                definition_revision: snapshot.revision,
+                execution_root: self.workspace.execution_root(snapshot.execution_id),
+                invocation_kind: snapshot.invocation_kind,
+            },
+            status: snapshot.status.clone(),
+            correlations,
+        };
+        if let Err(error) = hook.landing(context).await {
+            tracing::warn!(execution_id = %snapshot.execution_id, %error, "Flow application workspace landing failed after durable terminalization");
         }
     }
 

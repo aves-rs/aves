@@ -1,11 +1,12 @@
-use async_trait::async_trait;
-use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::oneshot;
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::auth::{
     AuthSudoService, AvesAuthError, Jwt,
@@ -29,6 +30,10 @@ use crate::utils::database::{MigrationRunner, connect_database};
 use super::super::database::FlowStore;
 use super::super::files::{checked_relative, seed_workspace_seeds};
 use super::super::fixtures::NativeDocsFixture;
+use super::super::hook::{
+    FlowAppCheckpoint, FlowAppCheckpointFuture, FlowAppHookContext, FlowAppHookError, FlowAppHookFuture,
+    FlowAppLandingContext, FlowAppWorkspaceHook,
+};
 use super::super::registration::NodeRegistrationSupply;
 use super::super::types::FlowMobilityReadiness;
 use super::super::{
@@ -514,6 +519,93 @@ impl TasksLifecycleSudoService for SequenceTasks {
 
 struct TestWorkspaceSource;
 
+#[derive(Clone)]
+enum HookCall {
+    Checkpoint(FlowAppHookContext),
+    Restore(FlowAppHookContext),
+    Takeoff(FlowAppHookContext),
+    Landing(FlowAppLandingContext),
+    Release(FlowAppHookContext),
+}
+
+#[derive(Default)]
+struct RecordingWorkspaceHook {
+    calls: Mutex<Vec<HookCall>>,
+    fail_checkpoint: bool,
+    checkpoint_owner: FlowAppCheckpoint,
+    symlink_on_takeoff: bool,
+    fail_takeoff: bool,
+    fail_landing: bool,
+    fail_release: bool,
+}
+
+impl RecordingWorkspaceHook {
+    fn calls(&self) -> Vec<HookCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl FlowAppWorkspaceHook for RecordingWorkspaceHook {
+    fn checkpoint(&self, context: FlowAppHookContext) -> FlowAppCheckpointFuture<'_> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HookCall::Checkpoint(context));
+        Box::pin(async move {
+            if self.fail_checkpoint {
+                Err(Box::new(std::io::Error::other("checkpoint failed")) as FlowAppHookError)
+            } else {
+                Ok(self.checkpoint_owner)
+            }
+        })
+    }
+
+    fn restore(&self, context: FlowAppHookContext) -> FlowAppHookFuture<'_> {
+        self.calls.lock().unwrap().push(HookCall::Restore(context));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn takeoff(&self, context: FlowAppHookContext) -> FlowAppHookFuture<'_> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HookCall::Takeoff(context.clone()));
+        Box::pin(async move {
+            if self.fail_takeoff {
+                Err(Box::new(std::io::Error::other("takeoff failed")) as FlowAppHookError)
+            } else {
+                #[cfg(unix)]
+                if self.symlink_on_takeoff {
+                    std::os::unix::fs::symlink("missing-target", context.execution_root.join("workspace-link"))?;
+                }
+                Ok(())
+            }
+        })
+    }
+
+    fn landing(&self, context: FlowAppLandingContext) -> FlowAppHookFuture<'_> {
+        self.calls.lock().unwrap().push(HookCall::Landing(context));
+        Box::pin(async move {
+            if self.fail_landing {
+                Err(Box::new(std::io::Error::other("landing failed")) as FlowAppHookError)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn release_artifacts(&self, context: FlowAppHookContext) -> FlowAppHookFuture<'_> {
+        self.calls.lock().unwrap().push(HookCall::Release(context));
+        Box::pin(async move {
+            if self.fail_release {
+                Err(Box::new(std::io::Error::other("release failed")) as FlowAppHookError)
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
 struct RejectingMobilityService;
 
 impl super::super::mobility::FlowMobilityService for RejectingMobilityService {
@@ -825,6 +917,7 @@ async fn echo_actor(
             node_registration_supply: NodeRegistrationSupply::default(),
             bus_context: BusRpcContext::unavailable(),
             workspace_source_service: ServiceReader::from_published_test_service(Arc::new(TestWorkspaceSource)),
+            app_workspace_hook: None,
             sync_services: native_fixture.sync_services(),
             mobility_service: Arc::new(RejectingMobilityService),
             retention_completed_runs: 10,
@@ -1070,6 +1163,7 @@ async fn actor_for_with_agent_and_retention(
             node_registration_supply: NodeRegistrationSupply::default(),
             bus_context: BusRpcContext::unavailable(),
             workspace_source_service: ServiceReader::from_published_test_service(Arc::new(TestWorkspaceSource)),
+            app_workspace_hook: None,
             sync_services,
             mobility_service,
             retention_completed_runs,
@@ -1099,6 +1193,7 @@ async fn retention_update_is_applied_while_idle() {
         execution_id,
         flow_id: FlowId(Uuid::new_v4()),
         revision: 1,
+        invocation_kind: super::super::types::FlowInvocationKind::Manual,
         status: FlowExecutionStatus::Succeeded,
         started_at: FlowTimestamp::now(),
         completed_at: Some(FlowTimestamp::now()),
@@ -1159,6 +1254,746 @@ async fn start_flow(actor: &mut Actor, flow_id: FlowId) -> FlowExecutionId {
         panic!("start response")
     };
     execution_id
+}
+
+async fn send_flow_request(actor: &mut Actor, payload: FlowRequestPayload) -> Result<FlowResponse, FlowError> {
+    let (reply_to, reply_rx) = oneshot::channel();
+    actor
+        .handle_message(FlowRequest { payload, reply_to })
+        .await;
+    reply_rx.await.expect("Flow actor must answer the request")
+}
+
+async fn finish_flow(actor: &mut Actor, flow_id: FlowId) -> FlowExecutionId {
+    let execution_id = start_flow(actor, flow_id).await;
+    let completion = actor
+        .completion_rx
+        .recv()
+        .await
+        .expect("Flow owner completion channel must remain open");
+    actor.handle_dispatch_result(completion).await.unwrap();
+    execution_id
+}
+
+#[tokio::test]
+async fn start_request_returns_takeoff_error_and_create_then_start_succeeds() {
+    let failed_dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut failed_actor, _) = actor_for(failed_dir.path(), tasks.clone()).await;
+    failed_actor.app_workspace_hook = Some(Arc::new(RecordingWorkspaceHook {
+        fail_takeoff: true,
+        ..Default::default()
+    }));
+    failed_actor.running = true;
+    let failed_flow_id = FlowId(Uuid::new_v4());
+    assert!(matches!(
+        send_flow_request(
+            &mut failed_actor,
+            FlowRequestPayload::CreateFlow {
+                flow: definition(failed_flow_id, 1),
+            },
+        )
+        .await,
+        Ok(FlowResponse::FlowCreated { .. })
+    ));
+    assert!(matches!(
+        send_flow_request(
+            &mut failed_actor,
+            FlowRequestPayload::Start {
+                flow_id: failed_flow_id,
+                pulse: serde_json::Value::Null,
+                automatic: false,
+                invocation_kind: FlowInvocationKind::Manual,
+            },
+        )
+        .await,
+        Err(FlowError::AppWorkspaceTakeoff { .. })
+    ));
+    assert_eq!(tasks.starts.load(Ordering::SeqCst), 0);
+    assert!(failed_actor.execution.is_empty());
+    failed_actor.shutdown().await.unwrap();
+
+    let success_dir = tempfile::tempdir().unwrap();
+    let (mut success_actor, _) = actor_for(
+        success_dir.path(),
+        Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick: false,
+            last_source: Mutex::new(None),
+        }),
+    )
+    .await;
+    success_actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    assert!(matches!(
+        send_flow_request(
+            &mut success_actor,
+            FlowRequestPayload::CreateFlow {
+                flow: definition(flow_id, 1),
+            },
+        )
+        .await,
+        Ok(FlowResponse::FlowCreated { .. })
+    ));
+    let execution_id = finish_flow(&mut success_actor, flow_id).await;
+    assert!(
+        success_actor
+            .terminal_executions
+            .iter()
+            .any(|run| { run.execution_id == execution_id && run.status == FlowExecutionStatus::Succeeded })
+    );
+    success_actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_execution_requests_list_each_outcome_once_and_return_terminal_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _) = actor_for(
+        dir.path(),
+        Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick: false,
+            last_source: Mutex::new(None),
+        }),
+    )
+    .await;
+    actor.running = true;
+    let success_flow = FlowId(Uuid::new_v4());
+    assert!(
+        send_flow_request(
+            &mut actor,
+            FlowRequestPayload::CreateFlow {
+                flow: definition(success_flow, 1),
+            },
+        )
+        .await
+        .is_ok()
+    );
+    let succeeded = finish_flow(&mut actor, success_flow).await;
+
+    let failed_flow = FlowId(Uuid::new_v4());
+    let mut failing_definition = definition(failed_flow, 1);
+    let mut graph = serde_json::to_value(&failing_definition.graph).unwrap();
+    graph["root"]["node"]["outputs"] = json!([{"name":"required","key":"result"}]);
+    failing_definition.graph = serde_json::from_value(graph).unwrap();
+    assert!(
+        send_flow_request(
+            &mut actor,
+            FlowRequestPayload::CreateFlow {
+                flow: failing_definition
+            },
+        )
+        .await
+        .is_ok()
+    );
+    let failed = finish_flow(&mut actor, failed_flow).await;
+
+    let aborted_flow = FlowId(Uuid::new_v4());
+    assert!(
+        send_flow_request(
+            &mut actor,
+            FlowRequestPayload::CreateFlow {
+                flow: definition(aborted_flow, 1),
+            },
+        )
+        .await
+        .is_ok()
+    );
+    let aborted = start_flow(&mut actor, aborted_flow).await;
+    assert!(matches!(
+        send_flow_request(&mut actor, FlowRequestPayload::Abort { execution_id: aborted }).await,
+        Ok(FlowResponse::Aborted { .. })
+    ));
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+
+    let expected = [
+        (succeeded, FlowExecutionStatus::Succeeded),
+        (failed, FlowExecutionStatus::Failed),
+        (aborted, FlowExecutionStatus::Aborted),
+    ];
+    for _ in 0..2 {
+        let Ok(FlowResponse::TerminalExecutionsListed { executions }) =
+            send_flow_request(&mut actor, FlowRequestPayload::ListTerminalExecutions).await
+        else {
+            panic!("terminal execution list response")
+        };
+        for (execution_id, status) in &expected {
+            assert_eq!(
+                executions
+                    .iter()
+                    .filter(|execution| execution.execution_id == *execution_id)
+                    .count(),
+                1,
+            );
+            let Ok(FlowResponse::ExecutionDetailRetrieved { detail }) = send_flow_request(
+                &mut actor,
+                FlowRequestPayload::GetExecutionDetail {
+                    execution_id: *execution_id,
+                },
+            )
+            .await
+            else {
+                panic!("execution detail response")
+            };
+            assert_eq!(detail.execution.status, *status);
+        }
+        assert_eq!(executions.len(), expected.len());
+    }
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_workspace_takeoff_precedes_first_node_tick_and_carries_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks.clone()).await;
+    let hook = Arc::new(RecordingWorkspaceHook::default());
+    actor.app_workspace_hook = Some(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 7)).await.unwrap();
+
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let calls = hook.calls();
+    let takeoff_position = calls
+        .iter()
+        .position(|call| matches!(call, HookCall::Takeoff(_)))
+        .unwrap();
+    let checkpoint_position = calls
+        .iter()
+        .position(|call| matches!(call, HookCall::Checkpoint(_)))
+        .unwrap();
+    assert!(takeoff_position < checkpoint_position);
+    let context = calls
+        .iter()
+        .find_map(|call| match call {
+            HookCall::Takeoff(context) => Some(context),
+            _ => None,
+        })
+        .expect("takeoff call");
+    assert_eq!(context.execution_id, execution_id);
+    assert_eq!(context.flow_id, flow_id);
+    assert_eq!(context.definition_revision, 7);
+    assert_eq!(
+        context.execution_root,
+        dir.path()
+            .join("flows/executions")
+            .join(execution_id.to_string())
+    );
+    assert_eq!(context.invocation_kind, FlowInvocationKind::Manual);
+    assert_eq!(tasks.starts.load(Ordering::SeqCst), 1);
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_workspace_takeoff_failure_discards_unlinked_execution_without_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks.clone()).await;
+    let hook = Arc::new(RecordingWorkspaceHook {
+        fail_takeoff: true,
+        ..Default::default()
+    });
+    actor.app_workspace_hook = Some(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+
+    let error = actor
+        .begin_start(
+            flow_id,
+            None,
+            serde_json::Value::Null,
+            false,
+            FlowInvocationKind::Manual,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, FlowError::AppWorkspaceTakeoff { .. }));
+    assert_eq!(tasks.starts.load(Ordering::SeqCst), 0);
+    assert!(actor.execution.is_empty());
+    let calls = hook.calls();
+    let context = calls
+        .iter()
+        .find_map(|call| match call {
+            HookCall::Takeoff(context) => Some(context),
+            _ => None,
+        })
+        .expect("takeoff call");
+    assert!(!context.execution_root.exists());
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_workspace_landing_failure_does_not_block_terminalization() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks).await;
+    let hook = Arc::new(RecordingWorkspaceHook {
+        fail_landing: true,
+        ..Default::default()
+    });
+    actor.app_workspace_hook = Some(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    assert!(actor.execution.get(&execution_id).is_none());
+    assert!(
+        actor
+            .terminal_executions
+            .iter()
+            .any(|run| run.execution_id == execution_id && run.status == FlowExecutionStatus::Succeeded)
+    );
+    assert!(
+        hook.calls()
+            .iter()
+            .any(|call| matches!(call, HookCall::Landing(landing) if landing.status == FlowExecutionStatus::Succeeded))
+    );
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_workspace_landing_reports_success_failure_and_abort_statuses() {
+    for (fail_tick, abort, expected) in [
+        (false, false, FlowExecutionStatus::Succeeded),
+        (true, false, FlowExecutionStatus::Failed),
+        (false, true, FlowExecutionStatus::Aborted),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick,
+            last_source: Mutex::new(None),
+        });
+        let (mut actor, _) = actor_for(dir.path(), tasks).await;
+        let hook = Arc::new(RecordingWorkspaceHook::default());
+        actor.app_workspace_hook = Some(hook.clone());
+        actor.running = true;
+        let flow_id = FlowId(Uuid::new_v4());
+        actor.create_flow(definition(flow_id, 1)).await.unwrap();
+        let execution_id = start_flow(&mut actor, flow_id).await;
+        if abort {
+            actor.abort(execution_id).await.unwrap();
+        }
+        let completion = actor.completion_rx.recv().await.unwrap();
+        actor.handle_dispatch_result(completion).await.unwrap();
+        assert!(
+            actor
+                .terminal_executions
+                .iter()
+                .any(|run| run.execution_id == execution_id && run.status == expected)
+        );
+        let calls = hook.calls();
+        assert!(calls.iter().any(|call| matches!(call, HookCall::Landing(landing) if landing.execution.execution_id == execution_id && landing.status == expected)));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, HookCall::Checkpoint(_)))
+                .count(),
+            if abort { 1 } else { 2 },
+        );
+        actor.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn app_checkpoint_skips_flow_capture_and_allows_symlinks_through_landing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _) = actor_for(
+        dir.path(),
+        Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick: false,
+            last_source: Mutex::new(None),
+        }),
+    )
+    .await;
+    let hook = Arc::new(RecordingWorkspaceHook {
+        checkpoint_owner: FlowAppCheckpoint::App,
+        symlink_on_takeoff: true,
+        ..Default::default()
+    });
+    actor.app_workspace_hook = Some(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let root = actor.workspace.execution_root(execution_id);
+    assert!(
+        root.join("workspace-link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let initial = actor
+        .snapshot_store
+        .load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.execution.execution_id == execution_id)
+        .unwrap();
+    assert!(initial.workspace_checkpoint.is_none());
+    assert!(initial.workspace_entries.is_empty());
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    assert!(
+        actor
+            .terminal_executions
+            .iter()
+            .any(|item| item.execution_id == execution_id)
+    );
+    let calls = hook.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, HookCall::Checkpoint(_)))
+            .count(),
+        2
+    );
+    for context in calls.iter().filter_map(|call| match call {
+        HookCall::Checkpoint(context) => Some(context),
+        _ => None,
+    }) {
+        assert_eq!(context.execution_id, execution_id);
+        assert_eq!(context.flow_id, flow_id);
+        assert_eq!(context.execution_root, root);
+    }
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, HookCall::Landing(_)))
+    );
+    let snapshots = actor.snapshot_store.load_all().await.unwrap();
+    let terminal = snapshots
+        .iter()
+        .find(|item| item.execution.execution_id == execution_id)
+        .unwrap();
+    assert!(terminal.workspace_checkpoint.is_none());
+    assert!(terminal.workspace_entries.is_empty());
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_checkpoint_error_fails_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _) = actor_for(
+        dir.path(),
+        Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick: false,
+            last_source: Mutex::new(None),
+        }),
+    )
+    .await;
+    actor.app_workspace_hook = Some(Arc::new(RecordingWorkspaceHook {
+        fail_checkpoint: true,
+        ..Default::default()
+    }));
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    let error = actor
+        .begin_start(
+            flow_id,
+            None,
+            serde_json::Value::Null,
+            false,
+            FlowInvocationKind::Manual,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, FlowError::AppWorkspaceCheckpoint { .. }));
+    assert!(actor.execution.is_empty());
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn flow_without_app_workspace_hook_keeps_normal_start_and_terminal_behavior() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks.clone()).await;
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    assert_eq!(tasks.starts.load(Ordering::SeqCst), 1); // The ScriptNode start is dispatched through Tasks.
+    assert!(actor.execution.contains_key(&execution_id));
+    let durable = actor
+        .snapshot_store
+        .load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.execution.execution_id == execution_id)
+        .unwrap();
+    assert!(durable.workspace_checkpoint.is_some());
+    assert!(!durable.workspace_entries.is_empty());
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    assert!(
+        actor
+            .terminal_executions
+            .iter()
+            .any(|run| run.execution_id == execution_id && run.status == FlowExecutionStatus::Succeeded)
+    );
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn default_app_checkpoint_keeps_flow_checkpoint_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _) = actor_for(
+        dir.path(),
+        Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick: false,
+            last_source: Mutex::new(None),
+        }),
+    )
+    .await;
+    let hook = Arc::new(RecordingWorkspaceHook::default());
+    actor.app_workspace_hook = Some(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 4)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let durable = actor
+        .snapshot_store
+        .load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.execution.execution_id == execution_id)
+        .unwrap();
+    assert!(durable.workspace_checkpoint.is_some());
+    assert!(!durable.workspace_entries.is_empty());
+    assert_eq!(
+        hook.calls()
+            .iter()
+            .filter(|call| matches!(call, HookCall::Checkpoint(_)))
+            .count(),
+        1
+    );
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_owned_restart_restores_hook_context_and_trigger_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _) = actor_for(
+        dir.path(),
+        Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick: false,
+            last_source: Mutex::new(None),
+        }),
+    )
+    .await;
+    let hook = Arc::new(RecordingWorkspaceHook {
+        checkpoint_owner: FlowAppCheckpoint::App,
+        ..Default::default()
+    });
+    actor.app_workspace_hook = Some(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 9)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let snapshot = actor
+        .snapshot_store
+        .load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.execution.execution_id == execution_id)
+        .unwrap();
+    assert!(snapshot.workspace_checkpoint.is_none());
+    assert!(snapshot.workspace_entries.is_empty());
+    let (restored_id, _) = Actor::restore_execution(
+        &snapshot,
+        &actor.store,
+        &actor.workspace,
+        &actor.node_registry,
+        actor.app_workspace_hook.as_ref(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored_id, execution_id);
+    let root = actor.workspace.execution_root(execution_id);
+    assert!(root.join("workflow/trigger.json").is_file());
+    let calls = hook.calls();
+    let restores = calls
+        .iter()
+        .filter_map(|call| match call {
+            HookCall::Restore(context) => Some(context),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [context] = restores.as_slice() else {
+        panic!("restart calls restore once")
+    };
+    assert_eq!(context.execution_id, execution_id);
+    assert_eq!(context.flow_id, flow_id);
+    assert_eq!(context.definition_revision, 9);
+    assert_eq!(context.execution_root, root);
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn retention_cleanup_lands_then_releases_before_removing_execution_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks).await;
+    let hook = Arc::new(RecordingWorkspaceHook::default());
+    actor.app_workspace_hook = Some(hook.clone());
+    let execution_id = FlowExecutionId(Uuid::new_v4());
+    let flow_id = FlowId(Uuid::new_v4());
+    let root = actor.workspace.execution_root(execution_id);
+    std::fs::create_dir_all(&root).unwrap();
+    actor.terminal_executions.push(FlowExecutionSnapshot {
+        execution_id,
+        flow_id,
+        revision: 3,
+        invocation_kind: FlowInvocationKind::Event,
+        status: FlowExecutionStatus::Failed,
+        started_at: FlowTimestamp::now(),
+        completed_at: Some(FlowTimestamp::now()),
+        error: None,
+    });
+
+    actor
+        .cleanup_terminal_execution(execution_id)
+        .await
+        .unwrap();
+    let calls = hook.calls();
+    let [HookCall::Landing(landing), HookCall::Release(release)] = calls.as_slice() else {
+        panic!("cleanup must land before releasing artifacts")
+    };
+    assert_eq!(landing.execution.execution_id, execution_id);
+    assert_eq!(release.execution_id, execution_id);
+    assert!(
+        !root.exists(),
+        "Flow removes the execution directory after both hook steps"
+    );
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_cleanup_hook_preserves_execution_directory_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks).await;
+    let hook = Arc::new(RecordingWorkspaceHook {
+        fail_landing: true,
+        ..Default::default()
+    });
+    actor.app_workspace_hook = Some(hook.clone());
+    let execution_id = FlowExecutionId(Uuid::new_v4());
+    let root = actor.workspace.execution_root(execution_id);
+    std::fs::create_dir_all(&root).unwrap();
+    actor.terminal_executions.push(FlowExecutionSnapshot {
+        execution_id,
+        flow_id: FlowId(Uuid::new_v4()),
+        revision: 1,
+        invocation_kind: FlowInvocationKind::Manual,
+        status: FlowExecutionStatus::Succeeded,
+        started_at: FlowTimestamp::now(),
+        completed_at: Some(FlowTimestamp::now()),
+        error: None,
+    });
+
+    assert!(matches!(
+        actor.cleanup_terminal_execution(execution_id).await,
+        Err(FlowError::AppWorkspaceCleanup { .. })
+    ));
+    assert!(root.exists(), "cleanup anchor remains until hook landing succeeds");
+    assert!(matches!(hook.calls().as_slice(), [HookCall::Landing(_)]));
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_hook_failure_keeps_anchor_and_does_not_suppress_terminal_broadcasts() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks).await;
+    let (broadcast_tx, mut broadcasts) = mpsc::channel(16);
+    actor.broadcast_tx = broadcast_tx;
+    actor.retention_completed_runs = 0;
+    let hook = Arc::new(RecordingWorkspaceHook {
+        fail_landing: true,
+        ..Default::default()
+    });
+    actor.app_workspace_hook = Some(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+
+    let execution_root = actor.workspace.execution_root(execution_id);
+    assert!(execution_root.exists(), "failed cleanup retains the execution anchor");
+    assert!(
+        actor
+            .terminal_executions
+            .iter()
+            .any(|run| run.execution_id == execution_id && run.status == FlowExecutionStatus::Succeeded)
+    );
+    let mut emitted = Vec::new();
+    while let Ok(event) = broadcasts.try_recv() {
+        emitted.push(event);
+    }
+    assert!(emitted.iter().any(|event| matches!(event, FlowBroadcast::ExecutionStatusChanged { snapshot, .. } if snapshot.execution_id == execution_id && snapshot.status == FlowExecutionStatus::Succeeded)));
+    assert!(
+        emitted
+            .iter()
+            .any(|event| matches!(event, FlowBroadcast::Succeeded { correlation } if correlation.flow_execution_id == execution_id))
+    );
+    assert!(
+        hook.calls()
+            .iter()
+            .filter(|call| matches!(call, HookCall::Landing(_)))
+            .count()
+            >= 2
+    );
+    actor.shutdown().await.unwrap();
 }
 
 async fn await_new_owner_dispatches(actor: &mut Actor, background_task_count: usize) {
@@ -2044,6 +2879,7 @@ fn retention_candidates_keep_newest_terminal_runs_and_zero_prunes_all() {
             execution_id: FlowExecutionId(Uuid::new_v4()),
             flow_id,
             revision: 1,
+            invocation_kind: FlowInvocationKind::Manual,
             status: FlowExecutionStatus::Succeeded,
             started_at: FlowTimestamp::from_datetime(chrono::Utc::now() - chrono::Duration::minutes(offset + 1)),
             completed_at: Some(FlowTimestamp::from_datetime(

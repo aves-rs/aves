@@ -4,6 +4,7 @@ use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::io::Error as IoError;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, ParseError, Utc};
 use croner::errors::CronError;
@@ -30,6 +31,8 @@ use crate::utils::database::{DatabaseError, MigrationRunner, maintain_database, 
 use super::ast::{ContentAddressedRoot, ContentHash, FlowNode};
 use super::database::FlowStore;
 use super::graph::FlowGraphAst;
+use super::hook::FlowAppHookError;
+use super::hook::FlowAppWorkspaceHook;
 use super::messages::{FlowResponse, LifecycleCorrelation};
 use super::registration::{
     FlowNodeRegistry, NodeKind, NodeKindRegistration, NodeRegistrationSupply, WorkspacePreparationError,
@@ -69,6 +72,8 @@ pub struct FlowBootOptions {
     pub node_registration_supply: NodeRegistrationSupply,
     /// Maximum number of completed executions retained per Flow.
     pub retention_completed_runs: u32,
+    /// Optional application-owned workspace lifecycle integration.
+    pub app_workspace_hook: Option<Arc<dyn FlowAppWorkspaceHook>>,
 }
 
 impl FlowBootOptions {
@@ -95,6 +100,7 @@ impl FlowBootOptions {
             node_registrations: Vec::new(),
             node_registration_supply: NodeRegistrationSupply::default(),
             retention_completed_runs: DEFAULT_RETENTION_COMPLETED_RUNS,
+            app_workspace_hook: None,
         })
     }
 
@@ -226,6 +232,9 @@ pub struct FlowExecutionSnapshot {
     pub flow_id: FlowId,
     /// Revision pinned by this execution.
     pub revision: i64,
+    /// Source of the invocation, retained for recovery and application hooks.
+    #[serde(default)]
+    pub invocation_kind: FlowInvocationKind,
     /// Current observer-visible status.
     pub status: FlowExecutionStatus,
     /// RFC3339 start time.
@@ -344,14 +353,21 @@ pub(super) struct ActiveExecution {
     pub(super) flow_id: FlowId,
     revision: i64,
     started_at: FlowTimestamp,
+    invocation_kind: FlowInvocationKind,
 }
 
 impl ActiveExecution {
-    pub(super) fn new(flow_id: FlowId, revision: i64, started_at: FlowTimestamp) -> Self {
+    pub(super) fn new(
+        flow_id: FlowId,
+        revision: i64,
+        started_at: FlowTimestamp,
+        invocation_kind: FlowInvocationKind,
+    ) -> Self {
         Self {
             flow_id,
             revision,
             started_at,
+            invocation_kind,
         }
     }
 
@@ -365,6 +381,10 @@ impl ActiveExecution {
 
     pub(super) fn started_at(&self) -> FlowTimestamp {
         self.started_at.clone()
+    }
+
+    pub(super) fn invocation_kind(&self) -> FlowInvocationKind {
+        self.invocation_kind
     }
 }
 
@@ -424,6 +444,7 @@ impl ExecutionState {
                 execution_id,
                 flow_id: self.active.flow_id(),
                 revision: self.active.revision(),
+                invocation_kind: self.active.invocation_kind(),
                 completed_at: status.is_terminal().then(FlowTimestamp::now),
                 status,
                 started_at: self.active.started_at(),
@@ -510,6 +531,30 @@ pub enum FlowError {
     /// The embedding application did not provide a usable data root.
     #[error("Flow data root must not be empty")]
     EmptyDataRoot,
+    /// The application workspace hook rejected execution takeoff.
+    #[error("application workspace takeoff failed: {source}")]
+    AppWorkspaceTakeoff {
+        #[source]
+        source: FlowAppHookError,
+    },
+    /// The application workspace hook failed to capture a checkpoint.
+    #[error("application workspace checkpoint failed: {source}")]
+    AppWorkspaceCheckpoint {
+        #[source]
+        source: FlowAppHookError,
+    },
+    /// The application workspace hook failed to restore its workspace.
+    #[error("application workspace restore failed: {source}")]
+    AppWorkspaceRestore {
+        #[source]
+        source: FlowAppHookError,
+    },
+    /// The application workspace hook rejected terminal artifact cleanup.
+    #[error("application workspace cleanup failed: {source}")]
+    AppWorkspaceCleanup {
+        #[source]
+        source: FlowAppHookError,
+    },
     /// A requested execution is not owned by this Flow actor.
     #[error("Flow execution was not found")]
     ExecutionNotFound,

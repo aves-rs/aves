@@ -47,6 +47,7 @@ where
             sync_services: services.sync_services,
             mobility_service: services.mobility_service,
             retention_completed_runs: options.retention_completed_runs,
+            app_workspace_hook: options.app_workspace_hook,
             #[cfg(test)]
             native_fixture: None,
         },

@@ -501,6 +501,7 @@ impl Actor {
                 agent_key,
                 session_name,
                 setup,
+                session_cwd,
             } => {
                 self.spawn_session(
                     sluice_session_id,
@@ -512,7 +513,7 @@ impl Actor {
                         acp_session_id: None,
                         announce_desktop_association: true,
                         transient_connectivity: false,
-                        session_cwd: None,
+                        session_cwd,
                         sluice_mcp_enabled: None,
                         node_token: None,
                         flow_mcp_endpoints: None,

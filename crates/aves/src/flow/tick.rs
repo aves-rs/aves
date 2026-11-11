@@ -617,6 +617,8 @@ fn compile_children(
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::flow::FlowInvocationKind;
+
     use super::super::mailbox::{TerminalResult, TerminalStatus};
     use super::super::registration::{
         CancellationDisposition, NodeKindDescriptor, NodeKindRegistration, NodeLifecycleResult, SideEffectDisposition,
@@ -688,6 +690,7 @@ mod tests {
                 execution_id,
                 flow_id,
                 revision: 1,
+                invocation_kind: FlowInvocationKind::Manual,
                 status: FlowExecutionStatus::Active,
                 started_at: FlowTimestamp::now(),
                 completed_at: None,

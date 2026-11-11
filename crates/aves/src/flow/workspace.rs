@@ -207,7 +207,7 @@ impl WorkspaceStore {
         Ok((execution_root, imported_workspace_root))
     }
 
-    async fn write_trigger(
+    pub(super) async fn write_trigger(
         &self,
         execution_root: &Path,
         pulse: &Value,

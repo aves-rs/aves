@@ -13,6 +13,7 @@ mod domain;
 mod files;
 mod graph;
 mod handle;
+mod hook;
 mod mailbox;
 mod mcp;
 mod messages;
@@ -44,13 +45,17 @@ pub use blackboard::{BoundInputs, BoundOutputs};
 pub use cron::{CronExpression, CronTriggerConfig, FlowTriggerRecord};
 pub use domain::{FlowControlService, FlowDomain, FlowTriggerSourceService};
 pub use graph::{FlowGraphAst, GraphNode};
+pub use hook::{
+    FlowAppCheckpoint, FlowAppCheckpointFuture, FlowAppHookContext, FlowAppHookError, FlowAppHookFuture,
+    FlowAppLandingContext, FlowAppWorkspaceHook,
+};
 pub use messages::{
-    CreateFlowInput, DeleteFlowInput, DeleteFlowTriggerInput, ErasedLifecycleMessage, FireSourceTriggerInput,
-    FlowBroadcast, FlowTriggerDeletedOutput, FlowTriggersListedOutput, FlowsListedOutput, GetExecutionDetailInput,
-    GetFlowInput, LifecycleCorrelation, LifecycleError, LifecycleStart, LifecycleSuccess, LifecycleTick,
-    ListActiveExecutionsInput, ListFlowTriggersInput, ListFlowsInput, ListSourceTriggersInput,
+    AbortInput, CreateFlowInput, DeleteFlowInput, DeleteFlowTriggerInput, ErasedLifecycleMessage,
+    FireSourceTriggerInput, FlowBroadcast, FlowTriggerDeletedOutput, FlowTriggersListedOutput, FlowsListedOutput,
+    GetExecutionDetailInput, GetFlowInput, LifecycleCorrelation, LifecycleError, LifecycleStart, LifecycleSuccess,
+    LifecycleTick, ListActiveExecutionsInput, ListFlowTriggersInput, ListFlowsInput, ListSourceTriggersInput,
     ListTerminalExecutionsInput, SetEnabledInput, SourceTriggersListedOutput, StartInput, StartedOutput,
-    UpdateFlowInput, dispatch_create_flow, dispatch_delete_flow, dispatch_delete_flow_trigger,
+    UpdateFlowInput, dispatch_abort, dispatch_create_flow, dispatch_delete_flow, dispatch_delete_flow_trigger,
     dispatch_get_execution_detail, dispatch_get_flow, dispatch_list_active_executions, dispatch_list_flow_triggers,
     dispatch_list_flows, dispatch_list_terminal_executions, dispatch_set_enabled, dispatch_start, dispatch_update_flow,
     flow_operation_descriptors_with_root_error, rpc_router,

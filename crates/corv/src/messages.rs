@@ -1,5 +1,7 @@
 //! Typed request, response, and broadcast contracts for Discuss.
 
+use std::path::PathBuf;
+
 use agent_client_protocol::schema::v1::SessionId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -40,7 +42,7 @@ pub enum DiscussRequestPayload {
         config_overrides: DiscussConfigValues,
         sluice_mcp_enabled: bool,
         prompt: String,
-        session_cwd: std::path::PathBuf,
+        session_cwd: PathBuf,
         max_turns: Option<i64>,
         max_tool_calls: Option<i64>,
         max_duration: Option<i64>,
@@ -214,6 +216,9 @@ pub enum DiscussRequestPayload {
         /// Configuration intent for a newly created session. Reconnects use
         /// the settings already persisted on the session anchor.
         setup: Option<DiscussSessionSetup>,
+        /// Optional execution directory; absence retains the provider workspace default.
+        #[serde(default)]
+        session_cwd: Option<PathBuf>,
     },
 
     /// Add a new provider to the Discuss server.
@@ -366,7 +371,7 @@ pub enum DiscussResponse {
         correlation: LifecycleCorrelation,
         session_id: SluiceSessionId,
         limits: AgentNodeSessionLimits,
-        session_cwd: std::path::PathBuf,
+        session_cwd: PathBuf,
     },
     /// Current live result for a Flow AgentNode execution.
     AgentNodeTicked {

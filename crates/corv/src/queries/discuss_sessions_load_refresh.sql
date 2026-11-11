@@ -7,4 +7,4 @@ SET
     display_title               = COALESCE(?3, display_title),
     latest_config_options_json  = COALESCE(?4, latest_config_options_json),
     last_interaction_at         = MAX(?5, COALESCE(last_interaction_at, ?5))
-WHERE sluice_session_id = ?1
+WHERE discuss_session_id = ?1

@@ -50,14 +50,14 @@ Defaults plus invocation `pulse` (`blackboard.set("pulse", …)` when non-null).
 
 ## Script
 ```js
-const price = __sluice_inputs.price;
-__sluice_outputs.isTradable = price < 100;
-const flows = await sluice.rpc("flow.listFlows", {});
+const price = __application_inputs.price;
+__application_outputs.isTradable = price < 100;
+const flows = await application.rpc("flow.listFlows", {});
 ```
 Guest `/` is the execution root (one WASI preopen). `artifacts/<node-id>/` is a relative convention — not a BoundInput, lifecycle field, or Script global. `tasks/adapter.rs` builds the ScriptNode registration (start/tick/cancel callbacks + owner state); `flow/adapter.rs` is the generic `HostLifecycleAdapter` bridge that looks up the registration by `node_kind` and dispatches `LifecycleStart`/`LifecycleTick`/`LifecycleCancel`.
 
 ## Agent
-Nonempty BoundInputs append once: `--- Sluice task inputs ---` compact `as_value()` JSON `--- End Sluice task inputs ---`. Empty inputs leave the prompt unchanged. Tick does not repeat. Discuss starts AgentNode sessions with the shared execution root as `session_cwd`; see [Flow Execution Workspace](flow-execution-workspace.md) for one-time Provider source seeding. No new Agent output contract.
+Nonempty BoundInputs append once: `--- Task inputs ---` compact `as_value()` JSON `--- End Task inputs ---`. Empty inputs leave the prompt unchanged. Tick does not repeat. Discuss starts AgentNode sessions with the shared execution root as `session_cwd`; see [Flow Execution Workspace](flow-execution-workspace.md) for one-time Provider source seeding. No new Agent output contract.
 
 ## Known pitfalls
 - Bare SQL `'{}'` needs `#[serde(default)]` on `values`.

@@ -310,6 +310,11 @@ pub trait DiscussAgentPlugin: Sync {
         server.clone()
     }
 
+    /// Return an isolated launch when a Team requires workspace-local assets.
+    fn team_launch_server(&self, _server: &McpServer, _workspace: &Path) -> Result<Option<McpServer>, DiscussError> {
+        Ok(None)
+    }
+
     /// Reconcile an advertised `session/list` capability with provider-adapter
     /// compatibility knowledge.
     fn supports_session_list(&self, advertised: bool) -> bool {
@@ -804,8 +809,8 @@ mod tests {
             .expect("sector analyst team");
         let customizer_team = test_library::library()
             .teams_for()
-            .find(|team| team.leader.as_ref() == "sluice-customizer")
-            .expect("Sluice customizer team");
+            .find(|team| team.leader.as_ref() == "application-customizer")
+            .expect("Application customizer team");
         // Keep the retained Team distinct from the removed Team's leader while
         // exercising retention with a Team member shared by the fixture.
         let shared_follower = equity_team
@@ -843,7 +848,7 @@ mod tests {
                 .expect("sector team installs");
             plugin
                 .install_team_with_member_overrides(library, directory.path(), customizer_team, &BTreeMap::new())
-                .expect("Sluice customizer team installs");
+                .expect("Application customizer team installs");
 
             assert_agent_materialized(&layout, directory.path(), &equity_team.leader);
             for follower in &equity_team.followers {

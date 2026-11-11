@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 
 use super::plugins::ConnectionStrategy;
 use super::types::{
-    DiscussError, ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus, SluiceSessionId,
+    DiscussError, DiscussSessionId, ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus,
 };
 
 /// Maximum number of automatic Provider runtime restart attempts per process.
@@ -50,11 +50,11 @@ impl ProviderRestartBudget {
 
 /// The owner of an Agent-to-Client callback on a Provider connection.
 ///
-/// Callback routes are always owned by a Sluice chat session.
+/// Callback routes are always owned by a chat session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum CallbackRouteTarget {
     /// A chat session, including an ephemeral inspector viewer.
-    Chat { sluice_session_id: SluiceSessionId },
+    Chat { discuss_session_id: DiscussSessionId },
 }
 
 /// Callback payload delivered to the owning shared-connection worker.
@@ -77,7 +77,7 @@ pub(super) enum CallbackEvent {
 ///
 /// ACP completion notifications may contain only this provider identity. It
 /// is intentionally distinct from [`ElicitationRequestId`], which is the
-/// Sluice-facing identity used to answer a pending UI request.
+/// Application-facing identity used to answer a pending UI request.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ElicitationCorrelationId(String);
 
@@ -201,22 +201,22 @@ impl CallbackRouter {
 /// session, so the newest session's endpoints serve every session in that
 /// workspace until its worker ends.
 #[derive(Clone, Default)]
-pub(super) struct SharedMcpRegistrations(Arc<SyncMutex<HashMap<PathBuf, SluiceSessionId>>>);
+pub(super) struct SharedMcpRegistrations(Arc<SyncMutex<HashMap<PathBuf, DiscussSessionId>>>);
 
 impl SharedMcpRegistrations {
     /// Record that this session's endpoints now serve `workspace`.
-    pub(super) fn claim(&self, workspace: &Path, sluice_session_id: SluiceSessionId) -> McpRegistrationClaim {
+    pub(super) fn claim(&self, workspace: &Path, discuss_session_id: DiscussSessionId) -> McpRegistrationClaim {
         let claim = McpRegistrationClaim {
             registrations: self.clone(),
             workspace: workspace.to_path_buf(),
-            sluice_session_id,
+            discuss_session_id,
             generation: 0,
         };
         claim.reclaim();
         claim
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, SluiceSessionId>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, DiscussSessionId>> {
         self.0.lock().expect("shared MCP registration lock")
     }
 }
@@ -228,7 +228,7 @@ impl SharedMcpRegistrations {
 pub(super) struct McpRegistrationClaim {
     registrations: SharedMcpRegistrations,
     workspace: PathBuf,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     generation: u64,
 }
 
@@ -248,14 +248,14 @@ impl McpRegistrationClaim {
     pub(super) fn reclaim(&self) {
         self.registrations
             .lock()
-            .insert(self.workspace.clone(), self.sluice_session_id);
+            .insert(self.workspace.clone(), self.discuss_session_id);
     }
 }
 
 impl Drop for McpRegistrationClaim {
     fn drop(&mut self) {
         let mut registrations = self.registrations.lock();
-        if registrations.get(&self.workspace) == Some(&self.sluice_session_id) {
+        if registrations.get(&self.workspace) == Some(&self.discuss_session_id) {
             registrations.remove(&self.workspace);
         }
     }
@@ -294,7 +294,7 @@ pub(super) enum ProviderSupervisorResources {
         mcp_registrations: SharedMcpRegistrations,
     },
     Isolated {
-        child_sessions: HashSet<SluiceSessionId>,
+        child_sessions: HashSet<DiscussSessionId>,
     },
 }
 
@@ -306,7 +306,7 @@ pub(super) struct ProviderSupervisor {
     restart_budget: ProviderRestartBudget,
     pub(super) last_failure: Option<ProviderRuntimeFailure>,
     pub(super) resources: ProviderSupervisorResources,
-    pub(super) chat_sessions: HashSet<SluiceSessionId>,
+    pub(super) chat_sessions: HashSet<DiscussSessionId>,
 }
 
 impl ProviderSupervisor {
@@ -439,11 +439,11 @@ impl ProviderSupervisor {
         self.admission_enabled
     }
 
-    pub(super) fn associate_chat(&mut self, session_id: SluiceSessionId) {
+    pub(super) fn associate_chat(&mut self, session_id: DiscussSessionId) {
         self.chat_sessions.insert(session_id);
     }
 
-    pub(super) fn disassociate_chat(&mut self, session_id: &SluiceSessionId) {
+    pub(super) fn disassociate_chat(&mut self, session_id: &DiscussSessionId) {
         self.chat_sessions.remove(session_id);
     }
 
@@ -478,7 +478,7 @@ mod tests {
 
     fn chat_target() -> CallbackRouteTarget {
         CallbackRouteTarget::Chat {
-            sluice_session_id: SluiceSessionId::new(),
+            discuss_session_id: DiscussSessionId::new(),
         }
     }
 

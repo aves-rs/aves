@@ -13,7 +13,7 @@ use super::messages::{BusIngress, BusRpcContext};
 use super::operations::{DomainPublication, RequestOperationDescriptor};
 
 /// ALPN negotiated by generated public Bus operations.
-pub(crate) const BUS_ALPN: &[u8] = b"sluice/bus";
+pub(crate) const BUS_ALPN: &[u8] = b"aves_app/bus";
 
 const MAX_OPERATION_BYTES: usize = 512 * 1024;
 

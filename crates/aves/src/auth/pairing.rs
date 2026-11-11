@@ -15,7 +15,7 @@ use zeroize::Zeroize;
 use super::peer::{PeerConfig, PeerEndpoint, PeerRecord, PeerTrustState};
 use super::types::{ApprovedIssuer, AuthAdmissionRegistry, AvesAuthError, MachineIssuerId};
 
-pub(crate) const AUTH_ALPN: &[u8] = b"sluice/auth";
+pub(crate) const AUTH_ALPN: &[u8] = b"aves_app/auth";
 
 const FIRST_CONTACT_PAYLOAD_LIMIT: usize = 4096;
 const INVITATION_SECRET_BYTES: usize = 32;

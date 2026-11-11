@@ -452,7 +452,7 @@ async fn restarted_script_node_starts_and_executes_without_durable_replay() {
         .handle_message(
             TasksRequestPayload::StartScript {
                 correlation: correlation.clone(),
-                source: "__sluice_outputs.restarted = true;".into(),
+                source: "__application_outputs.restarted = true;".into(),
                 filename: "script.ts".into(),
                 input: input.clone(),
                 fuel_limit: 100_000_000,

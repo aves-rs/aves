@@ -89,7 +89,7 @@ pub enum DiscussElicitationAnswer {
     Cancel,
 }
 
-/// Convert an accepted Sluice answer into the ACP response at the SDK boundary.
+/// Convert an accepted answer into the ACP response at the SDK boundary.
 pub(crate) fn content_to_sdk_answer(
     answer: DiscussElicitationAnswer,
 ) -> Result<CreateElicitationResponse, DiscussError> {

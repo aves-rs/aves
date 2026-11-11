@@ -36,9 +36,9 @@ use super::storage::{
 use super::supervisor::{CallbackRouteRegistry, ProviderSupervisor};
 use super::types::{
     AcpProvider, ActorInboundPorts, AgentNodeTerminalResult, DiscussConfigOption, DiscussElicitationAnswer,
-    DiscussError, DiscussPermissionOption, DiscussSessionSetup, DiscussStreamEvent, ElicitationRequestId,
-    InspectorBinding, PendingElicitation, PendingPermission, PendingPermissionRegistry, SluiceSessionId, WorkerEntry,
-    WorkerRegistry, WorkspaceCopySourceRequest, WorkspaceCopySources,
+    DiscussError, DiscussPermissionOption, DiscussSessionId, DiscussSessionSetup, DiscussStreamEvent,
+    ElicitationRequestId, InspectorBinding, PendingElicitation, PendingPermission, PendingPermissionRegistry,
+    SessionLaunchConfig, WorkerEntry, WorkerRegistry, WorkspaceCopySourceRequest, WorkspaceCopySources,
 };
 
 const DISCUSS_DOMAIN: &str = "discuss";
@@ -47,10 +47,11 @@ pub(super) const CANCEL_TURN_DEADLINE: Duration = Duration::from_secs(1);
 pub(super) const PROVIDER_CHILD_REAP_DEADLINE: Duration = Duration::from_secs(1);
 
 // ProviderSessionInfo, WorkerCommand, WorkerEntry, WorkerRegistry, PendingPermission,
-// PendingPermissionRegistry, SluiceSessionId, PermissionRequestId, DiscussStreamEvent,
+// PendingPermissionRegistry, DiscussSessionId, PermissionRequestId, DiscussStreamEvent,
 // DiscussPermissionOption are now defined in types.rs and imported via `use super::types::*`.
 
 pub(super) struct SpawnSessionOptions {
+    pub(super) launch_config: Option<SessionLaunchConfig>,
     pub(super) name: Option<String>,
     pub(super) setup: Option<DiscussSessionSetup>,
     pub(super) session_config_overrides: BTreeMap<String, String>,
@@ -58,13 +59,13 @@ pub(super) struct SpawnSessionOptions {
     pub(super) announce_desktop_association: bool,
     pub(super) transient_connectivity: bool,
     pub(super) session_cwd: Option<PathBuf>,
-    pub(super) sluice_mcp_enabled: Option<bool>,
+    pub(super) application_mcp_enabled: Option<bool>,
     pub(super) node_token: Option<Jwt>,
     pub(super) flow_mcp_endpoints: Option<Vec<BusMcpEndpoint>>,
 }
 
 pub(super) struct TransientWorkerEvent {
-    pub(super) sluice_session_id: SluiceSessionId,
+    pub(super) discuss_session_id: DiscussSessionId,
     pub(super) result: Result<(SessionId, Option<Vec<DiscussConfigOption>>), DiscussError>,
 }
 
@@ -129,7 +130,7 @@ pub(super) struct Actor {
     /// and threaded into every session worker.
     pub(super) agents_workspace: PathBuf,
 
-    /// Live worker entries keyed by `sluice_session_id`.
+    /// Live worker entries keyed by `discuss_session_id`.
     pub(super) worker_registry: WorkerRegistry,
 
     /// Actor-owned Provider supervisors keyed by the exact installed Provider ID.
@@ -151,19 +152,19 @@ pub(super) struct Actor {
     pub(super) provider_restart_cancellations: HashMap<String, oneshot::Sender<()>>,
 
     /// Ephemeral inspector bindings, held only for the viewer lifetime.
-    pub(super) inspector_bindings: HashMap<SluiceSessionId, InspectorBinding>,
+    pub(super) inspector_bindings: HashMap<DiscussSessionId, InspectorBinding>,
 
     /// Inspector viewers whose parent attachment is being disposed.
-    pub(super) disposing_inspectors: HashSet<SluiceSessionId>,
+    pub(super) disposing_inspectors: HashSet<DiscussSessionId>,
 
     /// Server-side capability bits captured from `initialize.agentCapabilities`.
-    pub(super) worker_capabilities: HashMap<SluiceSessionId, SessionCapabilitiesCache>,
+    pub(super) worker_capabilities: HashMap<DiscussSessionId, SessionCapabilitiesCache>,
 
     /// Receiver for capability updates from workers.
-    pub(super) capabilities_update_rx: mpsc::Receiver<(SluiceSessionId, SessionCapabilitiesCache)>,
+    pub(super) capabilities_update_rx: mpsc::Receiver<(DiscussSessionId, SessionCapabilitiesCache)>,
 
     /// Sender for capability updates, cloned into each worker.
-    pub(super) capabilities_update_tx: mpsc::Sender<(SluiceSessionId, SessionCapabilitiesCache)>,
+    pub(super) capabilities_update_tx: mpsc::Sender<(DiscussSessionId, SessionCapabilitiesCache)>,
 
     /// Receiver for workers that have completed setup and are ready.
     pub(super) worker_ready_rx: mpsc::Receiver<WorkerReady>,
@@ -204,15 +205,15 @@ pub(super) struct Actor {
     /// Sender for pending-elicitation cancellations, cloned into each worker.
     pub(super) pending_elicitation_cancel_tx: mpsc::Sender<PendingElicitationCancel>,
 
-    /// Pending permission requests keyed by `(sluice_session_id, permission_request_id)`.
+    /// Pending permission requests keyed by `(discuss_session_id, permission_request_id)`.
     /// Live-only state; not persisted.
     pub(super) pending_permissions: PendingPermissionRegistry,
 
-    /// Pending elicitation requests keyed by `(sluice_session_id, elicitation_request_id)`.
-    pub(super) pending_elicitations: HashMap<(SluiceSessionId, ElicitationRequestId), PendingElicitation>,
+    /// Pending elicitation requests keyed by `(discuss_session_id, elicitation_request_id)`.
+    pub(super) pending_elicitations: HashMap<(DiscussSessionId, ElicitationRequestId), PendingElicitation>,
 
     /// Deferred AddProvider replies keyed by their transient worker identity.
-    pub(super) pending_provider_tests: HashMap<SluiceSessionId, PendingProviderTest>,
+    pub(super) pending_provider_tests: HashMap<DiscussSessionId, PendingProviderTest>,
 
     /// Authoritative lifecycle state for ACP sessions.
     pub(super) server_running: bool,
@@ -299,7 +300,7 @@ impl Actor {
         // capturing `initialize.agentCapabilities`; the actor stores them in the
         // matching worker capability cache entry via `run_actor`.
         let (capabilities_update_tx, capabilities_update_rx) =
-            mpsc::channel::<(SluiceSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
+            mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
         let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -423,7 +424,7 @@ impl Actor {
                 provider_name,
                 agent_name,
                 config_overrides,
-                sluice_mcp_enabled,
+                application_mcp_enabled,
                 prompt,
                 session_cwd,
                 max_turns,
@@ -437,7 +438,7 @@ impl Actor {
                     provider_name,
                     agent_name,
                     config_overrides,
-                    sluice_mcp_enabled,
+                    application_mcp_enabled,
                     prompt,
                     session_cwd,
                     max_turns,
@@ -497,16 +498,19 @@ impl Actor {
             }
             DiscussRequestPayload::UninstallTeam { leader_id } => self.handle_uninstall_team(leader_id).await,
             DiscussRequestPayload::NewSession {
-                sluice_session_id,
+                launch_config,
+                discuss_session_id,
                 agent_key,
                 session_name,
                 setup,
                 session_cwd,
+                application_mcp_enabled,
             } => {
                 self.spawn_session(
-                    sluice_session_id,
+                    discuss_session_id,
                     &agent_key,
                     SpawnSessionOptions {
+                        launch_config,
                         name: session_name,
                         setup,
                         session_config_overrides: BTreeMap::new(),
@@ -514,7 +518,7 @@ impl Actor {
                         announce_desktop_association: true,
                         transient_connectivity: false,
                         session_cwd,
-                        sluice_mcp_enabled: None,
+                        application_mcp_enabled,
                         node_token: None,
                         flow_mcp_endpoints: None,
                     },
@@ -522,60 +526,62 @@ impl Actor {
                 .await
             }
             DiscussRequestPayload::ListSessions => self.handle_list_sessions().await,
-            DiscussRequestPayload::LoadSession { sluice_session_id } => {
-                self.handle_load_session(sluice_session_id).await
+            DiscussRequestPayload::LoadSession { discuss_session_id } => {
+                self.handle_load_session(discuss_session_id).await
             }
-            DiscussRequestPayload::GetConfigOptions { sluice_session_id } => {
-                self.handle_get_config_options(sluice_session_id).await
+            DiscussRequestPayload::GetConfigOptions { discuss_session_id } => {
+                self.handle_get_config_options(discuss_session_id).await
             }
             DiscussRequestPayload::SetConfigOption {
-                sluice_session_id,
+                discuss_session_id,
                 config_id,
                 value,
             } => {
-                self.handle_set_config_option(sluice_session_id, config_id, value)
+                self.handle_set_config_option(discuss_session_id, config_id, value)
                     .await
             }
-            DiscussRequestPayload::RemoveSession { sluice_session_id } => {
-                self.handle_remove_session(sluice_session_id).await
+            DiscussRequestPayload::RemoveSession { discuss_session_id } => {
+                self.handle_remove_session(discuss_session_id).await
             }
             DiscussRequestPayload::RenameSession {
-                sluice_session_id,
+                discuss_session_id,
                 display_title,
             } => {
-                self.handle_rename_session(sluice_session_id, &display_title)
+                self.handle_rename_session(discuss_session_id, &display_title)
                     .await
             }
             DiscussRequestPayload::SendUserTurn {
-                sluice_session_id,
+                discuss_session_id,
                 text,
-            } => self.handle_send_user_turn(sluice_session_id, text).await,
+            } => self.handle_send_user_turn(discuss_session_id, text).await,
             DiscussRequestPayload::AnswerPermission {
-                sluice_session_id,
+                discuss_session_id,
                 permission_request_id,
                 option,
             } => {
-                self.handle_answer_permission(sluice_session_id, permission_request_id, option)
+                self.handle_answer_permission(discuss_session_id, permission_request_id, option)
                     .await
             }
             DiscussRequestPayload::AnswerElicitation {
-                sluice_session_id,
+                discuss_session_id,
                 elicitation_request_id,
                 answer,
             } => {
-                self.handle_answer_elicitation(sluice_session_id, elicitation_request_id, answer)
+                self.handle_answer_elicitation(discuss_session_id, elicitation_request_id, answer)
                     .await
             }
             DiscussRequestPayload::CancelElicitation {
-                sluice_session_id,
+                discuss_session_id,
                 elicitation_request_id,
             } => {
-                self.handle_cancel_elicitation(sluice_session_id, elicitation_request_id)
+                self.handle_cancel_elicitation(discuss_session_id, elicitation_request_id)
                     .await
             }
-            DiscussRequestPayload::CancelTurn { sluice_session_id } => self.handle_cancel_turn(sluice_session_id).await,
-            DiscussRequestPayload::CancelSession { sluice_session_id } => {
-                self.handle_cancel_session(sluice_session_id).await
+            DiscussRequestPayload::CancelTurn { discuss_session_id } => {
+                self.handle_cancel_turn(discuss_session_id).await
+            }
+            DiscussRequestPayload::CancelSession { discuss_session_id } => {
+                self.handle_cancel_session(discuss_session_id).await
             }
             DiscussRequestPayload::ReserveInspector {
                 parent_session_id,
@@ -657,34 +663,35 @@ impl Actor {
             let Some(acp_session_id) = present_acp_session_id(row.acp_session_id.as_deref()) else {
                 continue;
             };
-            if row.sluice_session_id.trim().is_empty() {
-                tracing::warn!(target: "application_acp", "skipping Discuss anchor without a usable sluice_session_id");
+            if row.discuss_session_id.trim().is_empty() {
+                tracing::warn!(target: "application_acp", "skipping Discuss anchor without a usable discuss_session_id");
                 continue;
             }
             if !self.agents.contains_key(&row.agent_name) {
                 tracing::warn!(
                     target: "application_acp",
-                    sluice_session_id = %row.sluice_session_id,
+                    discuss_session_id = %row.discuss_session_id,
                     agent_name = %row.agent_name,
                     "skipping Discuss anchor whose agent is no longer installed"
                 );
                 continue;
             }
 
-            let Ok(sluice_session_id) = SluiceSessionId::from_str(&row.sluice_session_id) else {
+            let Ok(discuss_session_id) = DiscussSessionId::from_str(&row.discuss_session_id) else {
                 tracing::warn!(
                     target: "application_acp",
-                    sluice_session_id = %row.sluice_session_id,
-                    "skipping Discuss anchor with unparseable sluice_session_id"
+                    discuss_session_id = %row.discuss_session_id,
+                    "skipping Discuss anchor with unparseable discuss_session_id"
                 );
                 continue;
             };
 
             if let Err(error) = self
                 .spawn_session(
-                    sluice_session_id,
+                    discuss_session_id,
                     &row.agent_name,
                     SpawnSessionOptions {
+                        launch_config: None,
                         name: Some(row.session_name),
                         setup: None,
                         session_config_overrides: BTreeMap::new(),
@@ -692,7 +699,7 @@ impl Actor {
                         announce_desktop_association: false,
                         transient_connectivity: false,
                         session_cwd: None,
-                        sluice_mcp_enabled: None,
+                        application_mcp_enabled: None,
                         node_token: None,
                         flow_mcp_endpoints: None,
                     },
@@ -744,12 +751,12 @@ impl Actor {
 
     fn register_pending_permission(&mut self, registration: PendingPermissionRegistration) {
         let PendingPermissionRegistration {
-            sluice_session_id,
+            discuss_session_id,
             permission_request_id,
             pending,
             registration_ack,
         } = registration;
-        let key = (sluice_session_id, permission_request_id);
+        let key = (discuss_session_id, permission_request_id);
 
         if !self.server_running {
             let _ = pending.responder_tx.send(DiscussPermissionOption::Cancel);
@@ -757,9 +764,9 @@ impl Actor {
             return;
         }
 
-        if self.disposing_inspectors.contains(&sluice_session_id) {
+        if self.disposing_inspectors.contains(&discuss_session_id) {
             let _ = pending.responder_tx.send(DiscussPermissionOption::Cancel);
-            let _ = registration_ack.send(Err(DiscussError::SessionNotFound { sluice_session_id }));
+            let _ = registration_ack.send(Err(DiscussError::SessionNotFound { discuss_session_id }));
             return;
         }
 
@@ -775,7 +782,7 @@ impl Actor {
     }
 
     fn cancel_pending_permission(&mut self, cancellation: PendingPermissionCancel) {
-        let key = (cancellation.sluice_session_id, cancellation.permission_request_id);
+        let key = (cancellation.discuss_session_id, cancellation.permission_request_id);
         if let Some(pending) = self.pending_permissions.remove(&key) {
             let _ = pending.responder_tx.send(DiscussPermissionOption::Cancel);
         }
@@ -784,49 +791,49 @@ impl Actor {
 
     fn register_pending_elicitation(&mut self, registration: PendingElicitationRegistration) {
         let PendingElicitationRegistration {
-            sluice_session_id,
+            discuss_session_id,
             elicitation_request_id,
             pending,
             registration_ack,
         } = registration;
-        let key = (sluice_session_id, elicitation_request_id);
+        let key = (discuss_session_id, elicitation_request_id);
 
         if !self.server_running {
-            self.persist_cancelled_elicitation(sluice_session_id, elicitation_request_id, &pending);
+            self.persist_cancelled_elicitation(discuss_session_id, elicitation_request_id, &pending);
             let _ = pending.responder_tx.send(DiscussElicitationAnswer::Cancel);
             let _ = registration_ack.send(Err(DiscussError::ShuttingDown));
             return;
         }
 
-        if self.disposing_inspectors.contains(&sluice_session_id) {
-            self.persist_cancelled_elicitation(sluice_session_id, elicitation_request_id, &pending);
+        if self.disposing_inspectors.contains(&discuss_session_id) {
+            self.persist_cancelled_elicitation(discuss_session_id, elicitation_request_id, &pending);
             let _ = pending.responder_tx.send(DiscussElicitationAnswer::Cancel);
-            let _ = registration_ack.send(Err(DiscussError::SessionNotFound { sluice_session_id }));
+            let _ = registration_ack.send(Err(DiscussError::SessionNotFound { discuss_session_id }));
             return;
         }
 
         if let Some(previous) = self.pending_elicitations.insert(key, pending) {
-            self.persist_cancelled_elicitation(sluice_session_id, elicitation_request_id, &previous);
+            self.persist_cancelled_elicitation(discuss_session_id, elicitation_request_id, &previous);
             let _ = previous.responder_tx.send(DiscussElicitationAnswer::Cancel);
         }
 
         if registration_ack.send(Ok(())).is_err()
             && let Some(pending) = self.pending_elicitations.remove(&key)
         {
-            self.persist_cancelled_elicitation(sluice_session_id, elicitation_request_id, &pending);
+            self.persist_cancelled_elicitation(discuss_session_id, elicitation_request_id, &pending);
             let _ = pending.responder_tx.send(DiscussElicitationAnswer::Cancel);
         }
     }
 
     fn cancel_pending_elicitation(&mut self, cancellation: PendingElicitationCancel) {
         if let Some(elicitation_request_id) = cancellation.elicitation_request_id {
-            let key = (cancellation.sluice_session_id, elicitation_request_id);
+            let key = (cancellation.discuss_session_id, elicitation_request_id);
             if let Some(pending) = self.pending_elicitations.remove(&key) {
-                self.persist_cancelled_elicitation(cancellation.sluice_session_id, elicitation_request_id, &pending);
+                self.persist_cancelled_elicitation(cancellation.discuss_session_id, elicitation_request_id, &pending);
                 let _ = pending.responder_tx.send(DiscussElicitationAnswer::Cancel);
             }
         } else {
-            self.cancel_pending_elicitations_for_session(&cancellation.sluice_session_id);
+            self.cancel_pending_elicitations_for_session(&cancellation.discuss_session_id);
         }
         let _ = cancellation.cancellation_ack.send(());
     }
@@ -867,7 +874,7 @@ impl Actor {
 
         // (c) Abort every live worker immediately. Dropping each worker future
         // closes its ACP connection while leaving persisted sessions intact.
-        let entries: Vec<(SluiceSessionId, WorkerEntry)> = self.worker_registry.drain().collect();
+        let entries: Vec<(DiscussSessionId, WorkerEntry)> = self.worker_registry.drain().collect();
         for (_, entry) in entries {
             entry.join_handle.abort();
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
@@ -1001,13 +1008,13 @@ pub(super) async fn run_actor(mut actor: Actor) {
                 let _ = actor.handle_message(msg).await;
             }
             // Capability update from a worker.
-            Some((sluice_session_id, mut caps)) = actor.capabilities_update_rx.recv() => {
-                if actor.worker_registry.contains_key(&sluice_session_id) {
+            Some((discuss_session_id, mut caps)) = actor.capabilities_update_rx.recv() => {
+                if actor.worker_registry.contains_key(&discuss_session_id) {
                     caps.set_config_option |= actor
                         .worker_capabilities
-                        .get(&sluice_session_id)
+                        .get(&discuss_session_id)
                         .is_some_and(|current| current.set_config_option);
-                    actor.worker_capabilities.insert(sluice_session_id, caps);
+                    actor.worker_capabilities.insert(discuss_session_id, caps);
                 }
             }
             Some(event) = actor.shared_provider_event_rx.recv() => {
@@ -1016,37 +1023,37 @@ pub(super) async fn run_actor(mut actor: Actor) {
             Some(event) = actor.provider_restart_ready_rx.recv() => {
                 actor.handle_shared_provider_restart_ready(event).await;
             }
-            Some(WorkerReady { sluice_session_id, acp_session_id, announce_desktop_association, transient_connectivity, config_options, supports_config_updates }) = actor.worker_ready_rx.recv() => {
+            Some(WorkerReady { discuss_session_id, acp_session_id, announce_desktop_association, transient_connectivity, config_options, supports_config_updates }) = actor.worker_ready_rx.recv() => {
                 if !actor.server_running {
                     continue;
                 }
                 if transient_connectivity {
                     actor
-                        .finish_provider_test(sluice_session_id, Ok(config_options))
+                        .finish_provider_test(discuss_session_id, Ok(config_options))
                         .await;
                     continue;
                 }
                 // Update the worker entry with the provider ACP session id.
                 let mut should_announce_desktop_association = announce_desktop_association;
-                if let Some(entry) = actor.worker_registry.get_mut(&sluice_session_id) {
+                if let Some(entry) = actor.worker_registry.get_mut(&discuss_session_id) {
                     entry.acp_session_id = Some(acp_session_id);
                     should_announce_desktop_association |= entry.desktop_association_requested;
                     entry.desktop_association_requested = false;
                 }
                 actor
                     .worker_capabilities
-                    .entry(sluice_session_id)
+                    .entry(discuss_session_id)
                     .or_default()
                     .set_config_option |= supports_config_updates;
                 if should_announce_desktop_association
-                    && let Err(error) = actor.announce_desktop_association(sluice_session_id).await
+                    && let Err(error) = actor.announce_desktop_association(discuss_session_id).await
                 {
                     tracing::warn!(target: "application_acp", ?error, "could not announce ready Discuss desktop association");
                 }
             }
-            Some(TransientWorkerEvent { sluice_session_id, result }) = actor.transient_worker_rx.recv() => {
+            Some(TransientWorkerEvent { discuss_session_id, result }) = actor.transient_worker_rx.recv() => {
                 actor
-                    .finish_provider_test(sluice_session_id, result.map(|(_, options)| options))
+                    .finish_provider_test(discuss_session_id, result.map(|(_, options)| options))
                     .await;
             }
             // Pending permission registration from a worker. The worker sends

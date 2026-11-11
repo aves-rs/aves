@@ -4,6 +4,7 @@ mod agents;
 mod boot;
 mod config;
 mod database;
+mod discovery;
 mod domain;
 mod elicitation;
 mod handle;
@@ -30,6 +31,9 @@ mod test_library;
 use domain::{DiscussKernelServices, DiscussProviderConfigSudoServiceImpl, DiscussStreamingServiceImpl};
 
 pub use boot::{DiscussBootOptions, DiscussSettings};
+pub use discovery::{
+    DiscoveredProvider, DiscoveryOutcome, DiscoverySource, ProviderEnvironment, ProviderLaunch, discover_providers,
+};
 pub use domain::{DiscussDomain, DiscussStreamingService};
 pub use elicitation::{
     DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload,
@@ -57,8 +61,9 @@ pub use messages::{
 pub use types::{
     AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, AcpProvider, CleanupWarning,
     DiscussChatTurnRecord, DiscussConfigOption, DiscussConfigOptionValue, DiscussError, DiscussMcpStatus,
-    DiscussPermissionOption, DiscussSessionInfo, DiscussSessionSetup, DiscussStreamEvent, DiscussSubagentRecord,
-    DiscussSubagentSurfaceState, DiscussTerminalAuthMethod, DiscussTodoItem, DiscussTodoSnapshot, DiscussTodoStatus,
-    DiscussUtilityPayload, DiscussUtilityUpdate, ElicitationRequestId, InspectorBinding, PermissionRequestId,
-    ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus, SluiceSessionId,
+    DiscussPermissionOption, DiscussSessionId, DiscussSessionInfo, DiscussSessionSetup, DiscussStreamEvent,
+    DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTerminalAuthMethod, DiscussTodoItem,
+    DiscussTodoSnapshot, DiscussTodoStatus, DiscussUtilityPayload, DiscussUtilityUpdate, Effect, ElicitationRequestId,
+    InspectorBinding, Operation, PermissionRequestId, ProviderRuntimeFailure, ProviderRuntimeState,
+    ProviderRuntimeStatus, Rule, RuleSet, SessionLaunchConfig,
 };

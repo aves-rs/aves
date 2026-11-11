@@ -43,8 +43,9 @@ use super::supervisor::{
     SharedMcpRegistrations,
 };
 use super::types::{
-    DiscussConfigOption, DiscussError, DiscussMcpStatus, DiscussStreamEvent, ElicitationRequestId, PendingElicitation,
-    PendingPermission, PermissionRequestId, ProviderSessionInfo, SluiceSessionId, WorkerCommand,
+    DiscussConfigOption, DiscussError, DiscussMcpStatus, DiscussSessionId, DiscussStreamEvent, ElicitationRequestId,
+    PendingElicitation, PendingPermission, PermissionRequestId, ProviderSessionInfo, SessionLaunchConfig,
+    WorkerCommand,
 };
 use super::worker::{run_connected_session, run_isolated};
 
@@ -92,8 +93,9 @@ impl AgentNodeTerminalState {
 }
 
 pub(super) struct WorkerSessionParams {
+    pub(super) launch_config: Option<SessionLaunchConfig>,
     pub(super) stream_tx: mpsc::Sender<DiscussStreamEvent>,
-    pub(super) sluice_session_id: SluiceSessionId,
+    pub(super) discuss_session_id: DiscussSessionId,
     pub(super) auth_launch_server: agent_client_protocol::schema::v1::McpServer,
     pub(super) session_name: String,
     pub(super) agent_name: String,
@@ -104,7 +106,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) restored_persisted_transcript: bool,
     pub(super) next_turn_position: i64,
     pub(super) agents_workspace: PathBuf,
-    pub(super) sluice_mcp_enabled: bool,
+    pub(super) application_mcp_enabled: bool,
     pub(super) bus_service: ServiceReader<dyn BusSudoService>,
     pub(super) flow_mcp_endpoints: Option<Vec<BusMcpEndpoint>>,
     pub(super) worker_jwt: Jwt,
@@ -113,7 +115,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) broadcast_tx: mpsc::Sender<DiscussResponse>,
     pub(super) persistence: DiscussPersistence,
     pub(super) worker_command_rx: mpsc::Receiver<WorkerCommand>,
-    pub(super) capabilities_update_tx: mpsc::Sender<(SluiceSessionId, SessionCapabilitiesCache)>,
+    pub(super) capabilities_update_tx: mpsc::Sender<(DiscussSessionId, SessionCapabilitiesCache)>,
     pub(super) worker_ready_tx: mpsc::Sender<WorkerReady>,
     pub(super) agent_defaults: ConfigSettings,
     pub(super) pending_permission_tx: mpsc::Sender<PendingPermissionRegistration>,
@@ -130,7 +132,7 @@ pub(super) struct WorkerSessionParams {
 }
 
 pub(super) struct WorkerReady {
-    pub(super) sluice_session_id: SluiceSessionId,
+    pub(super) discuss_session_id: DiscussSessionId,
     pub(super) acp_session_id: SessionId,
     pub(super) announce_desktop_association: bool,
     pub(super) transient_connectivity: bool,
@@ -139,27 +141,27 @@ pub(super) struct WorkerReady {
 }
 
 pub(super) struct PendingPermissionRegistration {
-    pub(super) sluice_session_id: SluiceSessionId,
+    pub(super) discuss_session_id: DiscussSessionId,
     pub(super) permission_request_id: PermissionRequestId,
     pub(super) pending: PendingPermission,
     pub(super) registration_ack: oneshot::Sender<Result<(), DiscussError>>,
 }
 
 pub(super) struct PendingPermissionCancel {
-    pub(super) sluice_session_id: SluiceSessionId,
+    pub(super) discuss_session_id: DiscussSessionId,
     pub(super) permission_request_id: PermissionRequestId,
     pub(super) cancellation_ack: oneshot::Sender<()>,
 }
 
 pub(super) struct PendingElicitationRegistration {
-    pub(super) sluice_session_id: SluiceSessionId,
+    pub(super) discuss_session_id: DiscussSessionId,
     pub(super) elicitation_request_id: ElicitationRequestId,
     pub(super) pending: PendingElicitation,
     pub(super) registration_ack: oneshot::Sender<Result<(), DiscussError>>,
 }
 
 pub(super) struct PendingElicitationCancel {
-    pub(super) sluice_session_id: SluiceSessionId,
+    pub(super) discuss_session_id: DiscussSessionId,
     pub(super) elicitation_request_id: Option<ElicitationRequestId>,
     pub(super) cancellation_ack: oneshot::Sender<()>,
 }
@@ -187,7 +189,7 @@ pub struct SessionAnchorClear {
     pub available_commands_json: bool,
 }
 
-pub(super) struct AttachedInspectorReaders(pub(super) HashMap<SluiceSessionId, JoinHandle<()>>);
+pub(super) struct AttachedInspectorReaders(pub(super) HashMap<DiscussSessionId, JoinHandle<()>>);
 
 pub(super) fn load_session_request(
     session_id: SessionId,
@@ -642,7 +644,7 @@ impl McpAcpCapabilityWarningState {
     pub(super) async fn publish_once(
         &mut self,
         broadcast_tx: &mpsc::Sender<DiscussResponse>,
-        sluice_session_id: super::types::SluiceSessionId,
+        discuss_session_id: super::types::DiscussSessionId,
         provider_session_id: &SessionId,
         agent_name: &str,
     ) -> Result<(), DiscussError> {
@@ -657,11 +659,11 @@ impl McpAcpCapabilityWarningState {
         );
         broadcast_tx
             .send(DiscussResponse::SessionWarning {
-                sluice_session_id,
+                discuss_session_id,
                 acp_session_id: provider_session_id.clone(),
                 warning: format!(
                     "agent `{agent_name}` does not advertise MCP-over-ACP capability; \
-                     Sluice MCP tools will not be available for this session"
+                     Application MCP tools will not be available for this session"
                 ),
             })
             .await
@@ -673,13 +675,13 @@ impl McpAcpCapabilityWarningState {
 
 pub(super) async fn publish_mcp_status(
     broadcast_tx: &mpsc::Sender<DiscussResponse>,
-    sluice_session_id: super::types::SluiceSessionId,
+    discuss_session_id: super::types::DiscussSessionId,
     provider_session_id: &SessionId,
     status: DiscussMcpStatus,
 ) -> Result<(), DiscussError> {
     broadcast_tx
         .send(DiscussResponse::McpStatus {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id: provider_session_id.clone(),
             status,
         })

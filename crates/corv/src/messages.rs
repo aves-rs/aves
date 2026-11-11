@@ -14,9 +14,9 @@ use super::DiscussDomain;
 use super::types::{
     AcpProvider, AgentNodeSessionLimits, AgentNodeTickResult, AgentThemeColor, CleanupWarning, DiscussChatTurnRecord,
     DiscussConfigOption, DiscussConfigValues, DiscussElicitationAnswer, DiscussError, DiscussMcpStatus,
-    DiscussMemberOverrides, DiscussPermissionOption, DiscussProviderConfig, DiscussSessionInfo, DiscussSessionSetup,
-    DiscussSubagentRecord, ElicitationRequestId, InspectorBinding, PermissionRequestId, ProviderRuntimeState,
-    SluiceSessionId, TeamCatalogEntry,
+    DiscussMemberOverrides, DiscussPermissionOption, DiscussProviderConfig, DiscussSessionId, DiscussSessionInfo,
+    DiscussSessionSetup, DiscussSubagentRecord, ElicitationRequestId, InspectorBinding, PermissionRequestId,
+    ProviderRuntimeState, SessionLaunchConfig, TeamCatalogEntry,
 };
 
 /// Discuss domain request wrapper.
@@ -40,7 +40,7 @@ pub enum DiscussRequestPayload {
         provider_name: String,
         agent_name: String,
         config_overrides: DiscussConfigValues,
-        sluice_mcp_enabled: bool,
+        application_mcp_enabled: bool,
         prompt: String,
         session_cwd: PathBuf,
         max_turns: Option<i64>,
@@ -93,8 +93,8 @@ pub enum DiscussRequestPayload {
 
     #[privileged(reason = "User turns are internal bus-only control requests, not public RPC")]
     SendUserTurn {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Prompt text to send to the provider.
         text: String,
     },
@@ -103,8 +103,8 @@ pub enum DiscussRequestPayload {
 
     #[privileged(reason = "Permission answers are internal bus-only control requests, not public RPC")]
     AnswerPermission {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Opaque typed permission request id.
         permission_request_id: PermissionRequestId,
         /// The caller's selected option or cancellation.
@@ -115,8 +115,8 @@ pub enum DiscussRequestPayload {
 
     #[privileged(reason = "Elicitation answers are internal bus-only control requests, not public RPC")]
     AnswerElicitation {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Opaque typed elicitation request id.
         elicitation_request_id: ElicitationRequestId,
         /// The user's accepted, declined, or cancelled answer.
@@ -127,8 +127,8 @@ pub enum DiscussRequestPayload {
 
     #[privileged(reason = "Elicitation cancellation is an internal bus-only control request, not public RPC")]
     CancelElicitation {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Opaque typed elicitation request id.
         elicitation_request_id: ElicitationRequestId,
     },
@@ -137,24 +137,24 @@ pub enum DiscussRequestPayload {
 
     #[privileged(reason = "Turn cancellation is an internal bus-only control request, not public RPC")]
     CancelTurn {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
     },
 
     /// Cancel and close a session.
 
     #[privileged(reason = "Session cancellation is an internal bus-only control request, not public RPC")]
     CancelSession {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
     },
 
     /// Reserve an ephemeral viewer for a Provider child ACP session without starting its worker.
 
     #[privileged(reason = "Inspector open/dispose is an internal bus-only control request, not public RPC")]
     ReserveInspector {
-        /// Parent Sluice chat whose Provider owns the child session.
-        parent_session_id: SluiceSessionId,
+        /// Parent chat whose Provider owns the child session.
+        parent_session_id: DiscussSessionId,
         /// Provider ACP child-session identity.
         child_session_id: String,
     },
@@ -162,14 +162,14 @@ pub enum DiscussRequestPayload {
     /// Start a reserved inspector after Zeus has registered its viewer channel.
 
     #[privileged(reason = "Inspector start is an internal bus-only control request, not public RPC")]
-    StartInspector { viewer_session_id: SluiceSessionId },
+    StartInspector { viewer_session_id: DiscussSessionId },
 
     /// Tear down only an ephemeral inspector viewer.
 
     #[privileged(reason = "Inspector open/dispose is an internal bus-only control request, not public RPC")]
     DisposeInspector {
         /// Ephemeral viewer identity returned by `ReserveInspector`.
-        viewer_session_id: SluiceSessionId,
+        viewer_session_id: DiscussSessionId,
     },
 
     /// List all installed providers.
@@ -200,15 +200,18 @@ pub enum DiscussRequestPayload {
 
     /// New Discuss session.
     ///
-    /// The caller generates the `sluice_session_id` (UUID v4) before opening
+    /// The caller generates the `discuss_session_id` (UUID v4) before opening
     /// the Tauri channel. Discuss does not accept a provider ACP session id
     /// as input; reconnect and provider recovery are resolved by Discuss
     /// alone through its persisted mapping.
 
     #[operation(name = "newSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
     NewSession {
-        /// Caller-generated Sluice session identity (UUID v4).
-        sluice_session_id: SluiceSessionId,
+        /// Optional session-specific launch inputs.
+        #[serde(default)]
+        launch_config: Option<SessionLaunchConfig>,
+        /// Caller-generated session identity (UUID v4).
+        discuss_session_id: DiscussSessionId,
         /// The json representation from the Discuss registry that can be used to spawn the agent.
         agent_key: String,
         /// Human-readable session name (metadata, not a routing key).
@@ -219,6 +222,9 @@ pub enum DiscussRequestPayload {
         /// Optional execution directory; absence retains the provider workspace default.
         #[serde(default)]
         session_cwd: Option<PathBuf>,
+        /// Override application MCP for this session; absent uses the Provider default.
+        #[serde(default)]
+        application_mcp_enabled: Option<bool>,
     },
 
     /// Add a new provider to the Discuss server.
@@ -307,20 +313,20 @@ pub enum DiscussRequestPayload {
 
     /// Load a single chat session and its bounded recent transcript turns.
     ///
-    /// Read-only query keyed by `sluice_session_id`.
+    /// Read-only query keyed by `discuss_session_id`.
     #[operation(name = "loadSession", kind = "query", response = SessionLoadOutput, response_variant = "SessionLoad")]
     LoadSession {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
     },
 
     /// Get the provider-exposed config options for a live or loaded session.
     ///
-    /// Read-only query keyed by `sluice_session_id`.
+    /// Read-only query keyed by `discuss_session_id`.
     #[operation(name = "getConfigOptions", kind = "query", response = ConfigOptionsOutput, response_variant = "ConfigOptions")]
     GetConfigOptions {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
     },
 
     /// Set a provider-exposed config option on an active session.
@@ -328,37 +334,37 @@ pub enum DiscussRequestPayload {
     /// Mutation; subject to the bus safety gate.
     #[operation(name = "setConfigOption", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
     SetConfigOption {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Provider option id to set.
         config_id: String,
         /// New value for the option as an ACP `SessionConfigValueId` (string).
         value: String,
     },
 
-    /// Rename a local Sluice Discuss chat session display label.
+    /// Rename a local Discuss chat session display label.
     ///
-    /// Updates only the display title; the `sluice_session_id` identity and
+    /// Updates only the display title; the `discuss_session_id` identity and
     /// provider `acp_session_id` are preserved.
     #[operation(name = "renameSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
     RenameSession {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
-        /// User-controlled local Sluice display label.
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
+        /// User-controlled local display label.
         display_title: String,
     },
 
-    /// Remove a local Sluice Discuss chat session anchor.
+    /// Remove a local chat session anchor.
     ///
-    /// Deletes the session row keyed by `sluice_session_id`.
+    /// Deletes the session row keyed by `discuss_session_id`.
     /// Related chat turns cascade via FK. Live worker registry and
     /// capability cache entries for the same identity are dropped.
     ///
     /// Mutation; subject to the bus safety gate.
     #[operation(name = "removeSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
     RemoveSession {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
     },
 }
 
@@ -369,7 +375,7 @@ pub enum DiscussResponse {
     /// A Flow AgentNode session was accepted by its ACP worker.
     AgentNodeStarted {
         correlation: LifecycleCorrelation,
-        session_id: SluiceSessionId,
+        session_id: DiscussSessionId,
         limits: AgentNodeSessionLimits,
         session_cwd: PathBuf,
     },
@@ -380,8 +386,8 @@ pub enum DiscussResponse {
     },
     /// A new session has been created successfully
     NewSession {
-        /// The Sluice session id of the new session
-        session_id: SluiceSessionId,
+        /// The session id of the new session
+        session_id: DiscussSessionId,
     },
 
     /// Binding for an ephemeral child-session inspector.
@@ -452,21 +458,21 @@ pub enum DiscussResponse {
     /// The handle converts this to `DiscussBroadcast::SessionWarning`.
     #[serde(skip)]
     SessionWarning {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Provider ACP session id (protocol/diagnostic data).
         acp_session_id: SessionId,
         /// Human-readable warning message.
         warning: String,
     },
-    /// The selected Sluice MCP transport for a live session.
+    /// The selected MCP transport for a live session.
     #[serde(skip)]
     McpStatus {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Provider ACP session id (protocol/diagnostic data).
         acp_session_id: SessionId,
-        /// Current Sluice MCP transport status.
+        /// Current MCP transport status.
         status: DiscussMcpStatus,
     },
 }
@@ -488,8 +494,8 @@ pub enum DiscussBroadcast {
     /// Published on successful provider association. Zeus uses it to mark a
     /// session associated but must tolerate lag/drops.
     SessionReady {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
     },
     /// An informational session warning (e.g. missing MCP-over-ACP capability).
     ///
@@ -497,20 +503,20 @@ pub enum DiscussBroadcast {
     /// or category layer. This is a reusable informational broadcast, not a
     /// reliable delivery path.
     SessionWarning {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Provider ACP session id (protocol/diagnostic data).
         acp_session_id: SessionId,
         /// Human-readable warning message.
         warning: String,
     },
-    /// The selected Sluice MCP transport for a live session.
+    /// The selected MCP transport for a live session.
     McpStatus {
-        /// Sluice-owned canonical session identity.
-        sluice_session_id: SluiceSessionId,
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
         /// Provider ACP session id (protocol/diagnostic data).
         acp_session_id: SessionId,
-        /// Current Sluice MCP transport status.
+        /// Current MCP transport status.
         status: DiscussMcpStatus,
     },
     /// One Provider runtime lifecycle projection changed.

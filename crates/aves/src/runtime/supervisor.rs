@@ -285,7 +285,7 @@ where
         Ok(())
     }
 
-    /// Stops and drains Sluice network ingress, then stops every installed domain through
+    /// Stops and drains network ingress, then stops every installed domain through
     /// live bus ingress before shutting down the native Iroh handlers and bus. Domain
     /// callbacks contain and report their own failures.
     pub async fn shutdown(&self) -> Result<(), BusControlError> {

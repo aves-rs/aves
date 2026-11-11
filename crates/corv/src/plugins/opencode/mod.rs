@@ -1,3 +1,5 @@
+pub(super) mod permissions;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -5,7 +7,7 @@ use std::{
     process::Stdio,
 };
 
-use agent_client_protocol::schema::v1::{McpServer, SessionId};
+use agent_client_protocol::schema::v1::{EnvVariable, McpServer, SessionId};
 use chrono::Utc;
 use serde::Serialize;
 use tokio::{
@@ -109,6 +111,25 @@ struct OpenCodeConfig {
 impl DiscussAgentPlugin for OpenCodePlugin {
     fn connection_strategy(&self) -> ConnectionStrategy {
         ConnectionStrategy::Shared
+    }
+
+    fn team_launch_server(&self, server: &McpServer, workspace: &Path) -> Result<Option<McpServer>, DiscussError> {
+        let McpServer::Stdio(mut server) = server.clone() else {
+            return Err(DiscussError::Validation {
+                message: "OpenCode Team sessions require a stdio provider".to_string(),
+            });
+        };
+        let directory = workspace.join(".opencode");
+        let directory = directory.to_str().ok_or_else(|| DiscussError::Validation {
+            message: "OpenCode Team configuration directory is not UTF-8".to_string(),
+        })?;
+        server
+            .env
+            .retain(|entry| entry.name != "OPENCODE_CONFIG_DIR");
+        server
+            .env
+            .push(EnvVariable::new("OPENCODE_CONFIG_DIR", directory));
+        Ok(Some(McpServer::Stdio(server)))
     }
 
     // Source-verified OpenCode contracts: `todowrite` accepts `{ todos }`, and
@@ -692,6 +713,30 @@ mod tests {
     use super::super::super::test_library;
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn team_launch_uses_central_config_without_mutating_provider() {
+        let workspace = tempdir().expect("temporary workspace");
+        let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));
+        let launch = PLUGIN
+            .team_launch_server(&original, workspace.path())
+            .expect("valid launch")
+            .expect("isolated");
+        let McpServer::Stdio(server) = launch else {
+            panic!("expected stdio")
+        };
+        let expected = workspace.path().join(".opencode");
+        assert!(
+            server
+                .env
+                .iter()
+                .any(|entry| entry.name == "OPENCODE_CONFIG_DIR" && entry.value == expected.to_str().unwrap())
+        );
+        let McpServer::Stdio(original) = original else {
+            panic!("expected stdio")
+        };
+        assert!(original.env.is_empty());
+    }
 
     #[test]
     fn captures_todos_from_raw_input_object() {

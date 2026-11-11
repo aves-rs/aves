@@ -1,0 +1,8 @@
+{"agents":[
+ {"id":"codex-acp","name":"Codex","version":"1.1.7","description":"ACP adapter for OpenAI's coding assistant.","distribution":{"npx":{"package":"@agentclientprotocol/codex-acp@1.1.7"}}},
+ {"id":"gemini","name":"Gemini CLI","version":"0.47.0","description":"Google Gemini CLI in ACP mode.","distribution":{"npx":{"package":"@google/gemini-cli@0.47.0","args":["--acp"]}}},
+ {"id":"claude-acp","name":"Claude Agent","version":"0.47.0","description":"Claude-compatible ACP agent wrapper.","distribution":{"npx":{"package":"@agentclientprotocol/claude-agent-acp@0.47.0"}}},
+ {"id":"github-copilot-cli","name":"GitHub Copilot","version":"1.0.63","description":"GitHub Copilot CLI in ACP mode.","distribution":{"npx":{"package":"@github/copilot@1.0.63","args":["--acp"]}}},
+ {"id":"auggie","name":"Auggie CLI","version":"0.30.0","description":"Augment Code agent in ACP mode.","distribution":{"npx":{"package":"@augmentcode/auggie@0.30.0","args":["--acp"]}}},
+ {"id":"cline","name":"Cline","version":"3.0.27","description":"Cline agent in ACP mode.","distribution":{"npx":{"package":"cline@3.0.27","args":["--acp"]}}}
+]}

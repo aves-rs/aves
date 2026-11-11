@@ -76,7 +76,7 @@ impl McpAcpShim {
     /// Installs a fresh worker-local descriptor and dynamic handler state.
     pub fn new(domain: &DiscussMcpDomain, _owner: String, context: BusRpcContext, worker_jwt: Jwt) -> Self {
         let server_id = McpServerAcpId::new(format!("acp:{}", uuid::Uuid::new_v4()));
-        let descriptor = sluice_mcp_acp_descriptor(domain.server_name.to_string(), server_id.clone());
+        let descriptor = mcp_acp_descriptor(domain.server_name.to_string(), server_id.clone());
         let state = McpAcpShimState {
             closed: false,
             server_id,
@@ -221,7 +221,7 @@ impl McpAcpDynamicHandler {
 
 impl HandleDispatchFrom<Agent> for McpAcpDynamicHandler {
     fn describe_chain(&self) -> impl std::fmt::Debug {
-        "SluiceMcpAcpShim"
+        "McpAcpShim"
     }
 
     async fn handle_dispatch_from(
@@ -278,8 +278,8 @@ impl HandleDispatchFrom<Agent> for McpAcpDynamicHandler {
     }
 }
 
-/// Creates the sole ACP transport descriptor for Sluice's in-process MCP service.
-pub fn sluice_mcp_acp_descriptor(name: String, server_id: McpServerAcpId) -> McpServer {
+/// Creates the sole ACP transport descriptor.
+pub fn mcp_acp_descriptor(name: String, server_id: McpServerAcpId) -> McpServer {
     McpServer::Acp(McpServerAcp::new(name, server_id))
 }
 

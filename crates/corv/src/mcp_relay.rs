@@ -6,7 +6,7 @@ use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
 use aves::auth::Jwt;
 use aves::bus::{BusControlError, BusMcpEndpoint, BusSudoService, CloseMcpInput, OpenMcpInput};
 
-const MCP_REGISTRATION_HEADER: &str = "X-Sluice-Mcp-Registration";
+const MCP_REGISTRATION_HEADER: &str = "X-Mcp-Registration";
 
 /// A bus-owned MCP listener lease used by one ACP worker.
 ///
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn endpoint_shaping_preserves_bus_name_and_url() {
         let endpoint = BusMcpEndpoint {
-            server_name: "Sluice Discuss".to_string(),
+            server_name: "Discuss".to_string(),
             domain: "discuss".to_string(),
             url: "http://127.0.0.1:1234/mcp/discuss".to_string(),
         };

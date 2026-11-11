@@ -323,7 +323,7 @@ Selected entry from [Poseidon's real composition](../poseidon/src/app.rs):
 ConfigDomain => config_router,
   normal: AVES_CONFIG_OPERATIONS.as_slice(),
   mcp: AVES_CONFIG_OPERATIONS.as_slice(),
-  "Sluice Config", "config",
+  "Application Config", "config",
   broadcast: ConfigBroadcast => Config,
 ```
 
@@ -470,7 +470,7 @@ Pairing trust is local, unilateral, file-backed, and non-transitive.
 Confirmed machines still need an audience appropriate to the target runtime.
 Revocation changes local admission; it does not mutate the remote machine's files.
 
-Inspect [Auth contracts](src/auth/messages.rs), [capabilities](src/auth/types.rs), and [peer runtime architecture](../../docs/trade.sluice/trade.sluice.engineering/architecture/aves/iroh-peer-runtime.md).
+Inspect [Auth contracts](src/auth/messages.rs), [capabilities](src/auth/types.rs), and [peer runtime architecture](./docs/architecture/aves/iroh-peer-runtime.md).
 Use authenticated native peer operations for supported cross-runtime requests.
 Peer transport is not distributed consensus or an application-level shared transaction.
 
@@ -561,7 +561,7 @@ Declare `Cancellable` or `NonCancellable` honestly.
 Declare `Pure` or `SideEffecting` according to observable effects.
 Do not promise cancellation can undo an effect already accepted externally.
 
-See [the registration API](src/flow/registration.rs) and [adding a node kind](../../docs/trade.sluice/trade.sluice.engineering/guides/adding-a-flow-node-kind.md).
+See [the registration API](src/flow/registration.rs) and [adding a node kind](./docs/guides/adding-a-flow-node-kind.md).
 
 ### Bind data and prepare workspaces
 
@@ -586,7 +586,7 @@ Supply graph-level seeds through `WorkspacePreparation::graph_seeds` when requir
 Flow owns one writable directory per execution at `executions/{execution_id}` under the data root.
 Keep checkpoints and restoration in Flow's existing durability mechanism.
 
-Use [Flow dataflow](../../docs/trade.sluice/trade.sluice.engineering/concepts/flow-dataflow.md) and [execution workspaces](../../docs/trade.sluice/trade.sluice.engineering/concepts/flow-execution-workspace.md) for complete contracts.
+Use [Flow dataflow](./docs/concepts/flow-dataflow.md) and [execution workspaces](./docs/concepts/flow-execution-workspace.md) for complete contracts.
 Do not treat a working-directory setting as general process confinement.
 
 ### Choose node owners and trigger sources
@@ -608,7 +608,7 @@ Flow persists definitions, triggers, execution state, and workspace durability r
 Owners retain responsibility for their external side effects.
 Do not infer exactly-once execution or cross-system transactions from graph persistence alone.
 
-Inspect [Flow's public contracts](src/flow/mod.rs) and [pluggable node architecture](../../docs/trade.sluice/trade.sluice.engineering/architecture/aves/pluggable-flow-nodes.md).
+Inspect [Flow's public contracts](src/flow/mod.rs) and [pluggable node architecture](./docs/architecture/aves/pluggable-flow-nodes.md).
 
 ### Execute ScriptNode work
 
@@ -622,7 +622,7 @@ Treat guest filesystem access and guest RPC as separate mechanisms.
 Apply the owner-provided finite fuel and timeout limits.
 Do not assume an AgentNode's process working directory provides equivalent confinement.
 
-Read [Tasks architecture](../../docs/trade.sluice/trade.sluice.engineering/architecture/aves/tasks-domain.md) and [the script adapter](src/tasks/adapter.rs).
+Read [Tasks architecture](./docs/architecture/aves/tasks-domain.md) and [the script adapter](src/tasks/adapter.rs).
 Keep source compilation, execution, and terminal output handling with Tasks.
 Keep graph scheduling, persistence, and checkpoint policy with Flow.
 
@@ -757,6 +757,6 @@ Add durable Flow automation, configuration, authenticated messaging, and sandbox
 ## Contributing
 
 Follow [Aves conventions](AGENTS.md), [macro rules](domain_setup/AGENTS.md), and repository engineering standards.
-Start with [domain RPC guidance](../../docs/trade.sluice/trade.sluice.engineering/guides/aves-domain-rpc.md).
-Read [cross-domain requests](../../docs/trade.sluice/trade.sluice.engineering/guides/cross-domain-requests.md) before adding a second communication mechanism.
+Start with [domain RPC guidance](./docs/guides/aves-domain-rpc.md).
+Read [cross-domain requests](./docs/guides/cross-domain-requests.md) before adding a second communication mechanism.
 Use existing domain and registration patterns before introducing infrastructure abstractions.

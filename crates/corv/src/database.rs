@@ -93,7 +93,7 @@ pub enum PersistenceJob {
 /// drops its sender on loop exit).
 pub(super) fn spawn_persistence_queue(
     persistence: DiscussPersistence,
-    sluice_session_id: String,
+    discuss_session_id: String,
     agent_name: String,
     session_name: String,
     root_context: BusRpcContext,
@@ -108,7 +108,7 @@ pub(super) fn spawn_persistence_queue(
                 } => {
                     let result = persist_session_anchor_inner(
                         &persistence,
-                        &sluice_session_id,
+                        &discuss_session_id,
                         SessionAnchorMetadata {
                             acp_session_id: Some(&acp_session_id),
                             ..SessionAnchorMetadata::default()
@@ -127,15 +127,22 @@ pub(super) fn spawn_persistence_queue(
                     initial_prompt,
                 } => {
                     if position == 0 {
-                        persist_initial_turn(&persistence, &sluice_session_id, &acp_session_id, &initial_prompt).await;
+                        persist_initial_turn(&persistence, &discuss_session_id, &acp_session_id, &initial_prompt).await;
                     } else {
-                        persist_subsequent_user_turn(&persistence, &sluice_session_id, position, &initial_prompt).await;
+                        persist_subsequent_user_turn(&persistence, &discuss_session_id, position, &initial_prompt)
+                            .await;
                     }
                 }
                 PersistenceJob::MetadataUpdates { updates } => {
                     for metadata in &updates {
-                        persist_metadata_update(&persistence, &sluice_session_id, &agent_name, &session_name, metadata)
-                            .await;
+                        persist_metadata_update(
+                            &persistence,
+                            &discuss_session_id,
+                            &agent_name,
+                            &session_name,
+                            metadata,
+                        )
+                        .await;
                     }
                 }
                 PersistenceJob::ConfigOptions {
@@ -145,7 +152,7 @@ pub(super) fn spawn_persistence_queue(
                 } => {
                     let result = persist_config_options(
                         &persistence,
-                        &sluice_session_id,
+                        &discuss_session_id,
                         &agent_name,
                         &options,
                         session_settings.as_ref(),
@@ -161,10 +168,10 @@ pub(super) fn spawn_persistence_queue(
                     assistant_position,
                     flush,
                 } => {
-                    persist_flush_payload(&persistence, &sluice_session_id, assistant_position, &flush).await;
+                    persist_flush_payload(&persistence, &discuss_session_id, assistant_position, &flush).await;
                 }
                 PersistenceJob::TodoSnapshot { snapshot_json } => {
-                    if let Err(error) = persist_todo_snapshot(&persistence, &sluice_session_id, &snapshot_json).await {
+                    if let Err(error) = persist_todo_snapshot(&persistence, &discuss_session_id, &snapshot_json).await {
                         tracing::warn!(?error, "Discuss worker: failed to persist todo snapshot");
                     }
                 }
@@ -173,7 +180,7 @@ pub(super) fn spawn_persistence_queue(
                         let config = load_discuss_settings(&root_context).await?;
                         persist_subagent(
                             &persistence,
-                            &sluice_session_id,
+                            &discuss_session_id,
                             &subagent,
                             config.subagent_retention_limit,
                         )
@@ -231,7 +238,7 @@ pub(super) async fn enqueue_utility_persistence(
 /// single site that issues `discuss_chat_turns_*` writes.
 pub async fn persist_user_turn(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     position: i64,
     text: &str,
 ) -> Result<(), DiscussError> {
@@ -241,7 +248,7 @@ pub async fn persist_user_turn(
     insert_discuss_chat_turn(
         &conn,
         DiscussChatTurnInsert {
-            sluice_session_id,
+            discuss_session_id,
             position,
             role: "user",
             acp_session_id: None,
@@ -250,7 +257,7 @@ pub async fn persist_user_turn(
         },
     )
     .await?;
-    prune_discuss_chat_turns_window(&conn, sluice_session_id).await?;
+    prune_discuss_chat_turns_window(&conn, discuss_session_id).await?;
     Ok(())
 }
 
@@ -262,11 +269,11 @@ pub async fn persist_user_turn(
 /// continue.
 pub async fn persist_subsequent_user_turn(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     position: i64,
     text: &str,
 ) {
-    if let Err(error) = persist_user_turn(persistence, sluice_session_id, position, text).await {
+    if let Err(error) = persist_user_turn(persistence, discuss_session_id, position, text).await {
         tracing::warn!(?error, "Discuss worker: failed to persist user turn");
     }
     // Bump last_user_prompt + last_interaction_at on the chat anchor. The
@@ -274,7 +281,7 @@ pub async fn persist_subsequent_user_turn(
     // existing acp_session_id / display_title / config / commands columns.
     persist_session_anchor(
         persistence,
-        sluice_session_id,
+        discuss_session_id,
         SessionAnchorMetadata {
             last_user_prompt: Some(text),
             ..SessionAnchorMetadata::default()
@@ -294,13 +301,13 @@ pub async fn persist_subsequent_user_turn(
 /// and continue, so the live stream is never blocked.
 pub(super) async fn persist_initial_turn(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     acp_session_id: &str,
     initial_prompt: &str,
 ) {
     persist_session_anchor(
         persistence,
-        sluice_session_id,
+        discuss_session_id,
         SessionAnchorMetadata {
             acp_session_id: Some(acp_session_id),
             last_user_prompt: Some(initial_prompt),
@@ -309,7 +316,7 @@ pub(super) async fn persist_initial_turn(
     )
     .await;
 
-    if let Err(error) = persist_user_turn(persistence, sluice_session_id, 0, initial_prompt).await {
+    if let Err(error) = persist_user_turn(persistence, discuss_session_id, 0, initial_prompt).await {
         tracing::warn!(?error, "Discuss worker: failed to persist initial user turn");
     }
 }
@@ -318,45 +325,45 @@ pub(super) async fn persist_initial_turn(
 /// rows, metadata, or child utility state.
 pub async fn persist_todo_snapshot(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     snapshot_json: &str,
 ) -> Result<(), DiscussError> {
     let conn = persistence.acquire_connection().await?;
-    super::storage::update_discuss_session_todo_snapshot(&conn, sluice_session_id, snapshot_json).await
+    super::storage::update_discuss_session_todo_snapshot(&conn, discuss_session_id, snapshot_json).await
 }
 
 pub async fn persist_subagent(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     subagent: &DiscussSubagentRecord,
     retention_limit: u32,
 ) -> Result<(), DiscussError> {
     let mut conn = persistence.acquire_connection().await?;
-    super::storage::upsert_and_prune_discuss_subagent(&mut conn, sluice_session_id, subagent, retention_limit).await
+    super::storage::upsert_and_prune_discuss_subagent(&mut conn, discuss_session_id, subagent, retention_limit).await
 }
 
 pub async fn persist_session_anchor(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     metadata: SessionAnchorMetadata<'_>,
 ) {
-    if let Err(error) = persist_session_anchor_inner(persistence, sluice_session_id, metadata).await {
+    if let Err(error) = persist_session_anchor_inner(persistence, discuss_session_id, metadata).await {
         tracing::warn!(?error, "Discuss worker: failed to persist session metadata");
     }
 }
 
 pub async fn persist_session_anchor_inner(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     metadata: SessionAnchorMetadata<'_>,
 ) -> Result<(), DiscussError> {
     let conn = persistence.acquire_connection().await?;
-    let existing = load_discuss_session(&conn, sluice_session_id).await?;
+    let existing = load_discuss_session(&conn, discuss_session_id).await?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     upsert_discuss_session_with_task_tag(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id,
+            discuss_session_id,
             team_leader_id: metadata.team_leader_id.or(existing
                 .as_ref()
                 .and_then(|row| row.team_leader_id.as_deref())),
@@ -414,13 +421,13 @@ pub async fn persist_session_anchor_inner(
 
 pub async fn persist_metadata_update(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     agent_name: &str,
     session_name: &str,
     metadata: &serde_json::Value,
 ) {
     if let Err(error) =
-        persist_metadata_update_inner(persistence, sluice_session_id, agent_name, session_name, metadata).await
+        persist_metadata_update_inner(persistence, discuss_session_id, agent_name, session_name, metadata).await
     {
         tracing::warn!(?error, "Discuss worker: failed to persist metadata update");
     }
@@ -435,14 +442,14 @@ pub async fn persist_metadata_update(
 /// swallowed the error into a `tracing::warn!`.
 pub async fn persist_metadata_update_inner(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     agent_name: &str,
     session_name: &str,
     metadata: &serde_json::Value,
 ) -> Result<(), DiscussError> {
     let acp_session_id = metadata.get("sessionId").and_then(|value| value.as_str());
 
-    // Provider titles stay metadata-only. Local Sluice session names are
+    // Provider titles stay metadata-only. Local session names are
     // user-controlled, so metadata updates never overwrite display_title.
     // Config options are persisted as canonical `Vec<DiscussConfigOption>` JSON — the
     // exact shape the no-live-worker `handle_get_config_options` fallback
@@ -455,7 +462,7 @@ pub async fn persist_metadata_update_inner(
 
     persist_session_anchor_inner(
         persistence,
-        sluice_session_id,
+        discuss_session_id,
         SessionAnchorMetadata {
             agent_name: Some(agent_name),
             session_name: Some(session_name),
@@ -504,7 +511,7 @@ pub async fn persist_metadata_update_inner(
 ///
 pub async fn persist_config_options(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     agent_name: &str,
     options: &[DiscussConfigOption],
     session_settings: Option<&ConfigSettings>,
@@ -513,7 +520,7 @@ pub async fn persist_config_options(
     let settings_json = session_settings.map(serde_json::to_string).transpose()?;
     persist_session_anchor_inner(
         persistence,
-        sluice_session_id,
+        discuss_session_id,
         SessionAnchorMetadata {
             latest_config_options_json: Some(&options_json),
             config_settings_json: settings_json.as_deref(),
@@ -538,22 +545,22 @@ pub async fn persist_config_options(
 /// no position; the worker owns the per-session `position` counter.
 pub async fn persist_flush_payload(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     position: i64,
     payload: &FlushPayload,
 ) {
-    if let Err(error) = persist_assistant_turn(persistence, sluice_session_id, position, payload).await {
+    if let Err(error) = persist_assistant_turn(persistence, discuss_session_id, position, payload).await {
         tracing::warn!(?error, "Discuss worker: failed to persist assistant turn");
     }
     // Bump last_interaction_at on the chat anchor so the session dropdown
     // orders by the protocol-level turn boundary. The load-and-carry-forward
     // path preserves every other metadata column.
-    persist_session_anchor(persistence, sluice_session_id, SessionAnchorMetadata::default()).await;
+    persist_session_anchor(persistence, discuss_session_id, SessionAnchorMetadata::default()).await;
 }
 
 pub async fn persist_assistant_turn(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     position: i64,
     payload: &FlushPayload,
 ) -> Result<(), DiscussError> {
@@ -570,7 +577,7 @@ pub async fn persist_assistant_turn(
     insert_discuss_chat_turn(
         &conn,
         DiscussChatTurnInsert {
-            sluice_session_id,
+            discuss_session_id,
             position,
             role: "assistant",
             acp_session_id: None,
@@ -579,7 +586,7 @@ pub async fn persist_assistant_turn(
         },
     )
     .await?;
-    prune_discuss_chat_turns_window(&conn, sluice_session_id).await?;
+    prune_discuss_chat_turns_window(&conn, discuss_session_id).await?;
     Ok(())
 }
 
@@ -594,7 +601,7 @@ pub fn should_persist_assistant_turn(payload: &FlushPayload) -> bool {
 /// durable projection; cancellation is represented by `status: "cancelled"`.
 pub async fn persist_elicitation_turn_inner(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     elicitation_request_id: &str,
     input: ElicitationPersistenceInput,
     answer: DiscussElicitationAnswer,
@@ -615,7 +622,7 @@ pub async fn persist_elicitation_turn_inner(
     insert_discuss_chat_turn(
         &conn,
         DiscussChatTurnInsert {
-            sluice_session_id,
+            discuss_session_id,
             position: input.position,
             role: "elicitation",
             acp_session_id: None,
@@ -624,7 +631,7 @@ pub async fn persist_elicitation_turn_inner(
         },
     )
     .await?;
-    prune_discuss_chat_turns_window(&conn, sluice_session_id).await?;
+    prune_discuss_chat_turns_window(&conn, discuss_session_id).await?;
     Ok(())
 }
 
@@ -694,12 +701,12 @@ fn classify_clearable_config_options(
 #[cfg(test)]
 pub(super) async fn persist_session_open(
     persistence: &DiscussPersistence,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     acp_session_id: &str,
 ) {
     persist_session_anchor(
         persistence,
-        sluice_session_id,
+        discuss_session_id,
         SessionAnchorMetadata {
             acp_session_id: Some(acp_session_id),
             ..SessionAnchorMetadata::default()

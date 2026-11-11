@@ -13,7 +13,7 @@ static AGENTS: LazyLock<Vec<AgentDefinition>> = LazyLock::new(|| {
         ("chief-of-staff", AgentRole::Leader),
         ("equity-analyst", AgentRole::Leader),
         ("sector-analyst", AgentRole::Leader),
-        ("sluice-customizer", AgentRole::Leader),
+        ("application-customizer", AgentRole::Leader),
         ("equity-auditor", AgentRole::Follower),
         ("generalist-reviewer", AgentRole::Follower),
         ("sector-auditor", AgentRole::Follower),
@@ -76,7 +76,7 @@ static TEAMS: LazyLock<Vec<TeamDefinition>> = LazyLock::new(|| {
             &["sector-auditor"][..],
             &["financial-data", "valuation"][..],
         ),
-        ("sluice-customizer", &[][..], &["flow-builder"][..]),
+        ("application-customizer", &[][..], &["flow-builder"][..]),
     ]
     .into_iter()
     .map(|(leader, followers, skills)| TeamDefinition {

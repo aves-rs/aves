@@ -28,8 +28,8 @@ use super::messages::{
     CancelAgentExecutionInput, CancelSessionInput, DiscussResponse, StartAgentInput, TickAgentInput,
 };
 use super::types::{
-    AgentNodeTerminalResult, AgentNodeTickResult, DiscussConfigValues, DiscussError, SluiceSessionId, TaskSessionStart,
-    WorkspaceCopySourcePort, resolve_agent_node_limits,
+    AgentNodeTerminalResult, AgentNodeTickResult, DiscussConfigValues, DiscussError, DiscussSessionId,
+    TaskSessionStart, WorkspaceCopySourcePort, resolve_agent_node_limits,
 };
 
 impl Actor {
@@ -41,7 +41,7 @@ impl Actor {
         provider_name: String,
         agent_name: String,
         config_overrides: DiscussConfigValues,
-        sluice_mcp_enabled: bool,
+        application_mcp_enabled: bool,
         prompt: String,
         session_cwd: PathBuf,
         max_turns: Option<i64>,
@@ -61,10 +61,11 @@ impl Actor {
         let limits = resolve_agent_node_limits(max_turns, max_tool_calls, max_duration)?;
         let started = self
             .start_task_session(TaskSessionStart {
+                launch_config: None,
                 provider_name,
                 agent_name,
                 config_overrides,
-                sluice_mcp_enabled,
+                application_mcp_enabled,
                 prompt,
                 session_cwd: session_cwd.clone(),
                 limits,
@@ -113,7 +114,7 @@ struct AgentNodeOwnerState {
     lifecycle: Arc<dyn DiscussAgentNodeLifecycleService>,
     streaming: ServiceReader<dyn DiscussStreamingService>,
     copy_source_port: ServiceReader<WorkspaceCopySourcePort>,
-    sessions: Mutex<HashMap<NodeExecutionId, (FlowExecutionId, SluiceSessionId)>>,
+    sessions: Mutex<HashMap<NodeExecutionId, (FlowExecutionId, DiscussSessionId)>>,
 }
 
 pub(super) fn agent_node_registration(
@@ -148,7 +149,7 @@ pub(super) fn agent_node_registration(
             let correlation = context.correlation.clone();
             let execution_root = context.execution_root.clone();
             let node_token = context.node_token.clone();
-            let flow_mcp_endpoints = if configuration.sluice_mcp_enabled {
+            let flow_mcp_endpoints = if configuration.application_mcp_enabled {
                 Some(
                     context
                         .mcp_ports
@@ -246,7 +247,7 @@ pub(super) fn agent_node_registration(
                         .get()
                         .expect("Discuss streaming must be published before Flow execution")
                         .cancel_session(CancelSessionInput {
-                            sluice_session_id: session_id,
+                            discuss_session_id: session_id,
                         }),
                 )
                 .await
@@ -266,7 +267,7 @@ pub(super) fn agent_node_registration(
                 tracing::warn!(?error, "could not clear cancelled AgentNode completion");
             }
             let error = match session_id {
-                Some(sluice_session_id) => DiscussError::SessionCancelled { sluice_session_id },
+                Some(discuss_session_id) => DiscussError::SessionCancelled { discuss_session_id },
                 None => DiscussError::AgentNodeCompletionNotFound {
                     node_execution_id: correlation.node_execution_id,
                 },
@@ -343,7 +344,7 @@ fn agent_node_start_input(
         provider_name: configuration.provider_name,
         agent_name: configuration.agent_name,
         config_overrides: configuration.config_overrides,
-        sluice_mcp_enabled: configuration.sluice_mcp_enabled,
+        application_mcp_enabled: configuration.application_mcp_enabled,
         prompt: configuration.prompt,
         session_cwd: agent_node_session_cwd(execution_root),
         max_turns: to_limit(configuration.max_turns)?,
@@ -364,7 +365,7 @@ fn agent_node_prompt(prompt: String, inputs: &BoundInputs) -> Result<String, Flo
     }
     let inputs_json = to_string(&inputs.as_value()).map_err(owner_error)?;
     Ok(format!(
-        "{prompt}\n\n--- Sluice task inputs ---\n```json\n{inputs_json}\n```\n--- End Sluice task inputs ---"
+        "{prompt}\n\n--- Task inputs ---\n```json\n{inputs_json}\n```\n--- End Task inputs ---"
     ))
 }
 
@@ -414,7 +415,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             agent_node_prompt("configured prompt".into(), &inputs).unwrap(),
-            "configured prompt\n\n--- Sluice task inputs ---\n```json\n{\"alpha\":{\"nested\":\"value\"},\"zeta\":[1,false,null]}\n```\n--- End Sluice task inputs ---"
+            "configured prompt\n\n--- Task inputs ---\n```json\n{\"alpha\":{\"nested\":\"value\"},\"zeta\":[1,false,null]}\n```\n--- End Task inputs ---"
         );
     }
 }

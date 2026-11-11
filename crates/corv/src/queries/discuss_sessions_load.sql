@@ -1,6 +1,6 @@
 -- Load the session anchor and metadata needed to restore cached state.
 SELECT
-    sluice_session_id,
+    discuss_session_id,
     agent_name,
     session_name,
     display_title,
@@ -13,6 +13,8 @@ SELECT
     first_prompt_at,
     last_interaction_at,
     team_leader_id,
-    is_task_session
+    is_task_session,
+    session_cwd_json,
+    session_mcp_enabled
 FROM discuss_sessions
-WHERE sluice_session_id = ?1
+WHERE discuss_session_id = ?1

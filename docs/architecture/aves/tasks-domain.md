@@ -30,8 +30,8 @@ Aves Tasks owns ScriptNode Flow registration: Oxc TypeScript compile and a fresh
 
 1. Flow dispatches `StartScript` with source, **workspace-relative filename**, BoundInputs (`as_value()`), limits, `workspace_path`, and a Flow-scoped JWT + `BusIngress` (serde-skipped) for guest RPC.
 2. Actor transpiles with Oxc. Parse mode is always TypeScript module (`SourceType::ts().with_module(true)` in `compiler.rs`). Filename is diagnostics / import resolution only — not parse-mode selection. Then it stores process-local `pending` and runs a **new** Wasmtime engine/module (tests may cache the runtime; production does not).
-3. Sandbox preopens exactly one directory: host = `workspace_path`, guest = `/`. Compiled source is staged beside the entry parent so `./helper.js` resolves next to `src/main`. Bootstrap injects `__sluice_inputs` / `__sluice_outputs`, then module-mode `await import(guestPath)`, then `js_std_loop_once` drains jobs before `SLUICE_OUTPUT`.
-4. Guest emits `ScriptNodeCompletion { correlation, outputs, errors, logs }` from `__sluice_outputs`. Flow publishes BoundOutputs only on success ([Flow Dataflow](../../concepts/flow-dataflow.md)). File I/O never uses the guest RPC bridge.
+3. Sandbox preopens exactly one directory: host = `workspace_path`, guest = `/`. Compiled source is staged beside the entry parent so `./helper.js` resolves next to `src/main`. Bootstrap injects `__application_inputs` / `__application_outputs`, then module-mode `await import(guestPath)`, then `js_std_loop_once` drains jobs before `APP_OUTPUT`.
+4. Guest emits `ScriptNodeCompletion { correlation, outputs, errors, logs }` from `__application_outputs`. Flow publishes BoundOutputs only on success ([Flow Dataflow](../../concepts/flow-dataflow.md)). File I/O never uses the guest RPC bridge.
 5. `TickScript` requires a prior start in this process (`ScriptNotStarted` otherwise).
 
 ```rust

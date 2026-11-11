@@ -1088,7 +1088,7 @@ fn agent_definition(flow_id: FlowId, root: super::super::ast::ContentAddressedRo
                     "maxToolCalls": null,
                     "maxDuration": null,
                     "configOverrides": {},
-                    "sluiceMcpEnabled": false,
+                    "applicationMcpEnabled": false,
                     "workspace": root
                 }
             }

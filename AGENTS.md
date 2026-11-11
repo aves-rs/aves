@@ -1,6 +1,6 @@
 # Aves workspace
 
-This repository contains the reusable Aves runtime and three optional domain crates. It does not contain the Sluice trading application. Use the nearest package `AGENTS.md` for binding ownership and contracts; start at [engineering navigation](docs/navigation.md) for cross-package explanations.
+This repository contains the reusable Aves runtime and three optional domain crates. Use the nearest package `AGENTS.md` for binding ownership and contracts; start at [engineering navigation](docs/navigation.md) for cross-package explanations.
 
 | Package | Owns | Local rules |
 |---|---|---|

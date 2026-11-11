@@ -1,5 +1,5 @@
 {
-  description = "Sluice development environment";
+  description = "Aves development environment";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";

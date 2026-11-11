@@ -29,8 +29,8 @@ use super::storage::{
 };
 use super::supervisor::{CallbackRouteRegistry, CallbackRouter, ProviderSupervisor, ProviderSupervisorResources};
 use super::types::{
-    AcpProvider, CleanupWarning, DiscussConfigOption, DiscussError, DiscussProviderConfig, ProviderRuntimeState,
-    SluiceSessionId, WorkerCommand,
+    AcpProvider, CleanupWarning, DiscussConfigOption, DiscussError, DiscussProviderConfig, DiscussSessionId,
+    ProviderRuntimeState, WorkerCommand,
 };
 
 type SharedConnectionResult = Result<(ConnectionTo<Agent>, bool, bool), agent_client_protocol::Error>;
@@ -145,11 +145,11 @@ impl Actor {
         if requires_connectivity {
             let conn = self.persistence.acquire_connection().await?;
             let previous_config = load_discuss_agent_config(&conn, &provider_name).await?;
-            let sluice_session_id = SluiceSessionId::new();
+            let discuss_session_id = DiscussSessionId::new();
             self.agents
                 .insert(provider_name.clone(), provider_spec.clone());
             self.pending_provider_tests.insert(
-                sluice_session_id,
+                discuss_session_id,
                 PendingProviderTest {
                     provider_name: provider_name.clone(),
                     candidate: provider_spec,
@@ -160,9 +160,10 @@ impl Actor {
             );
             if let Err(error) = self
                 .spawn_session(
-                    sluice_session_id,
+                    discuss_session_id,
                     &provider_name,
                     SpawnSessionOptions {
+                        launch_config: None,
                         name: Some("Provider connectivity check".to_string()),
                         setup: None,
                         session_config_overrides: std::collections::BTreeMap::new(),
@@ -170,14 +171,14 @@ impl Actor {
                         announce_desktop_association: false,
                         transient_connectivity: true,
                         session_cwd: None,
-                        sluice_mcp_enabled: None,
+                        application_mcp_enabled: None,
                         node_token: None,
                         flow_mcp_endpoints: None,
                     },
                 )
                 .await
             {
-                if let Some(pending) = self.pending_provider_tests.remove(&sluice_session_id) {
+                if let Some(pending) = self.pending_provider_tests.remove(&discuss_session_id) {
                     let original = error.clone();
                     let reply = self.restore_provider_test_snapshot(pending, false).await;
                     let _ = reply.send(Err(original));
@@ -253,13 +254,13 @@ impl Actor {
 
     pub(super) async fn finish_provider_test(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         result: Result<Option<Vec<DiscussConfigOption>>, DiscussError>,
     ) {
-        let Some(pending) = self.pending_provider_tests.remove(&sluice_session_id) else {
+        let Some(pending) = self.pending_provider_tests.remove(&discuss_session_id) else {
             return;
         };
-        if let Some(entry) = self.worker_registry.remove(&sluice_session_id) {
+        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
             let _ = entry.command_tx.send(WorkerCommand::Stop).await;
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
         }
@@ -871,14 +872,15 @@ impl Actor {
             let Some(acp_session_id) = present_acp_session_id(row.acp_session_id.as_deref()) else {
                 continue;
             };
-            let Ok(sluice_session_id) = SluiceSessionId::from_str(&row.sluice_session_id) else {
+            let Ok(discuss_session_id) = DiscussSessionId::from_str(&row.discuss_session_id) else {
                 continue;
             };
             if let Err(error) = self
                 .spawn_session(
-                    sluice_session_id,
+                    discuss_session_id,
                     provider_name,
                     SpawnSessionOptions {
+                        launch_config: None,
                         name: Some(row.session_name),
                         setup: None,
                         session_config_overrides: std::collections::BTreeMap::new(),
@@ -886,7 +888,7 @@ impl Actor {
                         announce_desktop_association: false,
                         transient_connectivity: false,
                         session_cwd: None,
-                        sluice_mcp_enabled: None,
+                        application_mcp_enabled: None,
                         node_token: None,
                         flow_mcp_endpoints: None,
                     },
@@ -1180,7 +1182,7 @@ impl Actor {
         }
 
         for session in &sessions {
-            delete_discuss_session(conn, &session.sluice_session_id).await?;
+            delete_discuss_session(conn, &session.discuss_session_id).await?;
         }
 
         for session_id in live_session_ids {
@@ -1192,7 +1194,7 @@ impl Actor {
             if let Some(pending) = self.pending_provider_tests.remove(&session_id) {
                 let reply = self.restore_provider_test_snapshot(pending, false).await;
                 let _ = reply.send(Err(DiscussError::SessionCancelled {
-                    sluice_session_id: session_id,
+                    discuss_session_id: session_id,
                 }));
             }
             self.cancel_pending_permissions_for_session(&session_id);

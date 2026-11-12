@@ -6,8 +6,8 @@ Corv owns Discuss on the Aves runtime. Named for Corvidae (ravens/crows), the pl
 
 - **Corv Discuss** (`crates/corv/src/`): actor, workers, persistence, typed errors, stream sender, Provider/Team/session lifecycle, MCP transport, plugin materialization.
 - **Poseidon** (`pkg/poseidon/src/app.rs`): composition root; installs Discuss on the Aves runtime, supplies mandatory `PoseidonHarnessPlug.discuss_stream_tx` through `PoseidonStartOptions.harness`, and projects `PoseidonBroadcast`.
-- **Zeus** (`pkg/zeus/src/bridges/discuss/`): `Channel<AcpBridgeEvent>` wrapper, stream receiver, routing by `sluiceSessionId`.
-- **Hades** (`pkg/hades/src/app/acp/`): ACP SDK interpretation, Zustand store keyed by `sluiceSessionId`, chat rail.
+- **Zeus** (`pkg/zeus/src/bridges/discuss/`): `Channel<AcpBridgeEvent>` wrapper, stream receiver, routing by `discussSessionId`.
+- **Hades** (`pkg/hades/src/app/acp/`): ACP SDK interpretation, Zustand store keyed by `discussSessionId`, chat rail.
 
 ## File owner map
 
@@ -21,7 +21,7 @@ Corv owns Discuss on the Aves runtime. Named for Corvidae (ravens/crows), the pl
 | `session.rs` | ACP SDK connection and router: shared/isolated dispatch, SDK session new/load attachment, `SessionCallbackRouter`, callback routing, worker JWT, initialize/load requests. |
 | `worker.rs` | Single connected ACP worker event loop: `run_isolated` startup, `run_connected_session` command/event handlers, permission/elicitation/config/inspector branches. **File-length exception:** soft target 1,200 LOC; hard cap **1,750 LOC** (raised from 1,500). Current ~1,341 LOC. This exception applies ONLY to this file. |
 | `agents.rs` | Agent message and permission projection: turn buffer, transcript position allocation, permission/elicitation request preparation, responder resolution, message-to-user dispatch. |
-| `elicitation.rs` | Restricted-form DTO projection (`DiscussRestrictedFormField*`, `DiscussElicitationClassification`, `DiscussElicitationAnswer`) and validation (`validate_elicitation_content`, `classify_elicitation_schema`, `content_to_sdk_answer`). Reuses SDK `CreateElicitationRequest::scope` and typed `ElicitationContentValue` conversion; retains Sluice required-field/enum/pattern/numeric-bounds checks. |
+| `elicitation.rs` | Restricted-form DTO projection (`DiscussRestrictedFormField*`, `DiscussElicitationClassification`, `DiscussElicitationAnswer`) and validation (`validate_elicitation_content`, `classify_elicitation_schema`, `content_to_sdk_answer`). Reuses SDK `CreateElicitationRequest::scope` and typed `ElicitationContentValue` conversion; retains required-field/enum/pattern/numeric-bounds checks. |
 | `database.rs` | Ordered persistence queue: `PersistenceJob` variants, `enqueue_persistence_job`, `spawn_persistence_queue`, drain task, anchor merge, retention-scope helpers, cleanup warnings. |
 | `storage.rs` | Typed SQL storage: `include_str!` constants, Turso `Connection` helpers, row types, CRUD functions, decoders. **Subagent upsert + retention prune MUST execute inside one Turso transaction** (`upsert_and_prune_discuss_subagent` takes `&mut Connection`, begins transaction, executes upsert, executes prune, commits only after both succeed). |
 | `messages.rs` | Typed request/response/broadcast contracts: `DiscussRequest`, `DiscussRequestPayload` (bus macro), `DiscussResponse`, `DiscussBroadcast`. |
@@ -52,7 +52,7 @@ Corv owns Discuss on the Aves runtime. Named for Corvidae (ravens/crows), the pl
 ## Key contracts
 
 - **One Actor, one ordered persistence queue, one connected ACP worker per session.**
-- **`sluiceSessionId`** is the only Sluice routing key. Five `DiscussStreamEvent` variants: `SessionFailed`, `AgentMessage`, `UtilityUpdate`, `PermissionRequested`, `ElicitationRequested`.
+- **`discussSessionId`** is the only corv routing key. Five `DiscussStreamEvent` variants: `SessionFailed`, `AgentMessage`, `UtilityUpdate`, `PermissionRequested`, `ElicitationRequested`.
 - **`PoseidonHarnessPlug.discuss_stream_tx`** is mandatory (via `PoseidonStartOptions.harness`). Discuss is constructed for every runtime.
 - **Privileged bus-only:** session control, inspector, provider-config lifecycle. **Public:** `StartServer` / `StopServer` / `GetServerStatus` / `StartProvider` / `StopProvider`, Provider/Team mutations, reads.
 - **Provider runtimes:** Actor-owned `provider_supervisors` (memory only). Shared: `opencode`, `codex-acp`, `claude-acp`. Isolated: `grok-build` and custom.

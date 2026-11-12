@@ -31,14 +31,15 @@ use super::storage::{
     DiscussSessionRow, ElicitationPersistenceInput, LoadedSessionRefresh, delete_discuss_session,
     list_recent_discuss_sessions, load_discuss_agent_config, load_discuss_chat_turns_window, load_discuss_session,
     load_discuss_subagents, load_discuss_team_installation, merge_refresh_discuss_session, present_acp_session_id,
-    provider_updated_at_ms, rename_discuss_session, upsert_discuss_agent_config,
+    provider_updated_at_ms, rename_discuss_session, update_session_launch_config, update_session_launch_context,
+    update_session_setup_kind, upsert_discuss_agent_config,
 };
 use super::supervisor::{CallbackRouter, ProviderSupervisor, ProviderSupervisorResources};
 use super::types::{
     AcpProvider, ConfigSettings, DiscussChatTurnRecord, DiscussConfigOption, DiscussElicitationAnswer, DiscussError,
-    DiscussMemberOverrides, DiscussPermissionOption, DiscussSessionInfo, DiscussSessionSetup, DiscussStreamEvent,
-    ElicitationRequestId, InspectorBinding, PendingElicitation, PermissionRequestId, SluiceSessionId,
-    TaskSessionStarted, WorkerCommand, WorkerEntry,
+    DiscussMemberOverrides, DiscussPermissionOption, DiscussSessionId, DiscussSessionInfo, DiscussSessionSetup,
+    DiscussStreamEvent, ElicitationRequestId, InspectorBinding, PendingElicitation, PermissionRequestId,
+    SessionLaunchConfig, TaskSessionStarted, WorkerCommand, WorkerEntry,
 };
 
 impl Actor {
@@ -58,7 +59,7 @@ impl Actor {
 
     async fn handle_existing_session(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         announce_desktop_association: bool,
     ) -> Result<bool, DiscussError> {
         if !self.server_running {
@@ -66,24 +67,25 @@ impl Actor {
         }
         if self
             .worker_registry
-            .get(&sluice_session_id)
+            .get(&discuss_session_id)
             .is_some_and(|entry| entry.command_tx.is_closed())
         {
-            if let Some(entry) = self.worker_registry.remove(&sluice_session_id) {
+            if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
                 revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
                 if let Some(supervisor) = self.provider_supervisors.get_mut(&entry.agent_name) {
-                    supervisor.disassociate_chat(&sluice_session_id);
+                    supervisor.disassociate_chat(&discuss_session_id);
                 }
             }
-            self.worker_capabilities.remove(&sluice_session_id);
+            self.worker_capabilities.remove(&discuss_session_id);
         }
-        if let Some(entry) = self.worker_registry.get_mut(&sluice_session_id) {
+        if let Some(entry) = self.worker_registry.get_mut(&discuss_session_id) {
             let ready_for_desktop_association = announce_desktop_association && entry.acp_session_id.is_some();
             if announce_desktop_association {
                 entry.desktop_association_requested = !ready_for_desktop_association;
             }
             if ready_for_desktop_association {
-                self.announce_desktop_association(sluice_session_id).await?;
+                self.announce_desktop_association(discuss_session_id)
+                    .await?;
             }
             return Ok(true);
         }
@@ -98,10 +100,11 @@ impl Actor {
             return Err(DiscussError::ShuttingDown);
         }
         let TaskSessionStart {
+            launch_config,
             provider_name,
             agent_name,
             config_overrides,
-            sluice_mcp_enabled,
+            application_mcp_enabled,
             prompt,
             session_cwd,
             limits,
@@ -109,7 +112,7 @@ impl Actor {
             flow_mcp_endpoints,
         } = options;
         validate_user_turn(&prompt)?;
-        let session_id = SluiceSessionId::new();
+        let session_id = DiscussSessionId::new();
         tracing::debug!(
             %session_id,
             provider = %provider_name,
@@ -133,6 +136,7 @@ impl Actor {
             session_id,
             &provider_name,
             SpawnSessionOptions {
+                launch_config,
                 name: Some(agent_name.clone()),
                 setup,
                 session_config_overrides: config_overrides,
@@ -140,7 +144,7 @@ impl Actor {
                 announce_desktop_association: false,
                 transient_connectivity: false,
                 session_cwd: Some(session_cwd),
-                sluice_mcp_enabled: Some(sluice_mcp_enabled),
+                application_mcp_enabled: Some(application_mcp_enabled),
                 node_token: Some(node_token),
                 flow_mcp_endpoints,
             },
@@ -150,7 +154,7 @@ impl Actor {
             .worker_registry
             .get(&session_id)
             .ok_or(DiscussError::SessionNotFound {
-                sluice_session_id: session_id,
+                discuss_session_id: session_id,
             })?;
         let (accepted, accepted_rx) = oneshot::channel();
         entry
@@ -177,11 +181,12 @@ impl Actor {
 
     pub(super) async fn spawn_session(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         key: &str,
         options: SpawnSessionOptions,
     ) -> Result<DiscussResponse, DiscussError> {
         let SpawnSessionOptions {
+            launch_config,
             name,
             setup,
             session_config_overrides,
@@ -189,12 +194,12 @@ impl Actor {
             announce_desktop_association,
             transient_connectivity,
             session_cwd,
-            sluice_mcp_enabled: requested_sluice_mcp_enabled,
+            application_mcp_enabled: requested_application_mcp_enabled,
             node_token,
             flow_mcp_endpoints,
         } = options;
         if self
-            .handle_existing_session(sluice_session_id, announce_desktop_association)
+            .handle_existing_session(discuss_session_id, announce_desktop_association)
             .await?
         {
             return Ok(DiscussResponse::Success);
@@ -206,28 +211,51 @@ impl Actor {
         };
         self.ensure_provider_accepts_session(key, transient_connectivity)?;
         let session_name = name.unwrap_or_else(|| "A new session".to_string());
-        // NewSession is keyed only by the caller-owned Sluice id. Resolve the
+        // NewSession is keyed only by the caller-owned id. Resolve the
         // provider recovery id from the persisted anchor rather than accepting
         // one from Zeus or Hades.
         let acp_session_id = if transient_connectivity {
             None
         } else {
-            self.resolve_persisted_acp_session_id(sluice_session_id, acp_session_id)
+            self.resolve_persisted_acp_session_id(discuss_session_id, acp_session_id)
                 .await?
         };
         let reconnect_acp_session_id = acp_session_id.map(SessionId::from);
+        let stored_launch = if transient_connectivity {
+            None
+        } else {
+            let conn = self.persistence.acquire_connection().await?;
+            load_discuss_session(&conn, &discuss_session_id.to_string()).await?
+        };
+        let stored_cwd = stored_launch
+            .as_ref()
+            .and_then(|row| row.session_cwd_json.as_deref())
+            .map(serde_json::from_str::<PathBuf>)
+            .transpose()?;
+        let launch_config = stored_launch
+            .as_ref()
+            .and_then(|row| row.session_launch_config_json.as_deref())
+            .map(serde_json::from_str::<SessionLaunchConfig>)
+            .transpose()?
+            .or(launch_config);
+        let session_cwd = stored_cwd.or(session_cwd);
+        let requested_application_mcp_enabled = stored_launch
+            .as_ref()
+            .and_then(|row| row.session_mcp_enabled)
+            .map(|enabled| enabled != 0)
+            .or(requested_application_mcp_enabled);
         let (
             restored_persisted_transcript,
             next_turn_position,
             persisted_config_options,
             mut session_settings,
-            team_leader_id,
+            restored_setup,
         ) = if transient_connectivity {
             (false, 0, Vec::new(), ConfigSettings::new(), None)
         } else if reconnect_acp_session_id.is_some() {
             let conn = self.persistence.acquire_connection().await?;
-            let turns = load_discuss_chat_turns_window(&conn, &sluice_session_id.to_string()).await?;
-            let row = load_discuss_session(&conn, &sluice_session_id.to_string()).await?;
+            let turns = load_discuss_chat_turns_window(&conn, &discuss_session_id.to_string()).await?;
+            let row = load_discuss_session(&conn, &discuss_session_id.to_string()).await?;
             let next_position = turns.last().map(|turn| turn.position + 1).unwrap_or(0);
             let persisted_config_options = row
                 .as_ref()
@@ -246,16 +274,41 @@ impl Actor {
                 next_position,
                 persisted_config_options,
                 session_settings,
-                row.and_then(|row| row.team_leader_id),
+                row.as_ref().and_then(Self::restored_team_setup),
             )
         } else {
             (false, 0, Vec::new(), ConfigSettings::new(), None)
         };
-        let launch_server = plugins::for_agent(key).launch_server(agent_spec.server());
+        // Resolve the restored setup before choosing the launch: a root-materialized Team
+        // needs an isolated launch configured against its restored session root, even when
+        // the caller supplied no launch config.
+        let setup = if reconnect_acp_session_id.is_some() {
+            restored_setup
+        } else {
+            setup
+        };
+        let plugin = plugins::for_agent(key);
+        let mut launch_server = plugin.launch_server(agent_spec.server());
+        let root_default_config = SessionLaunchConfig::default();
+        let launch_workspace = Self::launch_workspace(setup.as_ref(), session_cwd.as_ref(), &self.agents_workspace)?;
+        let launch_inputs = match launch_config.as_ref() {
+            Some(config) => Some((config, launch_workspace)),
+            None if matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. })) => {
+                Some((&root_default_config, launch_workspace))
+            }
+            None => None,
+        };
+        let isolated_configured = if let Some((config, workspace)) = launch_inputs {
+            launch_server = plugin.configured_launch_server(&launch_server, workspace, config)?;
+            true
+        } else {
+            false
+        };
         let agent = Self::acp_agent_from_server(&launch_server)?;
         let (callback_router, callback_routes, shared_connection, shared_mcp_capabilities, shared_mcp_registrations) =
             self.provider_supervisors
                 .get(key)
+                .filter(|_| !isolated_configured)
                 .and_then(|supervisor| match &supervisor.resources {
                     ProviderSupervisorResources::Shared {
                         connection: Some(connection),
@@ -287,11 +340,7 @@ impl Actor {
                 .unwrap_or(configured_defaults)
         };
         drop(conn);
-        let setup = if reconnect_acp_session_id.is_some() {
-            team_leader_id.map(|leader_id| DiscussSessionSetup::Team { leader_id })
-        } else {
-            setup
-        };
+        let persisted_setup_kind = Self::setup_kind_for(setup.as_ref());
         let (assigned_agent_name, setup_settings) = self.resolve_session_setup(key, setup).await?;
         if reconnect_acp_session_id.is_none() {
             session_settings.extend(setup_settings);
@@ -300,7 +349,7 @@ impl Actor {
         if !transient_connectivity {
             persist_session_anchor_inner(
                 &self.persistence,
-                &sluice_session_id.to_string(),
+                &discuss_session_id.to_string(),
                 super::session::SessionAnchorMetadata {
                     agent_name: Some(key),
                     session_name: Some(&session_name),
@@ -310,8 +359,22 @@ impl Actor {
                 },
             )
             .await?;
+            let conn = self.persistence.acquire_connection().await?;
+            update_session_launch_context(
+                &conn,
+                &discuss_session_id.to_string(),
+                session_cwd
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                requested_application_mcp_enabled,
+            )
+            .await?;
+            update_session_launch_config(&conn, &discuss_session_id.to_string(), launch_config.as_ref()).await?;
+            update_session_setup_kind(&conn, &discuss_session_id.to_string(), persisted_setup_kind).await?;
         }
-        let sluice_mcp_enabled = requested_sluice_mcp_enabled.unwrap_or_else(|| agent_spec.sluice_mcp_enabled());
+        let application_mcp_enabled =
+            requested_application_mcp_enabled.unwrap_or_else(|| agent_spec.application_mcp_enabled());
         let stream_tx = self.stream_tx.clone();
         let broadcast_tx = self.broadcast_tx.clone();
         let persistence = self.persistence.clone();
@@ -338,12 +401,12 @@ impl Actor {
         let worker_name_for_reporting = agent_name.clone();
         let workspace_for_reporting = agents_workspace.clone();
 
-        // Create the worker command channel keyed by `sluice_session_id`.
+        // Create the worker command channel keyed by `discuss_session_id`.
         let (worker_command_tx, worker_command_rx) = mpsc::channel::<WorkerCommand>(DEFAULT_BUFFER_SIZE);
 
         tracing::debug!(
             target: "application_acp",
-            sluice_session_id = %sluice_session_id,
+            discuss_session_id = %discuss_session_id,
             session_name = %session_name,
             agent_name = %agent_name,
             reconnect = reconnect_acp_session_id.is_some(),
@@ -356,8 +419,9 @@ impl Actor {
         let stream_tx_for_failure = self.stream_tx.clone();
         let pending_elicitation_cancel_tx_for_failure = self.pending_elicitation_cancel_tx.clone();
         let worker_params = WorkerSessionParams {
+            launch_config,
             stream_tx,
-            sluice_session_id,
+            discuss_session_id,
             auth_launch_server: launch_server,
             session_name,
             agent_name,
@@ -368,7 +432,7 @@ impl Actor {
             restored_persisted_transcript,
             next_turn_position,
             agents_workspace,
-            sluice_mcp_enabled,
+            application_mcp_enabled,
             bus_service,
             flow_mcp_endpoints,
             worker_jwt,
@@ -395,7 +459,7 @@ impl Actor {
         let join_handle = tokio::spawn(run_session_worker_with_reporting(
             agent,
             worker_params,
-            sluice_session_id,
+            discuss_session_id,
             worker_name_for_reporting,
             workspace_for_reporting,
             auth_service,
@@ -406,7 +470,7 @@ impl Actor {
         ));
 
         self.worker_registry.insert(
-            sluice_session_id,
+            discuss_session_id,
             WorkerEntry {
                 agent_name: worker_agent_name,
                 worker_jti,
@@ -417,13 +481,44 @@ impl Actor {
             },
         );
         if !transient_connectivity && let Some(supervisor) = self.provider_supervisors.get_mut(key) {
-            supervisor.associate_chat(sluice_session_id);
+            supervisor.associate_chat(discuss_session_id);
             if let ProviderSupervisorResources::Isolated { child_sessions, .. } = &mut supervisor.resources {
-                child_sessions.insert(sluice_session_id);
+                child_sessions.insert(discuss_session_id);
             }
         }
 
         Ok(DiscussResponse::Success)
+    }
+
+    /// Workspace a launch is configured against. A root-materialized Team must launch from its
+    /// restored session root and never falls back to the central homebase; other launches keep the homebase.
+    fn launch_workspace<'a>(
+        setup: Option<&DiscussSessionSetup>,
+        session_cwd: Option<&'a PathBuf>,
+        homebase: &'a PathBuf,
+    ) -> Result<&'a PathBuf, DiscussError> {
+        match (setup, session_cwd) {
+            (Some(DiscussSessionSetup::TeamAtRoot { .. }), Some(root)) => Ok(root),
+            (Some(DiscussSessionSetup::TeamAtRoot { leader_id }), None) => Err(DiscussError::Validation {
+                message: format!("Team `{leader_id}` has no execution root to launch from"),
+            }),
+            _ => Ok(homebase),
+        }
+    }
+
+    /// Setup kind persisted beside the anchor; only the root-materialized Team needs restoring.
+    fn setup_kind_for(setup: Option<&DiscussSessionSetup>) -> Option<&'static str> {
+        matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. })).then_some("team_at_root")
+    }
+
+    /// Rebuild the Team setup from an anchor row, preserving the root-materialized variant.
+    fn restored_team_setup(row: &DiscussSessionRow) -> Option<DiscussSessionSetup> {
+        let leader_id = row.team_leader_id.clone()?;
+        Some(if row.session_setup_kind.as_deref() == Some("team_at_root") {
+            DiscussSessionSetup::TeamAtRoot { leader_id }
+        } else {
+            DiscussSessionSetup::Team { leader_id }
+        })
     }
 
     pub(super) async fn resolve_session_setup(
@@ -434,6 +529,7 @@ impl Actor {
         match setup {
             None => Ok((None, ConfigSettings::new())),
             Some(DiscussSessionSetup::Provider { config_overrides }) => Ok((None, config_overrides)),
+            Some(DiscussSessionSetup::TeamAtRoot { leader_id }) => Ok((Some(leader_id), ConfigSettings::new())),
             Some(DiscussSessionSetup::Team { leader_id }) => {
                 let conn = self.persistence.acquire_connection().await?;
                 let Some(installation) = load_discuss_team_installation(&conn, &leader_id).await? else {
@@ -478,7 +574,7 @@ impl Actor {
 
     pub(super) async fn resolve_persisted_acp_session_id(
         &self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         requested_acp_session_id: Option<String>,
     ) -> Result<Option<String>, DiscussError> {
         if let Some(acp_session_id) = present_acp_session_id(requested_acp_session_id.as_deref()) {
@@ -486,17 +582,17 @@ impl Actor {
         }
 
         let conn = self.persistence.acquire_connection().await?;
-        let row = load_discuss_session(&conn, &sluice_session_id.to_string()).await?;
+        let row = load_discuss_session(&conn, &discuss_session_id.to_string()).await?;
         Ok(row.and_then(|session| present_acp_session_id(session.acp_session_id.as_deref())))
     }
 
     pub(super) async fn announce_desktop_association(
         &self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
     ) -> Result<(), DiscussError> {
         self.broadcast_tx
             .send(DiscussResponse::NewSession {
-                session_id: sluice_session_id,
+                session_id: discuss_session_id,
             })
             .await
             .map_err(|error| channel_send_error("announce_desktop_association.broadcast", error.to_string()))?;
@@ -505,7 +601,7 @@ impl Actor {
 
     // ── Additive request handlers ──────────────────────────────────────────
 
-    /// List local Sluice ACP chat sessions ordered by most recent interaction.
+    /// List local ACP chat sessions ordered by most recent interaction.
     ///
     /// Reads local `acp_agent_sessions` rows only as the session identity
     /// source. For every local row that has a non-empty `acp_session_id`,
@@ -513,13 +609,13 @@ impl Actor {
     /// `list` bit is set, forwards a `WorkerCommand::ListProviderSessions` to
     /// the live worker so provider `SessionInfo` can refresh freshness metadata
     /// (`last_interaction_at`) on **already-local** rows matched by
-    /// `acp_session_id`. Provider titles remain metadata-only; local Sluice
+    /// `acp_session_id`. Provider titles remain metadata-only; local
     /// display labels are user-controlled.
     ///
     /// Provider-listed sessions that do not already have a local
     /// `discuss_sessions` row are **not** materialized. A provider list row
     /// is a candidate only; local identity is created solely by explicit
-    /// Sluice create / load / import / persist paths.
+    /// create / load / import / persist paths.
     pub(super) async fn handle_list_sessions(&mut self) -> Result<DiscussResponse, DiscussError> {
         let conn = self.persistence.acquire_connection().await?;
         let local_rows = list_recent_discuss_sessions(&conn).await?;
@@ -530,7 +626,7 @@ impl Actor {
                 Some(DiscussSessionInfo {
                     is_task_session: row.is_task_session,
                     team_leader_id: row.team_leader_id.clone(),
-                    sluice_session_id: SluiceSessionId::from_str(&row.sluice_session_id).ok()?,
+                    discuss_session_id: DiscussSessionId::from_str(&row.discuss_session_id).ok()?,
                     session_name: row.session_name.clone(),
                     agent_name: row.agent_name.clone(),
                     acp_session_id: present_acp_session_id(row.acp_session_id.as_deref()),
@@ -561,11 +657,11 @@ impl Actor {
             if present_acp_session_id(row.acp_session_id.as_deref()).is_none() {
                 continue;
             }
-            let Ok(sluice_session_id) = SluiceSessionId::from_str(&row.sluice_session_id) else {
+            let Ok(discuss_session_id) = DiscussSessionId::from_str(&row.discuss_session_id) else {
                 continue;
             };
-            if let Some(entry) = self.worker_registry.get(&sluice_session_id)
-                && let Some(caps) = self.worker_capabilities.get(&sluice_session_id)
+            if let Some(entry) = self.worker_registry.get(&discuss_session_id)
+                && let Some(caps) = self.worker_capabilities.get(&discuss_session_id)
                 && caps.list
             {
                 let command_tx = entry.command_tx.clone();
@@ -575,8 +671,8 @@ impl Actor {
                     .await
                     .is_err()
                 {
-                    self.worker_registry.remove(&sluice_session_id);
-                    self.worker_capabilities.remove(&sluice_session_id);
+                    self.worker_registry.remove(&discuss_session_id);
+                    self.worker_capabilities.remove(&discuss_session_id);
                 } else if let Ok(Ok(provider_sessions)) = reply_rx.await {
                     // Merge provider-listed freshness metadata onto already-local
                     // rows matched by acp_session_id. Provider-only rows are not
@@ -589,7 +685,7 @@ impl Actor {
                             let now_ms = provider_updated_at_ms(ps.updated_at.as_deref());
                             let _ = merge_refresh_discuss_session(
                                 &conn,
-                                &row.sluice_session_id,
+                                &row.discuss_session_id,
                                 &LoadedSessionRefresh {
                                     acp_session_id: None,
                                     // ProviderSessionInfo does not expose a title;
@@ -609,9 +705,9 @@ impl Actor {
         Ok(DiscussResponse::SessionList { sessions })
     }
 
-    /// Remove a local Sluice Discuss chat session anchor and clean live worker state.
+    /// Remove a local Discuss chat session anchor and clean live worker state.
     ///
-    /// Deletes the `discuss_sessions` row for `sluice_session_id`.
+    /// Deletes the `discuss_sessions` row for `discuss_session_id`.
     /// Related `discuss_chat_turns` cascade via FK. Dropping the worker registry
     /// sender closes the command channel so the session worker exits; the
     /// capability cache entry is removed so subsequent config/list calls fail
@@ -621,25 +717,25 @@ impl Actor {
     /// `Success`.
     pub(super) async fn handle_remove_session(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
         let conn = self.persistence.acquire_connection().await?;
-        delete_discuss_session(&conn, &sluice_session_id.to_string()).await?;
+        delete_discuss_session(&conn, &discuss_session_id.to_string()).await?;
 
-        if let Some(entry) = self.worker_registry.remove(&sluice_session_id) {
+        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
             let _ = entry.command_tx.send(WorkerCommand::Stop).await;
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
             if let Some(supervisor) = self.provider_supervisors.get_mut(&entry.agent_name) {
-                supervisor.disassociate_chat(&sluice_session_id);
+                supervisor.disassociate_chat(&discuss_session_id);
             }
         }
-        if let Some(pending) = self.pending_provider_tests.remove(&sluice_session_id) {
+        if let Some(pending) = self.pending_provider_tests.remove(&discuss_session_id) {
             let reply = self.restore_provider_test_snapshot(pending, false).await;
-            let _ = reply.send(Err(DiscussError::SessionCancelled { sluice_session_id }));
+            let _ = reply.send(Err(DiscussError::SessionCancelled { discuss_session_id }));
         }
-        self.worker_capabilities.remove(&sluice_session_id);
-        self.cancel_pending_permissions_for_session(&sluice_session_id);
-        self.cancel_pending_elicitations_for_session(&sluice_session_id);
+        self.worker_capabilities.remove(&discuss_session_id);
+        self.cancel_pending_permissions_for_session(&discuss_session_id);
+        self.cancel_pending_elicitations_for_session(&discuss_session_id);
 
         Ok(DiscussResponse::Success)
     }
@@ -654,27 +750,27 @@ impl Actor {
     /// sees the freshest persisted state rather than the pre-refresh snapshot.
     pub(super) async fn handle_load_session(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
-        let key = sluice_session_id;
+        let key = discuss_session_id;
         tracing::debug!(
             target: "application_acp",
-            sluice_session_id = %sluice_session_id,
+            discuss_session_id = %discuss_session_id,
             has_live_worker = self.worker_registry.contains_key(&key),
             "loading session (metadata + bounded transcript window)"
         );
         let conn = self.persistence.acquire_connection().await?;
-        let mut row = load_discuss_session(&conn, &sluice_session_id.to_string())
+        let mut row = load_discuss_session(&conn, &discuss_session_id.to_string())
             .await?
-            .ok_or(DiscussError::SessionNotFound { sluice_session_id })?;
+            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
 
-        let turns = load_discuss_chat_turns_window(&conn, &sluice_session_id.to_string()).await?;
-        let subagents = load_discuss_subagents(&conn, &sluice_session_id.to_string()).await?;
+        let turns = load_discuss_chat_turns_window(&conn, &discuss_session_id.to_string()).await?;
+        let subagents = load_discuss_subagents(&conn, &discuss_session_id.to_string()).await?;
         let turn_records: Vec<DiscussChatTurnRecord> = turns
             .iter()
             .filter_map(|t| {
                 Some(DiscussChatTurnRecord {
-                    sluice_session_id: SluiceSessionId::from_str(&t.sluice_session_id).ok()?,
+                    discuss_session_id: DiscussSessionId::from_str(&t.discuss_session_id).ok()?,
                     position: t.position,
                     role: t.role.clone().unwrap_or_default(),
                     acp_session_id: t.acp_session_id.clone(),
@@ -711,7 +807,7 @@ impl Actor {
                     let refreshed_options_json = provider_config_options_json(&ps.config_options)?;
                     row = self
                         .refresh_loaded_session_row(
-                            sluice_session_id,
+                            discuss_session_id,
                             LoadedSessionRefresh {
                                 acp_session_id: Some(ps.session_id.to_string()),
                                 display_title: None,
@@ -734,7 +830,7 @@ impl Actor {
                 });
             }
             let Some(agent_spec) = self.agents.get(&row.agent_name) else {
-                return Err(DiscussError::SessionNotFound { sluice_session_id });
+                return Err(DiscussError::SessionNotFound { discuss_session_id });
             };
             if let Some(options) = load_provider_session_short_lived(
                 &row.agent_name,
@@ -753,7 +849,7 @@ impl Actor {
                 upsert_discuss_agent_config(&conn, &row.agent_name, Some(&options), &defaults).await?;
                 row = self
                     .refresh_loaded_session_row(
-                        sluice_session_id,
+                        discuss_session_id,
                         LoadedSessionRefresh {
                             acp_session_id: None,
                             display_title: None,
@@ -768,9 +864,9 @@ impl Actor {
         let session = DiscussSessionInfo {
             is_task_session: row.is_task_session,
             team_leader_id: row.team_leader_id,
-            sluice_session_id: SluiceSessionId::from_str(&row.sluice_session_id).map_err(|_| {
+            discuss_session_id: DiscussSessionId::from_str(&row.discuss_session_id).map_err(|_| {
                 DiscussError::Serialization {
-                    message: "invalid sluice_session_id in Discuss session row".to_string(),
+                    message: "invalid discuss_session_id in Discuss session row".to_string(),
                 }
             })?,
             session_name: row.session_name,
@@ -812,15 +908,15 @@ impl Actor {
     /// database instead of being re-written from a possibly-stale snapshot.
     async fn refresh_loaded_session_row(
         &self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         refresh: LoadedSessionRefresh,
     ) -> Result<DiscussSessionRow, DiscussError> {
         let conn = self.persistence.acquire_connection().await?;
-        let sluice_session_id_string = sluice_session_id.to_string();
-        merge_refresh_discuss_session(&conn, &sluice_session_id_string, &refresh).await?;
-        let refreshed = load_discuss_session(&conn, &sluice_session_id_string)
+        let discuss_session_id_string = discuss_session_id.to_string();
+        merge_refresh_discuss_session(&conn, &discuss_session_id_string, &refresh).await?;
+        let refreshed = load_discuss_session(&conn, &discuss_session_id_string)
             .await?
-            .ok_or(DiscussError::SessionNotFound { sluice_session_id })?;
+            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
         Ok(refreshed)
     }
 
@@ -830,11 +926,11 @@ impl Actor {
     /// publishes a complete menu. Reads never synchronously query a provider.
     pub(super) async fn handle_get_config_options(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
         let conn = self.persistence.acquire_connection().await?;
-        let row = load_discuss_session(&conn, &sluice_session_id.to_string()).await?;
-        let row = row.ok_or(DiscussError::SessionNotFound { sluice_session_id })?;
+        let row = load_discuss_session(&conn, &discuss_session_id.to_string()).await?;
+        let row = row.ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
         let options = match row.latest_config_options_json.as_deref() {
             Some(json) => config_options_from_json(json)?,
             None => load_discuss_agent_config(&conn, &row.agent_name)
@@ -865,17 +961,17 @@ impl Actor {
     /// `UnsupportedCapability { capability: "set_config_option" }`.
     pub(super) async fn handle_set_config_option(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         config_id: String,
         value: String,
     ) -> Result<DiscussResponse, DiscussError> {
-        let key = sluice_session_id;
+        let key = discuss_session_id;
 
         let command_tx = self
             .worker_registry
             .get(&key)
             .map(|e| e.command_tx.clone())
-            .ok_or(DiscussError::SessionNotFound { sluice_session_id })?;
+            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
 
         let set_config_supported = self
             .worker_capabilities
@@ -904,14 +1000,14 @@ impl Actor {
         Ok(DiscussResponse::Success)
     }
 
-    /// Rename the local Sluice display label for a chat anchor.
+    /// Rename the local display label for a chat anchor.
     ///
-    /// The stable `sluice_session_id` key and any provider `acp_session_id`
+    /// The stable `discuss_session_id` key and any provider `acp_session_id`
     /// are preserved; this updates only the user-controlled local label stored
     /// on the anchor row.
     pub(super) async fn handle_rename_session(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         display_title: &str,
     ) -> Result<DiscussResponse, DiscussError> {
         let title = display_title.trim();
@@ -922,7 +1018,7 @@ impl Actor {
         }
 
         let conn = self.persistence.acquire_connection().await?;
-        rename_discuss_session(&conn, sluice_session_id, title).await?;
+        rename_discuss_session(&conn, discuss_session_id, title).await?;
         Ok(DiscussResponse::Success)
     }
 
@@ -931,7 +1027,7 @@ impl Actor {
     /// Send a user turn to a live session worker.
     pub(super) async fn handle_send_user_turn(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         text: String,
     ) -> Result<DiscussResponse, DiscussError> {
         if !self.server_running {
@@ -940,8 +1036,8 @@ impl Actor {
         validate_user_turn(&text)?;
         let entry = self
             .worker_registry
-            .get(&sluice_session_id)
-            .ok_or(DiscussError::SessionNotFound { sluice_session_id })?;
+            .get(&discuss_session_id)
+            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
         if !self
             .provider_supervisors
             .get(&entry.agent_name)
@@ -969,14 +1065,14 @@ impl Actor {
     /// pending entry. An invalid option does NOT consume the pending entry.
     pub(super) async fn handle_answer_permission(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         permission_request_id: PermissionRequestId,
         option: DiscussPermissionOption,
     ) -> Result<DiscussResponse, DiscussError> {
         if !self.server_running {
             return Err(DiscussError::ShuttingDown);
         }
-        let key = (sluice_session_id, permission_request_id);
+        let key = (discuss_session_id, permission_request_id);
 
         // Validate the option against the offered options before removing
         // the pending entry. An invalid option must NOT consume the entry.
@@ -985,7 +1081,7 @@ impl Actor {
                 .pending_permissions
                 .get(&key)
                 .ok_or(DiscussError::PermissionNotFound {
-                    sluice_session_id,
+                    discuss_session_id,
                     permission_request_id: permission_request_id.to_string(),
                 })?;
             let selected_option_id = PermissionOptionId::new(option_id.clone());
@@ -1005,7 +1101,7 @@ impl Actor {
             .pending_permissions
             .remove(&key)
             .ok_or(DiscussError::PermissionNotFound {
-                sluice_session_id,
+                discuss_session_id,
                 permission_request_id: permission_request_id.to_string(),
             })?;
 
@@ -1019,19 +1115,19 @@ impl Actor {
     /// the pending responder available for correction and resubmission.
     pub(super) async fn handle_answer_elicitation(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         elicitation_request_id: ElicitationRequestId,
         answer: DiscussElicitationAnswer,
     ) -> Result<DiscussResponse, DiscussError> {
         if !self.server_running {
             return Err(DiscussError::ShuttingDown);
         }
-        let key = (sluice_session_id, elicitation_request_id);
+        let key = (discuss_session_id, elicitation_request_id);
         let pending = self
             .pending_elicitations
             .get(&key)
             .ok_or(DiscussError::ElicitationRequestNotPending {
-                sluice_session_id,
+                discuss_session_id,
                 elicitation_request_id,
             })?;
 
@@ -1043,10 +1139,10 @@ impl Actor {
             .pending_elicitations
             .remove(&key)
             .ok_or(DiscussError::ElicitationAlreadyAnswered {
-                sluice_session_id,
+                discuss_session_id,
                 elicitation_request_id,
             })?;
-        self.persist_elicitation_turn(sluice_session_id, elicitation_request_id, &pending, &answer);
+        self.persist_elicitation_turn(discuss_session_id, elicitation_request_id, &pending, &answer);
         let _ = pending.responder_tx.send(answer);
         Ok(DiscussResponse::Success)
     }
@@ -1054,28 +1150,28 @@ impl Actor {
     /// Cancel one pending elicitation request.
     pub(super) async fn handle_cancel_elicitation(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         elicitation_request_id: ElicitationRequestId,
     ) -> Result<DiscussResponse, DiscussError> {
         if !self.server_running {
             return Err(DiscussError::ShuttingDown);
         }
-        self.cancel_pending_elicitation_entry(sluice_session_id, elicitation_request_id);
+        self.cancel_pending_elicitation_entry(discuss_session_id, elicitation_request_id);
         Ok(DiscussResponse::Success)
     }
 
     /// Cancel the active turn for a session.
     pub(super) async fn handle_cancel_turn(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
-        self.cancel_pending_permissions_for_session(&sluice_session_id);
-        self.cancel_pending_elicitations_for_session(&sluice_session_id);
+        self.cancel_pending_permissions_for_session(&discuss_session_id);
+        self.cancel_pending_elicitations_for_session(&discuss_session_id);
 
         if !self.server_running {
             return Err(DiscussError::ShuttingDown);
         }
-        let Some(entry) = self.worker_registry.get(&sluice_session_id) else {
+        let Some(entry) = self.worker_registry.get(&discuss_session_id) else {
             return Ok(DiscussResponse::Success);
         };
         let command_tx = entry.command_tx.clone();
@@ -1086,7 +1182,7 @@ impl Actor {
             .is_err()
         {
             self.recover_cancel_turn_worker(
-                sluice_session_id,
+                discuss_session_id,
                 channel_send_error("handle_cancel_turn.worker_command", "worker command channel closed"),
             )
             .await;
@@ -1096,13 +1192,13 @@ impl Actor {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => return Err(error),
             Ok(Err(_)) => {
-                self.recover_cancel_turn_worker(sluice_session_id, DiscussError::OneshotReply)
+                self.recover_cancel_turn_worker(discuss_session_id, DiscussError::OneshotReply)
                     .await;
             }
             Err(_) => {
                 self.recover_cancel_turn_worker(
-                    sluice_session_id,
-                    DiscussError::WorkerStopTimeout { sluice_session_id },
+                    discuss_session_id,
+                    DiscussError::WorkerStopTimeout { discuss_session_id },
                 )
                 .await;
             }
@@ -1114,24 +1210,26 @@ impl Actor {
     /// Cancel and close a session.
     pub(super) async fn handle_cancel_session(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
         if !self.server_running {
             return Err(DiscussError::ShuttingDown);
         }
-        let cancel_result = if self.worker_registry.contains_key(&sluice_session_id) {
-            self.handle_cancel_turn(sluice_session_id).await.map(|_| ())
+        let cancel_result = if self.worker_registry.contains_key(&discuss_session_id) {
+            self.handle_cancel_turn(discuss_session_id)
+                .await
+                .map(|_| ())
         } else {
             Ok(())
         };
-        if let Some(entry) = self.worker_registry.remove(&sluice_session_id) {
+        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
             let _ = entry.command_tx.send(WorkerCommand::Stop).await;
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "session cancellation").await;
         }
-        self.worker_capabilities.remove(&sluice_session_id);
+        self.worker_capabilities.remove(&discuss_session_id);
 
-        self.cancel_pending_permissions_for_session(&sluice_session_id);
-        self.cancel_pending_elicitations_for_session(&sluice_session_id);
+        self.cancel_pending_permissions_for_session(&discuss_session_id);
+        self.cancel_pending_elicitations_for_session(&discuss_session_id);
 
         cancel_result?;
         Ok(DiscussResponse::Success)
@@ -1139,14 +1237,14 @@ impl Actor {
 
     pub(super) async fn handle_reserve_inspector(
         &mut self,
-        parent_session_id: SluiceSessionId,
+        parent_session_id: DiscussSessionId,
         child_session_id: String,
     ) -> Result<DiscussResponse, DiscussError> {
         let parent = self
             .worker_registry
             .get(&parent_session_id)
             .ok_or(DiscussError::SessionNotFound {
-                sluice_session_id: parent_session_id,
+                discuss_session_id: parent_session_id,
             })?;
         let provider_name = parent.agent_name.clone();
         if !self
@@ -1160,7 +1258,7 @@ impl Actor {
         if !plugin.supports_child_session_load() {
             return Err(DiscussError::InspectorUnavailable { provider_name });
         }
-        let viewer_session_id = SluiceSessionId::new();
+        let viewer_session_id = DiscussSessionId::new();
         let binding = InspectorBinding {
             viewer_session_id,
             parent_session_id,
@@ -1173,20 +1271,20 @@ impl Actor {
 
     pub(super) async fn handle_start_inspector(
         &mut self,
-        viewer_session_id: SluiceSessionId,
+        viewer_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
         let binding = self
             .inspector_bindings
             .get(&viewer_session_id)
             .cloned()
             .ok_or(DiscussError::SessionNotFound {
-                sluice_session_id: viewer_session_id,
+                discuss_session_id: viewer_session_id,
             })?;
         let parent = self
             .worker_registry
             .get(&binding.parent_session_id)
             .ok_or(DiscussError::SessionNotFound {
-                sluice_session_id: binding.parent_session_id,
+                discuss_session_id: binding.parent_session_id,
             })?;
         if !self
             .provider_supervisors
@@ -1214,11 +1312,11 @@ impl Actor {
 
     pub(super) async fn handle_dispose_inspector(
         &mut self,
-        viewer_session_id: SluiceSessionId,
+        viewer_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
         let Some(binding) = self.inspector_bindings.remove(&viewer_session_id) else {
             return Err(DiscussError::SessionNotFound {
-                sluice_session_id: viewer_session_id,
+                discuss_session_id: viewer_session_id,
             });
         };
         self.disposing_inspectors.insert(binding.viewer_session_id);
@@ -1252,18 +1350,18 @@ impl Actor {
     }
     /// Remove a cancellation worker that can no longer acknowledge commands and
     /// publish the same terminal failure path used by normal worker failures.
-    async fn recover_cancel_turn_worker(&mut self, sluice_session_id: SluiceSessionId, error: DiscussError) {
-        if let Some(entry) = self.worker_registry.remove(&sluice_session_id) {
+    async fn recover_cancel_turn_worker(&mut self, discuss_session_id: DiscussSessionId, error: DiscussError) {
+        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
             entry.join_handle.abort();
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "cancel-turn recovery").await;
         }
-        self.worker_capabilities.remove(&sluice_session_id);
-        self.cancel_pending_permissions_for_session(&sluice_session_id);
+        self.worker_capabilities.remove(&discuss_session_id);
+        self.cancel_pending_permissions_for_session(&discuss_session_id);
 
         if let Err(send_error) = self
             .stream_tx
             .send(DiscussStreamEvent::SessionFailed {
-                sluice_session_id,
+                discuss_session_id,
                 error,
                 terminal_auth_methods: Vec::new(),
             })
@@ -1278,11 +1376,11 @@ impl Actor {
     }
 
     /// Cancel all pending permissions for a given session.
-    pub(super) fn cancel_pending_permissions_for_session(&mut self, sluice_session_id: &SluiceSessionId) {
+    pub(super) fn cancel_pending_permissions_for_session(&mut self, discuss_session_id: &DiscussSessionId) {
         let keys_to_remove: Vec<_> = self
             .pending_permissions
             .keys()
-            .filter(|(sid, _)| sid == sluice_session_id)
+            .filter(|(sid, _)| sid == discuss_session_id)
             .cloned()
             .collect();
         for key in keys_to_remove {
@@ -1294,19 +1392,19 @@ impl Actor {
 
     fn cancel_pending_elicitation_entry(
         &mut self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         elicitation_request_id: ElicitationRequestId,
     ) {
-        let key = (sluice_session_id, elicitation_request_id);
+        let key = (discuss_session_id, elicitation_request_id);
         if let Some(pending) = self.pending_elicitations.remove(&key) {
-            self.persist_cancelled_elicitation(sluice_session_id, elicitation_request_id, &pending);
+            self.persist_cancelled_elicitation(discuss_session_id, elicitation_request_id, &pending);
             let _ = pending.responder_tx.send(DiscussElicitationAnswer::Cancel);
         }
     }
 
     fn persist_elicitation_turn(
         &self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         elicitation_request_id: ElicitationRequestId,
         pending: &PendingElicitation,
         answer: &DiscussElicitationAnswer,
@@ -1316,7 +1414,7 @@ impl Actor {
             position: pending.position,
             message: pending.raw_request.message.clone(),
         };
-        let session_id = sluice_session_id.to_string();
+        let session_id = discuss_session_id.to_string();
         let request_id = elicitation_request_id.to_string();
         let answer = answer.clone();
         tokio::spawn(async move {
@@ -1330,12 +1428,12 @@ impl Actor {
 
     pub(super) fn persist_cancelled_elicitation(
         &self,
-        sluice_session_id: SluiceSessionId,
+        discuss_session_id: DiscussSessionId,
         elicitation_request_id: ElicitationRequestId,
         pending: &PendingElicitation,
     ) {
         self.persist_elicitation_turn(
-            sluice_session_id,
+            discuss_session_id,
             elicitation_request_id,
             pending,
             &DiscussElicitationAnswer::Cancel,
@@ -1343,11 +1441,11 @@ impl Actor {
     }
 
     /// Cancel all pending elicitations for a session.
-    pub(super) fn cancel_pending_elicitations_for_session(&mut self, sluice_session_id: &SluiceSessionId) {
+    pub(super) fn cancel_pending_elicitations_for_session(&mut self, discuss_session_id: &DiscussSessionId) {
         let keys_to_remove: Vec<_> = self
             .pending_elicitations
             .keys()
-            .filter(|(sid, _)| sid == sluice_session_id)
+            .filter(|(sid, _)| sid == discuss_session_id)
             .cloned()
             .collect();
         for (session_id, request_id) in keys_to_remove {
@@ -1370,7 +1468,7 @@ impl Actor {
 async fn run_session_worker_with_reporting(
     agent: AcpAgent,
     params: WorkerSessionParams,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     agent_name: String,
     agents_workspace: PathBuf,
     auth_service: Option<ServiceReader<dyn AuthSudoService>>,
@@ -1379,13 +1477,13 @@ async fn run_session_worker_with_reporting(
     pending_elicitation_cancel_tx: mpsc::Sender<PendingElicitationCancel>,
     stream_tx: mpsc::Sender<DiscussStreamEvent>,
 ) {
-    tracing::info!(%sluice_session_id, provider = %agent_name, cwd = %agents_workspace.display(), "Discuss session worker started");
+    tracing::info!(%discuss_session_id, provider = %agent_name, cwd = %agents_workspace.display(), "Discuss session worker started");
     let result = run_session_worker(agent, params).await;
 
-    tracing::info!(%sluice_session_id, failed = result.is_err(), "Discuss session worker stopped");
+    tracing::info!(%discuss_session_id, failed = result.is_err(), "Discuss session worker stopped");
 
     if let Err(failure) = &result {
-        tracing::debug!(%sluice_session_id, error = %failure.error, "Discuss session worker failure");
+        tracing::debug!(%discuss_session_id, error = %failure.error, "Discuss session worker failure");
     }
     revoke_worker_jti(auth_service.as_ref(), worker_jti, "transient").await;
 
@@ -1398,7 +1496,7 @@ async fn run_session_worker_with_reporting(
         if let Some(transient_worker_tx) = transient_worker_tx {
             let _ = transient_worker_tx
                 .send(TransientWorkerEvent {
-                    sluice_session_id,
+                    discuss_session_id,
                     result: Err(error),
                 })
                 .await;
@@ -1406,7 +1504,7 @@ async fn run_session_worker_with_reporting(
             let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
             if pending_elicitation_cancel_tx
                 .send(PendingElicitationCancel {
-                    sluice_session_id,
+                    discuss_session_id,
                     elicitation_request_id: None,
                     cancellation_ack,
                 })
@@ -1417,7 +1515,7 @@ async fn run_session_worker_with_reporting(
             }
             if let Err(send_error) = stream_tx
                 .send(DiscussStreamEvent::SessionFailed {
-                    sluice_session_id,
+                    discuss_session_id,
                     error,
                     terminal_auth_methods,
                 })
@@ -1439,13 +1537,13 @@ async fn load_provider_session_short_lived(
     agents_workspace: PathBuf,
 ) -> Result<Option<Vec<DiscussConfigOption>>, DiscussError> {
     let agent_plugin = plugins::for_agent(agent_name);
-    let sluice_mcp_enabled = agent_spec.sluice_mcp_enabled();
+    let application_mcp_enabled = agent_spec.application_mcp_enabled();
     let agent_key = serde_json::to_string(agent_spec.server())?;
     let agent = AcpAgent::from_str(&agent_key)?;
 
     Client
         .builder()
-        .name("sluice-acp-session-load")
+        .name("acp-session-load")
         .connect_with(agent, move |cx: ConnectionTo<Agent>| async move {
             let init_response = cx.send_request(initialize_request()).block_task().await?;
 
@@ -1459,10 +1557,10 @@ async fn load_provider_session_short_lived(
                 return Ok(None);
             }
 
-            if sluice_mcp_enabled && !init_response.agent_capabilities.mcp_capabilities.acp {
+            if application_mcp_enabled && !init_response.agent_capabilities.mcp_capabilities.acp {
                 tracing::debug!(
                     target: "application_acp",
-                    "short-lived ACP session load skipped Sluice MCP because the agent lacks MCP-over-ACP support"
+                    "short-lived ACP session load skipped MCP because the agent lacks MCP-over-ACP support"
                 );
             }
 
@@ -1488,12 +1586,12 @@ async fn load_provider_session_short_lived(
 /// Empty-string / absent `acp_session_id` values do not participate in the
 /// provider-id merge (they are not real provider identities).
 pub(super) fn dedupe_session_list(sessions: Vec<DiscussSessionInfo>) -> Vec<DiscussSessionInfo> {
-    let mut seen_identity = HashSet::<SluiceSessionId>::new();
+    let mut seen_identity = HashSet::<DiscussSessionId>::new();
     let mut seen_acp_id = HashSet::<String>::new();
     let mut out = Vec::with_capacity(sessions.len());
 
     for session in sessions {
-        let identity = session.sluice_session_id;
+        let identity = session.discuss_session_id;
         if !seen_identity.insert(identity)
             || present_acp_session_id(session.acp_session_id.as_deref())
                 .is_some_and(|acp_id| !seen_acp_id.insert(acp_id))
@@ -1504,4 +1602,156 @@ pub(super) fn dedupe_session_list(sessions: Vec<DiscussSessionInfo>) -> Vec<Disc
     }
 
     out
+}
+
+#[cfg(test)]
+mod team_at_root_setup_tests {
+    use super::*;
+    use crate::storage::DiscussSessionRow;
+
+    fn row(team_leader_id: Option<&str>, setup_kind: Option<&str>) -> DiscussSessionRow {
+        DiscussSessionRow {
+            is_task_session: false,
+            session_cwd_json: None,
+            session_mcp_enabled: None,
+            session_launch_config_json: None,
+            session_setup_kind: setup_kind.map(str::to_string),
+            team_leader_id: team_leader_id.map(str::to_string),
+            discuss_session_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            agent_name: "opencode".to_string(),
+            session_name: "ticket".to_string(),
+            acp_session_id: None,
+            display_title: None,
+            last_user_prompt: None,
+            latest_todo_snapshot_json: None,
+            latest_config_options_json: None,
+            config_settings_json: None,
+            available_commands_json: None,
+            first_prompt_at: None,
+            last_interaction_at: None,
+        }
+    }
+
+    #[test]
+    fn only_root_materialized_team_persists_a_setup_kind() {
+        let leader = "chief-of-staff".to_string();
+        assert_eq!(
+            Actor::setup_kind_for(Some(&DiscussSessionSetup::TeamAtRoot {
+                leader_id: leader.clone()
+            })),
+            Some("team_at_root")
+        );
+        assert_eq!(
+            Actor::setup_kind_for(Some(&DiscussSessionSetup::Team {
+                leader_id: leader.clone()
+            })),
+            None
+        );
+        assert_eq!(
+            Actor::setup_kind_for(Some(&DiscussSessionSetup::Provider {
+                config_overrides: Default::default()
+            })),
+            None
+        );
+        assert_eq!(Actor::setup_kind_for(None), None);
+    }
+
+    #[test]
+    fn reconnect_restores_root_materialized_team_with_exact_leader() {
+        let restored = Actor::restored_team_setup(&row(Some("chief-of-staff"), Some("team_at_root")));
+        assert_eq!(
+            restored,
+            Some(DiscussSessionSetup::TeamAtRoot {
+                leader_id: "chief-of-staff".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_team_rows_still_restore_the_central_team_setup() {
+        // Rows written before migration 4 have no setup kind and must keep the central path.
+        let restored = Actor::restored_team_setup(&row(Some("sector-analyst"), None));
+        assert_eq!(
+            restored,
+            Some(DiscussSessionSetup::Team {
+                leader_id: "sector-analyst".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn provider_sessions_without_a_leader_restore_no_team() {
+        assert_eq!(Actor::restored_team_setup(&row(None, None)), None);
+        assert_eq!(Actor::restored_team_setup(&row(None, Some("team_at_root"))), None);
+    }
+
+    #[test]
+    fn root_materialized_team_launches_from_the_restored_session_root() {
+        let homebase = std::path::PathBuf::from("/central/homebase");
+        let root = std::path::PathBuf::from("/tickets/execution-root");
+        let setup = DiscussSessionSetup::TeamAtRoot {
+            leader_id: "lead".to_string(),
+        };
+        assert_eq!(
+            Actor::launch_workspace(Some(&setup), Some(&root), &homebase).expect("root launch"),
+            &root
+        );
+    }
+
+    #[test]
+    fn root_team_without_a_session_root_fails_validation() {
+        let homebase = std::path::PathBuf::from("/central/homebase");
+        let setup = DiscussSessionSetup::TeamAtRoot {
+            leader_id: "lead".to_string(),
+        };
+        assert!(matches!(
+            Actor::launch_workspace(Some(&setup), None, &homebase),
+            Err(DiscussError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn central_team_and_provider_launches_keep_the_homebase_workspace() {
+        let homebase = std::path::PathBuf::from("/central/homebase");
+        let root = std::path::PathBuf::from("/tickets/execution-root");
+        let team = DiscussSessionSetup::Team {
+            leader_id: "lead".to_string(),
+        };
+        let provider = DiscussSessionSetup::Provider {
+            config_overrides: Default::default(),
+        };
+        assert_eq!(
+            Actor::launch_workspace(Some(&team), Some(&root), &homebase).expect("team"),
+            &homebase
+        );
+        assert_eq!(
+            Actor::launch_workspace(Some(&provider), Some(&root), &homebase).expect("provider"),
+            &homebase
+        );
+        assert_eq!(
+            Actor::launch_workspace(None, Some(&root), &homebase).expect("no setup"),
+            &homebase
+        );
+    }
+
+    #[test]
+    fn reconnect_restores_root_team_launch_workspace_from_the_stored_root() {
+        let homebase = std::path::PathBuf::from("/central/homebase");
+        let root = std::path::PathBuf::from("/tickets/execution-root");
+        let restored = Actor::restored_team_setup(&row(Some("lead"), Some("team_at_root")));
+        assert_eq!(
+            Actor::launch_workspace(restored.as_ref(), Some(&root), &homebase).expect("reconnect"),
+            &root
+        );
+    }
+
+    #[test]
+    fn setup_kind_round_trips_through_reconnect() {
+        let setup = DiscussSessionSetup::TeamAtRoot {
+            leader_id: "chief-of-staff".to_string(),
+        };
+        let kind = Actor::setup_kind_for(Some(&setup));
+        let restored = Actor::restored_team_setup(&row(Some("chief-of-staff"), kind));
+        assert_eq!(restored, Some(setup));
+    }
 }

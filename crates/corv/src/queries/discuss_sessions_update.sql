@@ -1,4 +1,4 @@
--- Existing anchor metadata update keyed by `sluice_session_id`.
+-- Existing anchor metadata update keyed by `discuss_session_id`.
 -- Caller binds final values: NULL explicitly clears nullable metadata fields.
 -- ACP session ID is never cleared; NULL/empty input preserves the stored ID.
 -- Task origin is sticky: once true, `is_task_session` remains true.
@@ -17,4 +17,4 @@ SET
     last_interaction_at          = ?12,
     team_leader_id               = ?13,
     is_task_session              = is_task_session OR ?14
-WHERE sluice_session_id = ?1
+WHERE discuss_session_id = ?1

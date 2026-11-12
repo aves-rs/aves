@@ -5,8 +5,8 @@ use turso::{Connection, Database};
 use aves::utils::database::{DatabaseError, connect_database};
 
 use super::types::{
-    ConfigSettings, DiscussConfigOption, DiscussError, DiscussSubagentRecord, DiscussSubagentSurfaceState,
-    SluiceSessionId,
+    ConfigSettings, DiscussConfigOption, DiscussError, DiscussSessionId, DiscussSubagentRecord,
+    DiscussSubagentSurfaceState, SessionLaunchConfig,
 };
 
 pub const DISCUSS_SESSIONS_UPSERT_SQL: &str = include_str!("queries/discuss_sessions_upsert.sql");
@@ -15,6 +15,9 @@ pub const DISCUSS_SESSIONS_TODO_SNAPSHOT_UPDATE_SQL: &str = include_str!("querie
 pub const DISCUSS_SESSIONS_LOAD_REFRESH_SQL: &str = include_str!("queries/discuss_sessions_load_refresh.sql");
 pub const DISCUSS_SESSIONS_LIST_RECENT_SQL: &str = include_str!("queries/discuss_sessions_list_recent.sql");
 pub const DISCUSS_SESSIONS_LOAD_SQL: &str = include_str!("queries/discuss_sessions_load.sql");
+const DISCUSS_SESSIONS_SETUP_KIND_SQL: &str = include_str!("queries/discuss_sessions_setup_kind.sql");
+const DISCUSS_SESSIONS_LAUNCH_CONTEXT_SQL: &str = include_str!("queries/discuss_sessions_launch_context.sql");
+const DISCUSS_SESSIONS_LAUNCH_CONFIG_SQL: &str = include_str!("queries/discuss_sessions_launch_config.sql");
 pub const DISCUSS_SESSIONS_DELETE_SQL: &str = include_str!("queries/session_delete.sql");
 pub const DISCUSS_SESSIONS_RENAME_SQL: &str = include_str!("queries/discuss_sessions_rename.sql");
 pub const DISCUSS_CHAT_TURNS_INSERT_SQL: &str = include_str!("queries/discuss_chat_turns_insert.sql");
@@ -36,12 +39,16 @@ pub const DISCUSS_SUBAGENTS_LOAD_SQL: &str = include_str!("queries/discuss_subag
 /// Row projection for `discuss_sessions` chat anchor rows.
 ///
 /// Carries the full metadata column set so the session dropdown and load path
-/// can restore cached state in one round-trip. `sluice_session_id` is the
+/// can restore cached state in one round-trip. `discuss_session_id` is the
 /// canonical identity; `session_name` and `agent_name` are metadata only.
 pub struct DiscussSessionRow {
     pub(super) is_task_session: bool,
+    pub(super) session_cwd_json: Option<String>,
+    pub(super) session_mcp_enabled: Option<i64>,
+    pub(super) session_launch_config_json: Option<String>,
+    pub(super) session_setup_kind: Option<String>,
     pub(super) team_leader_id: Option<String>,
-    pub(super) sluice_session_id: String,
+    pub(super) discuss_session_id: String,
     pub(super) agent_name: String,
     pub(super) session_name: String,
     pub(super) acp_session_id: Option<String>,
@@ -57,7 +64,7 @@ pub struct DiscussSessionRow {
 
 /// Row projection for `discuss_chat_turns` bounded transcript rows.
 pub struct DiscussChatTurnRow {
-    pub(super) sluice_session_id: String,
+    pub(super) discuss_session_id: String,
     pub(super) position: i64,
     pub(super) role: Option<String>,
     pub(super) acp_session_id: Option<String>,
@@ -69,10 +76,10 @@ pub struct DiscussChatTurnRow {
 ///
 /// The same tuple binds both the UPDATE and the INSERT-if-absent halves of
 /// the session upsert, covering every metadata column. Identity is
-/// `sluice_session_id` alone; `session_name` and `agent_name` are metadata.
+/// `discuss_session_id` alone; `session_name` and `agent_name` are metadata.
 pub struct DiscussSessionUpsert<'a> {
     pub(super) team_leader_id: Option<&'a str>,
-    pub(super) sluice_session_id: &'a str,
+    pub(super) discuss_session_id: &'a str,
     pub(super) agent_name: &'a str,
     pub(super) session_name: &'a str,
     pub(super) acp_session_id: Option<&'a str>,
@@ -132,7 +139,7 @@ pub struct LoadedSessionRefresh {
 
 /// Insert parameters for `discuss_chat_turns_insert`.
 pub struct DiscussChatTurnInsert<'a> {
-    pub(super) sluice_session_id: &'a str,
+    pub(super) discuss_session_id: &'a str,
     pub(super) position: i64,
     pub(super) role: &'a str,
     pub(super) acp_session_id: Option<&'a str>,
@@ -194,10 +201,10 @@ where
 // `DiscussPersistence` factory, and have no `acquire_connection()` method. DB
 // ownership and worker wiring belong to subtask 07.
 
-/// Upsert a Discuss session anchor row keyed by `sluice_session_id`.
+/// Upsert a Discuss session anchor row keyed by `discuss_session_id`.
 ///
-/// The new `discuss_sessions` table declares `sluice_session_id TEXT NOT NULL
-/// PRIMARY KEY`, so a plain `INSERT ... ON CONFLICT(sluice_session_id) DO
+/// The new `discuss_sessions` table declares `discuss_session_id TEXT NOT NULL
+/// PRIMARY KEY`, so a plain `INSERT ... ON CONFLICT(discuss_session_id) DO
 /// UPDATE` has a matching conflict target. However, the caller still uses an
 /// explicit **UPDATE-first, INSERT-if-absent** upsert to preserve the
 /// load-and-carry-forward semantics of the persistence queue: the UPDATE half
@@ -215,7 +222,7 @@ pub(super) async fn upsert_discuss_session_with_task_tag(
     is_task_session: bool,
 ) -> Result<(), DiscussError> {
     let bindings = (
-        params.sluice_session_id.to_string(),
+        params.discuss_session_id.to_string(),
         params.agent_name.to_string(),
         params.session_name.to_string(),
         params.display_title.map(str::to_string),
@@ -243,12 +250,12 @@ pub(super) async fn upsert_discuss_session_with_task_tag(
 /// Replace the persisted typed todo snapshot for a Discuss session.
 pub(super) async fn update_discuss_session_todo_snapshot(
     conn: &Connection,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     snapshot_json: &str,
 ) -> Result<(), DiscussError> {
     conn.execute(
         DISCUSS_SESSIONS_TODO_SNAPSHOT_UPDATE_SQL,
-        (sluice_session_id.to_string(), snapshot_json.to_string()),
+        (discuss_session_id.to_string(), snapshot_json.to_string()),
     )
     .await?;
     Ok(())
@@ -266,13 +273,13 @@ pub(super) async fn update_discuss_session_todo_snapshot(
 /// because `handle_load_session` already loaded it before refreshing.
 pub async fn merge_refresh_discuss_session(
     conn: &Connection,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     refresh: &LoadedSessionRefresh,
 ) -> Result<(), DiscussError> {
     conn.execute(
         DISCUSS_SESSIONS_LOAD_REFRESH_SQL,
         (
-            sluice_session_id.to_string(),
+            discuss_session_id.to_string(),
             refresh.acp_session_id.clone(),
             refresh.display_title.clone(),
             refresh.latest_config_options_json.clone(),
@@ -294,16 +301,16 @@ pub async fn list_recent_discuss_sessions(conn: &Connection) -> Result<Vec<Discu
     Ok(sessions)
 }
 
-/// Load a single Discuss session anchor row by `sluice_session_id`.
+/// Load a single Discuss session anchor row by `discuss_session_id`.
 ///
 /// Returns `Ok(None)` when no row matches so callers can branch into
 /// `DiscussError::SessionNotFound` at a higher layer.
 pub async fn load_discuss_session(
     conn: &Connection,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
 ) -> Result<Option<DiscussSessionRow>, DiscussError> {
     let mut rows = conn
-        .query(DISCUSS_SESSIONS_LOAD_SQL, (sluice_session_id.to_string(),))
+        .query(DISCUSS_SESSIONS_LOAD_SQL, (discuss_session_id.to_string(),))
         .await?;
     match rows.next().await? {
         Some(row) => Ok(Some(decode_discuss_session_row(&row)?)),
@@ -311,12 +318,55 @@ pub async fn load_discuss_session(
     }
 }
 
+pub(super) async fn update_session_launch_context(
+    conn: &Connection,
+    session_id: &str,
+    cwd_json: Option<String>,
+    mcp_enabled: Option<bool>,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        DISCUSS_SESSIONS_LAUNCH_CONTEXT_SQL,
+        (session_id.to_string(), cwd_json, mcp_enabled.map(i64::from)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Persist the restorable setup kind (for example a Team materialized at the session root).
+pub(super) async fn update_session_setup_kind(
+    conn: &Connection,
+    session_id: &str,
+    setup_kind: Option<&str>,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        DISCUSS_SESSIONS_SETUP_KIND_SQL,
+        (session_id.to_string(), setup_kind.map(str::to_string)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Persist the explicitly supplied launch configuration on an existing anchor.
+pub(super) async fn update_session_launch_config(
+    conn: &Connection,
+    session_id: &str,
+    launch_config: Option<&SessionLaunchConfig>,
+) -> Result<(), DiscussError> {
+    let launch_config_json = launch_config.map(serde_json::to_string).transpose()?;
+    conn.execute(
+        DISCUSS_SESSIONS_LAUNCH_CONFIG_SQL,
+        (session_id.to_string(), launch_config_json),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn load_discuss_subagents(
     conn: &Connection,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
 ) -> Result<Vec<DiscussSubagentRecord>, DiscussError> {
     let mut rows = conn
-        .query(DISCUSS_SUBAGENTS_LOAD_SQL, (sluice_session_id.to_string(),))
+        .query(DISCUSS_SUBAGENTS_LOAD_SQL, (discuss_session_id.to_string(),))
         .await?;
     let mut subagents = Vec::new();
     while let Some(row) = rows.next().await? {
@@ -430,7 +480,7 @@ fn decode_discuss_team_installation_row(row: &turso::Row) -> Result<DiscussTeamI
 /// Upsert a captured subagent and prune older captures to the configured bound.
 pub(super) async fn upsert_and_prune_discuss_subagent(
     conn: &mut Connection,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
     subagent: &DiscussSubagentRecord,
     retention_limit: u32,
 ) -> Result<(), DiscussError> {
@@ -439,7 +489,7 @@ pub(super) async fn upsert_and_prune_discuss_subagent(
         .execute(
             DISCUSS_SUBAGENTS_UPSERT_SQL,
             (
-                sluice_session_id.to_string(),
+                discuss_session_id.to_string(),
                 subagent.capture_id.clone(),
                 subagent.child_session_id.clone(),
                 subagent.agent_name.clone(),
@@ -453,7 +503,7 @@ pub(super) async fn upsert_and_prune_discuss_subagent(
     transaction
         .execute(
             DISCUSS_SUBAGENTS_PRUNE_DONE_SQL,
-            (sluice_session_id.to_string(), i64::from(retention_limit)),
+            (discuss_session_id.to_string(), i64::from(retention_limit)),
         )
         .await?;
     transaction.commit().await?;
@@ -523,41 +573,41 @@ fn row_get_optional_string(row: &turso::Row, index: usize, label: &str) -> Resul
         Err(_) => row_get::<String>(row, index, label).map(Some),
     }
 }
-/// Delete a local Discuss session anchor by canonical `sluice_session_id`.
+/// Delete a local Discuss session anchor by canonical `discuss_session_id`.
 ///
 /// Child `discuss_chat_turns` rows cascade via the FK from migration 0030
 /// (`ON DELETE CASCADE`) when foreign_keys are enabled on the connection.
 /// Idempotent: deleting a missing row is success.
-pub async fn delete_discuss_session(conn: &Connection, sluice_session_id: &str) -> Result<(), DiscussError> {
-    conn.execute(DISCUSS_SESSIONS_DELETE_SQL, (sluice_session_id.to_string(),))
+pub async fn delete_discuss_session(conn: &Connection, discuss_session_id: &str) -> Result<(), DiscussError> {
+    conn.execute(DISCUSS_SESSIONS_DELETE_SQL, (discuss_session_id.to_string(),))
         .await?;
     Ok(())
 }
 
 /// Update the local user-controlled display title for an existing Discuss
-/// session anchor, keyed by `sluice_session_id`.
+/// session anchor, keyed by `discuss_session_id`.
 pub async fn rename_discuss_session(
     conn: &Connection,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     display_title: &str,
 ) -> Result<(), DiscussError> {
     let updated = conn
         .execute(
             DISCUSS_SESSIONS_RENAME_SQL,
             (
-                sluice_session_id.to_string(),
+                discuss_session_id.to_string(),
                 display_title.to_string(),
                 chrono::Utc::now().timestamp_millis(),
             ),
         )
         .await?;
     if updated == 0 {
-        return Err(DiscussError::SessionNotFound { sluice_session_id });
+        return Err(DiscussError::SessionNotFound { discuss_session_id });
     }
     Ok(())
 }
 
-/// Insert one bounded transcript turn keyed by `(sluice_session_id, position)`.
+/// Insert one bounded transcript turn keyed by `(discuss_session_id, position)`.
 pub async fn insert_discuss_chat_turn(
     conn: &Connection,
     params: DiscussChatTurnInsert<'_>,
@@ -565,7 +615,7 @@ pub async fn insert_discuss_chat_turn(
     conn.execute(
         DISCUSS_CHAT_TURNS_INSERT_SQL,
         (
-            params.sluice_session_id.to_string(),
+            params.discuss_session_id.to_string(),
             params.position,
             params.role.to_string(),
             params.acp_session_id.map(str::to_string),
@@ -578,21 +628,21 @@ pub async fn insert_discuss_chat_turn(
 }
 
 /// Prune the bounded transcript window to the latest 10 turns for a given
-/// `sluice_session_id`.
-pub async fn prune_discuss_chat_turns_window(conn: &Connection, sluice_session_id: &str) -> Result<(), DiscussError> {
-    conn.execute(DISCUSS_CHAT_TURNS_PRUNE_WINDOW_SQL, (sluice_session_id.to_string(),))
+/// `discuss_session_id`.
+pub async fn prune_discuss_chat_turns_window(conn: &Connection, discuss_session_id: &str) -> Result<(), DiscussError> {
+    conn.execute(DISCUSS_CHAT_TURNS_PRUNE_WINDOW_SQL, (discuss_session_id.to_string(),))
         .await?;
     Ok(())
 }
 
-/// Load the latest 10 transcript turns for a given `sluice_session_id`,
+/// Load the latest 10 transcript turns for a given `discuss_session_id`,
 /// ordered by position ASC.
 pub async fn load_discuss_chat_turns_window(
     conn: &Connection,
-    sluice_session_id: &str,
+    discuss_session_id: &str,
 ) -> Result<Vec<DiscussChatTurnRow>, DiscussError> {
     let mut rows = conn
-        .query(DISCUSS_CHAT_TURNS_LOAD_WINDOW_SQL, (sluice_session_id.to_string(),))
+        .query(DISCUSS_CHAT_TURNS_LOAD_WINDOW_SQL, (discuss_session_id.to_string(),))
         .await?;
     let mut turns = Vec::new();
     while let Some(row) = rows.next().await? {
@@ -607,14 +657,18 @@ pub async fn load_discuss_chat_turns_window(
 ///
 /// Column order matches `DISCUSS_SESSIONS_LIST_RECENT_SQL` /
 /// `DISCUSS_SESSIONS_LOAD_SQL`:
-/// `sluice_session_id, agent_name, session_name, display_title, acp_session_id,
+/// `discuss_session_id, agent_name, session_name, display_title, acp_session_id,
 /// last_user_prompt, latest_todo_snapshot_json, latest_config_options_json, config_settings_json,
 /// available_commands_json, first_prompt_at, last_interaction_at`.
 fn decode_discuss_session_row(row: &turso::Row) -> Result<DiscussSessionRow, DiscussError> {
     Ok(DiscussSessionRow {
         is_task_session: row_get::<i64>(row, 13, "discuss_sessions.is_task_session")? != 0,
+        session_cwd_json: row_get(row, 14, "discuss_sessions.session_cwd_json")?,
+        session_mcp_enabled: row_get(row, 15, "discuss_sessions.session_mcp_enabled")?,
+        session_launch_config_json: row_get(row, 16, "discuss_sessions.session_launch_config_json")?,
+        session_setup_kind: row_get(row, 17, "discuss_sessions.session_setup_kind")?,
         team_leader_id: row_get::<Option<String>>(row, 12, "discuss_sessions.team_leader_id")?,
-        sluice_session_id: row_get::<String>(row, 0, "discuss_sessions.sluice_session_id")?,
+        discuss_session_id: row_get::<String>(row, 0, "discuss_sessions.discuss_session_id")?,
         agent_name: row_get::<String>(row, 1, "discuss_sessions.agent_name")?,
         session_name: row_get::<String>(row, 2, "discuss_sessions.session_name")?,
         display_title: row_get::<Option<String>>(row, 3, "discuss_sessions.display_title")?,
@@ -632,11 +686,11 @@ fn decode_discuss_session_row(row: &turso::Row) -> Result<DiscussSessionRow, Dis
 /// Decode a `discuss_chat_turns` row into `DiscussChatTurnRow`.
 ///
 /// Column order matches `DISCUSS_CHAT_TURNS_LOAD_WINDOW_SQL`:
-/// `sluice_session_id, position, role, acp_session_id, content_json,
+/// `discuss_session_id, position, role, acp_session_id, content_json,
 /// created_at`.
 fn decode_discuss_chat_turn_row(row: &turso::Row) -> Result<DiscussChatTurnRow, DiscussError> {
     Ok(DiscussChatTurnRow {
-        sluice_session_id: row_get::<String>(row, 0, "discuss_chat_turns.sluice_session_id")?,
+        discuss_session_id: row_get::<String>(row, 0, "discuss_chat_turns.discuss_session_id")?,
         position: row_get::<i64>(row, 1, "discuss_chat_turns.position")?,
         role: row_get::<Option<String>>(row, 2, "discuss_chat_turns.role")?,
         acp_session_id: row_get::<Option<String>>(row, 3, "discuss_chat_turns.acp_session_id")?,

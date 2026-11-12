@@ -183,8 +183,11 @@ pub struct AgentNodeConfig {
     pub max_duration_secs: Option<u64>,
     /// Sparse Provider/Agent configuration overrides.
     pub config_overrides: BTreeMap<String, String>,
-    /// Whether the session may receive Sluice MCP tools.
-    pub sluice_mcp_enabled: bool,
+    /// Provider-owned session launch configuration, validated by the node owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_config: Option<Value>,
+    /// Whether the session may receive the applicatiton's consolidated MCP tools.
+    pub application_mcp_enabled: bool,
     /// Immutable workspace root materialized as the session CWD by Flow.
     pub workspace: Option<ContentAddressedRoot>,
 }
@@ -320,7 +323,7 @@ mod tests {
             ("OrderNode", json!({"command":"place"})),
             (
                 "AgentNode",
-                json!({"providerName":"test","agentName":"analyst","prompt":"review","maxTurns":3,"maxToolCalls":4,"maxDuration":5,"configOverrides":{},"sluiceMcpEnabled":false,"workspace":null}),
+                json!({"providerName":"test","agentName":"analyst","prompt":"review","maxTurns":3,"maxToolCalls":4,"maxDuration":5,"configOverrides":{},"applicationMcpEnabled":false,"workspace":null}),
             ),
             ("EchoNode", json!({"message":"hello"})),
         ];
@@ -351,7 +354,7 @@ mod tests {
             ("OrderNode", json!({"command":"place"})),
             (
                 "AgentNode",
-                json!({"providerName":"test","agentName":"analyst","prompt":"review","configOverrides":{},"sluiceMcpEnabled":false}),
+                json!({"providerName":"test","agentName":"analyst","prompt":"review","configOverrides":{},"applicationMcpEnabled":false}),
             ),
         ] {
             let mut legacy = configuration.as_object().unwrap().clone();

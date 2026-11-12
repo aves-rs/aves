@@ -1,5 +1,5 @@
 INSERT INTO discuss_subagents (
-    sluice_session_id,
+    discuss_session_id,
     capture_id,
     child_session_id,
     agent_name,
@@ -9,7 +9,7 @@ INSERT INTO discuss_subagents (
     last_updated_at
 )
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-ON CONFLICT (sluice_session_id, capture_id) DO UPDATE SET
+ON CONFLICT (discuss_session_id, capture_id) DO UPDATE SET
     child_session_id = COALESCE(excluded.child_session_id, discuss_subagents.child_session_id),
     agent_name = excluded.agent_name,
     description = COALESCE(excluded.description, discuss_subagents.description),

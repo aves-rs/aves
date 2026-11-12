@@ -146,12 +146,12 @@ Provider runtime state is process-local; persisted sessions remain after Provide
 
 ### Route sessions and stream events
 
-Generate a `SluiceSessionId` before requesting a genuinely new session:
+Generate a `DiscussSessionId` before requesting a genuinely new session:
 
 ```rust
-use corv::SluiceSessionId;
+use corv::DiscussSessionId;
 
-let session_id = SluiceSessionId::new();
+let session_id = DiscussSessionId::new();
 ```
 
 Retain that identity for reconnects and subsequent operations.
@@ -168,7 +168,7 @@ Handle all five `DiscussStreamEvent` variants:
 | `PermissionRequested` | Obtain a permission answer through privileged session control |
 | `ElicitationRequested` | Obtain structured input through privileged session control |
 
-Route every event by `sluice_session_id`.
+Route every event by `discuss_session_id`.
 Live protocol events also carry the Provider ACP identity for protocol and diagnostics.
 Do not use it as an application routing key.
 Corv retains responders internally; answer through its typed services, not raw channels.
@@ -203,7 +203,7 @@ Let the Aves bus own listener lifecycle, including session-scoped loopback lease
 Corv prefers native MCP-over-ACP when supported.
 The HTTP fallback uses a loopback listener and a worker-JWT Bearer header.
 HTTP admission requires exactly one well-formed, nonempty compact-JWT Bearer header.
-Provider-level `sluice_mcp_enabled` gates both transports.
+Provider-level `application_mcp_enabled` gates both transports.
 Unsupported MCP capability produces a warning without necessarily ending the session.
 
 Observe `DiscussMcpStatus::{Off, Acp, Fallback, Broken}` for provisioning state.

@@ -32,4 +32,4 @@ Keep the existing context truthful, small, and navigable. Prefer removing an obs
 - Concepts stay ≤100 lines; architecture, guides, and standards ≤150 lines. Compact duplicated AGENTS content and historical narration rather than splitting by default.
 - A missing source or link is a failure to report, not an invitation to invent a replacement.
 
-Use the repository's read/search tools for discovery and targeted link checks. Avoid broad shell grep/find pipelines and never treat the old Sluice tree as the source of truth.
+Use the repository's read/search tools for discovery and targeted link checks. Avoid broad shell grep/find pipelines.

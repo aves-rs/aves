@@ -34,7 +34,7 @@ use aves::utils::database::{
 use aves::utils::test_support::{MockBus, reply_with};
 use aves::utils::uuid::SpectaUuid;
 
-use super::super::boot::DiscussBootOptions;
+use super::super::boot::{DiscussBootOptions, DiscussSettings};
 use super::super::library::AgentId;
 use super::super::migration::MIGRATIONS as DISCUSS_MIGRATIONS;
 use super::super::sessions::dedupe_session_list;
@@ -52,6 +52,53 @@ async fn apply_discuss_migrations(database: &turso::Database) -> Result<usize, D
     MigrationRunner::new("__discuss_migrations", DISCUSS_MIGRATIONS)
         .apply(database)
         .await
+}
+
+#[tokio::test]
+async fn session_launch_context_survives_anchor_updates() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let database = open_local_db(temp_dir.path()).await.expect("database");
+    apply_discuss_migrations(&database)
+        .await
+        .expect("migrations");
+    let persistence = DiscussPersistence {
+        database: Arc::new(database),
+    };
+    let session_id = DiscussSessionId::new().to_string();
+    persist_session_anchor_inner(&persistence, &session_id, SessionAnchorMetadata::default())
+        .await
+        .expect("anchor");
+    let conn = persistence.acquire_connection().await.expect("connection");
+    let cwd = temp_dir.path().join("project");
+    update_session_launch_context(
+        &conn,
+        &session_id,
+        Some(serde_json::to_string(&cwd).unwrap()),
+        Some(false),
+    )
+    .await
+    .expect("launch context");
+    persist_session_anchor_inner(&persistence, &session_id, SessionAnchorMetadata::default())
+        .await
+        .expect("anchor update");
+    let row = load_discuss_session(&conn, &session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<PathBuf>(row.session_cwd_json.as_deref().unwrap()).unwrap(),
+        cwd
+    );
+    assert_eq!(row.session_mcp_enabled, Some(0));
+    update_session_launch_context(&conn, &session_id, None, None)
+        .await
+        .unwrap();
+    let row = load_discuss_session(&conn, &session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_mcp_enabled, Some(0));
+    assert!(row.session_cwd_json.is_some());
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -123,7 +170,7 @@ async fn attached_inspector_readers_drop_aborts_every_reader() {
             let _marker = DropMarker(dropped);
             std::future::pending::<()>().await;
         });
-        readers.0.insert(SluiceSessionId::new(), reader);
+        readers.0.insert(DiscussSessionId::new(), reader);
     }
 
     drop(readers);
@@ -158,6 +205,48 @@ async fn inspector_reader_reap_aborts_then_awaits_the_reader() {
 fn make_local_mcp_server(cmd: &str) -> AcpProvider {
     let server = McpServerStdio::new(cmd, "/bin/sh").args(vec!["-c".to_string(), format!("sleep 60 # {cmd}")]);
     AcpProvider::from(McpServer::Stdio(server))
+}
+
+#[test]
+fn legacy_provider_mcp_setting_round_trips_as_canonical_config() {
+    for enabled in [true, false] {
+        let legacy = json!({
+            "agents": {
+                "example": {
+                    "type": "acp",
+                    "serverId": "server-1",
+                    "name": "Original server",
+                    "sluice_mcp_enabled": enabled,
+                    "default_session_config": {
+                        "model": "careful",
+                        "options": {"reasoning": "high", "temperature": 0.2}
+                    },
+                    "workspace_copy_sources": ["notes"]
+                }
+            }
+        });
+        let settings: DiscussSettings = serde_json::from_value(legacy).expect("legacy Discuss settings");
+        assert_eq!(settings.agents["example"].application_mcp_enabled(), enabled);
+
+        let canonical = serde_json::to_value(&settings).expect("canonical Discuss settings");
+        let provider = &canonical["agents"]["example"];
+        assert_eq!(provider["application_mcp_enabled"], enabled);
+        assert!(provider.get("sluice_mcp_enabled").is_none());
+        assert_eq!(provider["type"], "acp");
+        assert_eq!(provider["serverId"], "server-1");
+        assert_eq!(provider["name"], "Original server");
+        assert_eq!(provider["workspace_copy_sources"], json!(["notes"]));
+        assert_eq!(
+            provider["default_session_config"],
+            json!({
+                "model": "careful",
+                "options": {"reasoning": "high", "temperature": 0.2}
+            })
+        );
+
+        let reread: DiscussSettings = serde_json::from_value(canonical).expect("canonical Discuss settings");
+        assert_eq!(reread.agents["example"].application_mcp_enabled(), enabled);
+    }
 }
 
 #[test]
@@ -462,7 +551,7 @@ async fn make_actor(
         database: database.clone(),
     };
     let (capabilities_update_tx, capabilities_update_rx) =
-        mpsc::channel::<(SluiceSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
+        mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
     let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -1452,7 +1541,7 @@ async fn deferred_provider_upsert_success_persists_menu_and_stops_transient_work
         actor
             .worker_ready_tx
             .send(WorkerReady {
-                sluice_session_id: session_id,
+                discuss_session_id: session_id,
                 acp_session_id: SessionId::from("transient-ready"),
                 announce_desktop_association: false,
                 transient_connectivity: true,
@@ -1462,7 +1551,7 @@ async fn deferred_provider_upsert_success_persists_menu_and_stops_transient_work
             .await
             .expect("send transient ready event");
         let WorkerReady {
-            sluice_session_id,
+            discuss_session_id,
             config_options,
             ..
         } = actor
@@ -1471,7 +1560,7 @@ async fn deferred_provider_upsert_success_persists_menu_and_stops_transient_work
             .await
             .expect("receive transient ready event");
         actor
-            .finish_provider_test(sluice_session_id, Ok(config_options))
+            .finish_provider_test(discuss_session_id, Ok(config_options))
             .await;
         assert!(actor_tx.send(actor).is_ok(), "return actor");
     });
@@ -1589,7 +1678,7 @@ async fn deferred_provider_upsert_error_restores_provider_and_menu_and_propagate
     actor
         .transient_worker_tx
         .send(TransientWorkerEvent {
-            sluice_session_id: session_id,
+            discuss_session_id: session_id,
             result: Err(original_error),
         })
         .await
@@ -1600,7 +1689,7 @@ async fn deferred_provider_upsert_error_restores_provider_and_menu_and_propagate
         .await
         .expect("receive transient error event");
     actor
-        .finish_provider_test(event.sluice_session_id, event.result.map(|(_, options)| options))
+        .finish_provider_test(event.discuss_session_id, event.result.map(|(_, options)| options))
         .await;
 
     assert!(
@@ -1642,16 +1731,16 @@ async fn answer_permission_valid_option_resolves_and_consumes_entry() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let permission_request_id = PermissionRequestId::new();
     let (pending, responder_rx) = pending_permission(&["allow"]);
     actor
         .pending_permissions
-        .insert((sluice_session_id, permission_request_id), pending);
+        .insert((discuss_session_id, permission_request_id), pending);
 
     let result = actor
         .handle_answer_permission(
-            sluice_session_id,
+            discuss_session_id,
             permission_request_id,
             DiscussPermissionOption::Select {
                 option_id: "allow".to_string(),
@@ -1663,7 +1752,7 @@ async fn answer_permission_valid_option_resolves_and_consumes_entry() {
     assert!(
         !actor
             .pending_permissions
-            .contains_key(&(sluice_session_id, permission_request_id))
+            .contains_key(&(discuss_session_id, permission_request_id))
     );
     assert!(matches!(
         responder_rx.await,
@@ -1677,16 +1766,16 @@ async fn answer_permission_invalid_option_preserves_entry() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let permission_request_id = PermissionRequestId::new();
     let (pending, mut responder_rx) = pending_permission(&["allow"]);
     actor
         .pending_permissions
-        .insert((sluice_session_id, permission_request_id), pending);
+        .insert((discuss_session_id, permission_request_id), pending);
 
     let result = actor
         .handle_answer_permission(
-            sluice_session_id,
+            discuss_session_id,
             permission_request_id,
             DiscussPermissionOption::Select {
                 option_id: "deny".to_string(),
@@ -1701,7 +1790,7 @@ async fn answer_permission_invalid_option_preserves_entry() {
     assert!(
         actor
             .pending_permissions
-            .contains_key(&(sluice_session_id, permission_request_id))
+            .contains_key(&(discuss_session_id, permission_request_id))
     );
     assert!(responder_rx.try_recv().is_err());
 }
@@ -1712,12 +1801,12 @@ async fn answer_permission_missing_entry_returns_not_found() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let permission_request_id = PermissionRequestId::new();
 
     let result = actor
         .handle_answer_permission(
-            sluice_session_id,
+            discuss_session_id,
             permission_request_id,
             DiscussPermissionOption::Cancel,
         )
@@ -1736,7 +1825,7 @@ async fn answer_permission_rejects_during_shutdown() {
 
     let result = actor
         .handle_answer_permission(
-            SluiceSessionId::new(),
+            DiscussSessionId::new(),
             PermissionRequestId::new(),
             DiscussPermissionOption::Cancel,
         )
@@ -1751,13 +1840,13 @@ async fn pending_permission_registration_ack_precedes_answer() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let permission_request_id = PermissionRequestId::new();
     let (pending, responder_rx) = pending_permission(&["allow"]);
     let (registration_ack, registration_ack_rx) = oneshot::channel();
 
     actor.register_pending_permission(PendingPermissionRegistration {
-        sluice_session_id,
+        discuss_session_id,
         permission_request_id,
         pending,
         registration_ack,
@@ -1766,7 +1855,7 @@ async fn pending_permission_registration_ack_precedes_answer() {
 
     let result = actor
         .handle_answer_permission(
-            sluice_session_id,
+            discuss_session_id,
             permission_request_id,
             DiscussPermissionOption::Select {
                 option_id: "allow".to_string(),
@@ -1787,13 +1876,13 @@ async fn pending_permission_registration_cancels_when_server_is_stopped() {
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
     actor.server_running = false;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let permission_request_id = PermissionRequestId::new();
     let (pending, responder_rx) = pending_permission(&["allow"]);
     let (registration_ack, registration_ack_rx) = oneshot::channel();
 
     actor.register_pending_permission(PendingPermissionRegistration {
-        sluice_session_id,
+        discuss_session_id,
         permission_request_id,
         pending,
         registration_ack,
@@ -1809,13 +1898,13 @@ async fn pending_permission_cancellation_is_idempotent_after_answer() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let permission_request_id = PermissionRequestId::new();
     let (pending, responder_rx) = pending_permission(&["allow"]);
     let (registration_ack, registration_ack_rx) = oneshot::channel();
 
     actor.register_pending_permission(PendingPermissionRegistration {
-        sluice_session_id,
+        discuss_session_id,
         permission_request_id,
         pending,
         registration_ack,
@@ -1824,7 +1913,7 @@ async fn pending_permission_cancellation_is_idempotent_after_answer() {
 
     let answer = actor
         .handle_answer_permission(
-            sluice_session_id,
+            discuss_session_id,
             permission_request_id,
             DiscussPermissionOption::Select {
                 option_id: "allow".to_string(),
@@ -1839,7 +1928,7 @@ async fn pending_permission_cancellation_is_idempotent_after_answer() {
 
     let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
     actor.cancel_pending_permission(PendingPermissionCancel {
-        sluice_session_id,
+        discuss_session_id,
         permission_request_id,
         cancellation_ack,
     });
@@ -1847,7 +1936,7 @@ async fn pending_permission_cancellation_is_idempotent_after_answer() {
     assert!(
         !actor
             .pending_permissions
-            .contains_key(&(sluice_session_id, permission_request_id))
+            .contains_key(&(discuss_session_id, permission_request_id))
     );
 }
 
@@ -1857,20 +1946,20 @@ async fn cancel_turn_missing_worker_cleans_permissions_and_succeeds() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let permission_request_id = PermissionRequestId::new();
     let (pending, responder_rx) = pending_permission(&["allow"]);
     actor
         .pending_permissions
-        .insert((sluice_session_id, permission_request_id), pending);
+        .insert((discuss_session_id, permission_request_id), pending);
 
-    let result = actor.handle_cancel_turn(sluice_session_id).await;
+    let result = actor.handle_cancel_turn(discuss_session_id).await;
 
     assert!(matches!(result, Ok(DiscussResponse::Success)));
     assert!(actor.pending_permissions.is_empty());
     assert!(matches!(responder_rx.await, Ok(DiscussPermissionOption::Cancel)));
 
-    let repeated = actor.handle_cancel_turn(sluice_session_id).await;
+    let repeated = actor.handle_cancel_turn(discuss_session_id).await;
     assert!(matches!(repeated, Ok(DiscussResponse::Success)));
 }
 
@@ -2030,7 +2119,7 @@ async fn actor_new_resolves_agents_workspace_from_config() {
     // Reply with a config that sets an explicit Discuss agents workspace so
     // the assertion is independent of the machine's default config dir.
     let mut config = super::super::boot::DiscussSettings::default();
-    config.agents_workspace = Some("/tmp/sluice-acp-workspace".into());
+    config.agents_workspace = Some("/tmp/discuss-acp-workspace".into());
 
     assert!(
         matches!(request.payload, ConfigRequestPayload::GetConfigSection { section } if section == "discuss"),
@@ -2046,7 +2135,7 @@ async fn actor_new_resolves_agents_workspace_from_config() {
     let actor = actor_fut.await.expect("actor task panicked");
     assert_eq!(
         actor.agents_workspace,
-        std::path::PathBuf::from("/tmp/sluice-acp-workspace"),
+        std::path::PathBuf::from("/tmp/discuss-acp-workspace"),
         "actor must resolve agents_workspace from discuss.agents_workspace config"
     );
 }
@@ -2446,8 +2535,8 @@ async fn remove_provider_cascade_deletes_only_matching_sessions() {
         .agents
         .insert("provider-b".to_string(), make_local_mcp_server("echo").into());
 
-    let session_a = SluiceSessionId::new();
-    let session_b = SluiceSessionId::new();
+    let session_a = DiscussSessionId::new();
+    let session_b = DiscussSessionId::new();
     let sid_a = session_a.to_string();
     let sid_b = session_b.to_string();
     let conn = actor
@@ -2459,7 +2548,7 @@ async fn remove_provider_cascade_deletes_only_matching_sessions() {
         upsert_discuss_session(
             &conn,
             DiscussSessionUpsert {
-                sluice_session_id: sid,
+                discuss_session_id: sid,
                 agent_name: provider,
                 session_name: provider,
                 acp_session_id: Some(sid),
@@ -2479,7 +2568,7 @@ async fn remove_provider_cascade_deletes_only_matching_sessions() {
         insert_discuss_chat_turn(
             &conn,
             DiscussChatTurnInsert {
-                sluice_session_id: sid,
+                discuss_session_id: sid,
                 position: 0,
                 role: "user",
                 acp_session_id: Some(sid),
@@ -2573,7 +2662,7 @@ async fn remove_provider_cascade_deletes_only_matching_sessions() {
     );
     let mut turns = conn
         .query(
-            "SELECT COUNT(*) FROM discuss_chat_turns WHERE sluice_session_id = ?1",
+            "SELECT COUNT(*) FROM discuss_chat_turns WHERE discuss_session_id = ?1",
             (sid_a.clone(),),
         )
         .await
@@ -2583,7 +2672,7 @@ async fn remove_provider_cascade_deletes_only_matching_sessions() {
     assert_eq!(count, 0);
     let mut other_turns = conn
         .query(
-            "SELECT COUNT(*) FROM discuss_chat_turns WHERE sluice_session_id = ?1",
+            "SELECT COUNT(*) FROM discuss_chat_turns WHERE discuss_session_id = ?1",
             (sid_b,),
         )
         .await
@@ -2603,7 +2692,7 @@ async fn remove_provider_last_remaining_provider_deletes_its_sessions() {
         .agents
         .insert("provider-a".to_string(), make_local_mcp_server("echo").into());
 
-    let session_id = SluiceSessionId::new();
+    let session_id = DiscussSessionId::new();
     let sid = session_id.to_string();
     let conn = actor
         .persistence
@@ -2613,7 +2702,7 @@ async fn remove_provider_last_remaining_provider_deletes_its_sessions() {
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             agent_name: "provider-a",
             session_name: "provider-a",
             acp_session_id: Some("acp-a"),
@@ -2633,7 +2722,7 @@ async fn remove_provider_last_remaining_provider_deletes_its_sessions() {
     insert_discuss_chat_turn(
         &conn,
         DiscussChatTurnInsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             position: 0,
             role: "user",
             acp_session_id: Some("acp-a"),
@@ -2689,7 +2778,7 @@ async fn remove_provider_partial_failure_leaves_provider_present() {
         .agents
         .insert("provider-a".to_string(), make_local_mcp_server("echo").into());
 
-    let session_id = SluiceSessionId::new();
+    let session_id = DiscussSessionId::new();
     let sid = session_id.to_string();
     let conn = actor
         .persistence
@@ -2699,7 +2788,7 @@ async fn remove_provider_partial_failure_leaves_provider_present() {
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             agent_name: "provider-a",
             session_name: "provider-a",
             acp_session_id: None,
@@ -2860,9 +2949,10 @@ async fn spawn_session_returns_error_for_unknown_agent_key() {
 
     let result = actor
         .spawn_session(
-            SluiceSessionId::new(),
+            DiscussSessionId::new(),
             "nonexistent-agent",
             SpawnSessionOptions {
+                launch_config: None,
                 name: Some("Test Session".to_string()),
                 setup: None,
                 session_config_overrides: std::collections::BTreeMap::new(),
@@ -2870,7 +2960,7 @@ async fn spawn_session_returns_error_for_unknown_agent_key() {
                 announce_desktop_association: true,
                 transient_connectivity: false,
                 session_cwd: None,
-                sluice_mcp_enabled: None,
+                application_mcp_enabled: None,
                 node_token: None,
                 flow_mcp_endpoints: None,
             },
@@ -3110,7 +3200,7 @@ async fn make_migrated_actor(
         database: database.clone(),
     };
     let (capabilities_update_tx, capabilities_update_rx) =
-        mpsc::channel::<(SluiceSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
+        mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
     let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -3332,8 +3422,8 @@ async fn session_config_read_falls_back_to_database_agent_menu() {
     let (bus_requester, _mock) = MockBus::new(8);
     let (broadcast_tx, _) = mpsc::channel(1);
     let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
-    let session_id = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let session_id = discuss_session_id.to_string();
     let options = vec![config_option("model", "model-a", &["model-a", "model-b"])];
     let conn = actor
         .persistence
@@ -3346,7 +3436,7 @@ async fn session_config_read_falls_back_to_database_agent_menu() {
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &session_id,
+            discuss_session_id: &session_id,
             agent_name: "custom-agent",
             session_name: "session",
             acp_session_id: Some("provider-session"),
@@ -3365,7 +3455,7 @@ async fn session_config_read_falls_back_to_database_agent_menu() {
     .expect("persist session anchor");
 
     let response = actor
-        .handle_get_config_options(sluice_session_id)
+        .handle_get_config_options(discuss_session_id)
         .await
         .expect("read database menu");
     assert!(matches!(response, DiscussResponse::ConfigOptions { options: actual } if actual == options));
@@ -3376,7 +3466,7 @@ async fn session_settings_persist_separately_from_menu_snapshot() {
     let (bus_requester, _mock) = MockBus::new(8);
     let (broadcast_tx, _) = mpsc::channel(1);
     let (actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new().to_string();
+    let discuss_session_id = DiscussSessionId::new().to_string();
     let options = vec![config_option("model", "model-b", &["model-a", "model-b"])];
     let settings = ConfigSettings::from([("model".to_string(), "model-b".to_string())]);
     let conn = actor
@@ -3387,7 +3477,7 @@ async fn session_settings_persist_separately_from_menu_snapshot() {
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sluice_session_id,
+            discuss_session_id: &discuss_session_id,
             agent_name: "custom-agent",
             session_name: "session",
             acp_session_id: Some("provider-session"),
@@ -3407,7 +3497,7 @@ async fn session_settings_persist_separately_from_menu_snapshot() {
 
     persist_config_options(
         &actor.persistence,
-        &sluice_session_id,
+        &discuss_session_id,
         "custom-agent",
         &options,
         Some(&settings),
@@ -3415,7 +3505,7 @@ async fn session_settings_persist_separately_from_menu_snapshot() {
     .await
     .expect("persist session config");
 
-    let row = load_discuss_session(&conn, &sluice_session_id)
+    let row = load_discuss_session(&conn, &discuss_session_id)
         .await
         .expect("load session")
         .expect("session exists");
@@ -3450,8 +3540,8 @@ async fn persisted_config_options_round_trip_through_no_live_worker_fallback() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
 
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
     let agent_name = "agent";
 
     // A provider config update in the real SDK wire shape.
@@ -3494,7 +3584,7 @@ async fn persisted_config_options_round_trip_through_no_live_worker_fallback() {
     // takes the persisted-fallback path and must return the same canonical
     // options — not empty.
     let response = actor
-        .handle_get_config_options(sluice_session_id)
+        .handle_get_config_options(discuss_session_id)
         .await
         .expect("get config options succeeds");
     match response {
@@ -3517,12 +3607,12 @@ async fn persisted_config_options_round_trip_through_no_live_worker_fallback() {
 }
 
 #[tokio::test]
-async fn new_session_resolves_persisted_provider_id_by_sluice_session_id() {
+async fn new_session_resolves_persisted_provider_id_by_discuss_session_id() {
     let (bus_requester, _mock) = MockBus::new(8);
     let (broadcast_tx, _) = mpsc::channel(1);
     let (actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
-    let sluice_session_id_text = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let discuss_session_id_text = discuss_session_id.to_string();
     let conn = actor
         .persistence
         .acquire_connection()
@@ -3532,7 +3622,7 @@ async fn new_session_resolves_persisted_provider_id_by_sluice_session_id() {
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sluice_session_id_text,
+            discuss_session_id: &discuss_session_id_text,
             session_name: "persisted-session",
             agent_name: "agent",
             acp_session_id: Some("provider-session"),
@@ -3551,7 +3641,7 @@ async fn new_session_resolves_persisted_provider_id_by_sluice_session_id() {
     .expect("persisted session anchor");
 
     let resolved = actor
-        .resolve_persisted_acp_session_id(sluice_session_id, None)
+        .resolve_persisted_acp_session_id(discuss_session_id, None)
         .await
         .expect("provider id resolution");
     assert_eq!(resolved.as_deref(), Some("provider-session"));
@@ -3595,8 +3685,8 @@ async fn set_config_option_success_persists_post_response_options_for_no_worker_
     let (broadcast_tx, _) = mpsc::channel(1);
     let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
 
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     // The provider's post-response config options select `gpt-5`. Normalize
     // through the canonical normalizer the worker uses, then persist through
@@ -3617,7 +3707,7 @@ async fn set_config_option_success_persists_post_response_options_for_no_worker_
     // No live worker registered: getConfigOptions must return the persisted
     // post-response options (not stale/empty).
     let response = actor
-        .handle_get_config_options(sluice_session_id)
+        .handle_get_config_options(discuss_session_id)
         .await
         .expect("get config options succeeds");
     match response {
@@ -3653,8 +3743,8 @@ async fn set_config_option_success_persists_explicit_empty_options() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
 
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     // Seed a prior non-empty persisted state so the explicit-empty write must
     // actually overwrite (not carry forward) the earlier options.
@@ -3698,7 +3788,7 @@ async fn set_config_option_success_persists_explicit_empty_options() {
     }
 
     let response = actor
-        .handle_get_config_options(sluice_session_id)
+        .handle_get_config_options(discuss_session_id)
         .await
         .expect("get config options succeeds");
     match response {
@@ -3725,8 +3815,8 @@ async fn set_config_option_failure_does_not_mutate_persisted_options() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
 
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     // Seed a known persisted state via a prior successful set.
     let seeded = test_agent_plugin()
@@ -3741,7 +3831,7 @@ async fn set_config_option_failure_does_not_mutate_persisted_options() {
     // model that by simply not calling `persist_config_options` for the
     // failed attempt and asserting the seeded state survives.
     let response = actor
-        .handle_get_config_options(sluice_session_id)
+        .handle_get_config_options(discuss_session_id)
         .await
         .expect("get config options succeeds");
     match response {
@@ -3769,7 +3859,7 @@ async fn set_config_option_fails_closed_without_live_worker() {
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
 
     let result = actor
-        .handle_set_config_option(SluiceSessionId::new(), "model".to_string(), "gpt-4".to_string())
+        .handle_set_config_option(DiscussSessionId::new(), "model".to_string(), "gpt-4".to_string())
         .await;
 
     assert!(
@@ -3788,7 +3878,7 @@ async fn set_config_option_fails_closed_when_capability_unset() {
     let (_, receiver) = mpsc::channel(1);
 
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
 
     // A live worker exists, but no server-side config signal has been
     // observed, so the capability bit is unset (default).
@@ -3798,7 +3888,7 @@ async fn set_config_option_fails_closed_when_capability_unset() {
         drop(_command_rx);
     });
     actor.worker_registry.insert(
-        sluice_session_id,
+        discuss_session_id,
         WorkerEntry {
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
@@ -3810,10 +3900,10 @@ async fn set_config_option_fails_closed_when_capability_unset() {
     );
     actor
         .worker_capabilities
-        .insert(sluice_session_id, SessionCapabilitiesCache::default());
+        .insert(discuss_session_id, SessionCapabilitiesCache::default());
 
     let result = actor
-        .handle_set_config_option(sluice_session_id, "model".to_string(), "gpt-4".to_string())
+        .handle_set_config_option(discuss_session_id, "model".to_string(), "gpt-4".to_string())
         .await;
 
     assert!(
@@ -3836,7 +3926,7 @@ async fn set_config_option_allowed_once_capability_raised() {
     let (_, receiver) = mpsc::channel(1);
 
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
 
     // A live worker with the capability raised (as a config_option_update or
     // session/load advertising options would do).
@@ -3857,7 +3947,7 @@ async fn set_config_option_allowed_once_capability_raised() {
         }
     });
     actor.worker_registry.insert(
-        sluice_session_id,
+        discuss_session_id,
         WorkerEntry {
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
@@ -3871,15 +3961,15 @@ async fn set_config_option_allowed_once_capability_raised() {
         set_config_option: true,
         ..SessionCapabilitiesCache::default()
     };
-    actor.worker_capabilities.insert(sluice_session_id, caps);
+    actor.worker_capabilities.insert(discuss_session_id, caps);
 
     let result = actor
-        .handle_set_config_option(sluice_session_id, "model".to_string(), "gpt-4".to_string())
+        .handle_set_config_option(discuss_session_id, "model".to_string(), "gpt-4".to_string())
         .await;
 
     // The mock worker's join handle is owned by the registry entry; abort it
     // to avoid leaking the task if the handler consumed the command.
-    if let Some(entry) = actor.worker_registry.remove(&sluice_session_id) {
+    if let Some(entry) = actor.worker_registry.remove(&discuss_session_id) {
         entry.join_handle.abort();
     }
     assert!(
@@ -3917,8 +4007,8 @@ async fn persistence_with_notnull_schema() -> (DiscussPersistence, tempfile::Tem
 #[tokio::test]
 async fn session_open_persists_anchor_without_user_turn() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     persist_session_open(&persistence, &sid, "acp-sid-pre").await;
 
@@ -3949,8 +4039,8 @@ async fn session_open_persists_anchor_without_user_turn() {
 #[tokio::test]
 async fn assistant_turn_persists_at_stop_boundary_and_loads_after_reseed() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
     persist_session_open(&persistence, &sid, "acp-stop").await;
     persist_initial_turn(&persistence, &sid, "acp-stop", "user text").await;
 
@@ -3982,7 +4072,7 @@ async fn assistant_turn_persists_at_stop_boundary_and_loads_after_reseed() {
         drop(_reseeded_worker_rx);
     });
     rebooted_actor.worker_registry.insert(
-        sluice_session_id,
+        discuss_session_id,
         WorkerEntry {
             agent_name: "agent-a".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
@@ -3994,9 +4084,9 @@ async fn assistant_turn_persists_at_stop_boundary_and_loads_after_reseed() {
     );
     rebooted_actor
         .worker_capabilities
-        .insert(sluice_session_id, SessionCapabilitiesCache::default());
+        .insert(discuss_session_id, SessionCapabilitiesCache::default());
     let response = rebooted_actor
-        .handle_load_session(sluice_session_id)
+        .handle_load_session(discuss_session_id)
         .await
         .expect("reseed persisted session");
     let turns = match response {
@@ -4040,8 +4130,8 @@ fn cancelled_turn_flushes_partial_content_once_and_late_stop_is_empty() {
 #[tokio::test]
 async fn persistence_queue_drains_assistant_turn_on_shutdown() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
     let (bus_requester, _bus_requests) = mpsc::channel::<OpaqueRequestEnvelope>(1);
     let (queue, drain) = spawn_persistence_queue(
         persistence.clone(),
@@ -4097,8 +4187,8 @@ async fn persistence_queue_drains_assistant_turn_on_shutdown() {
 #[tokio::test]
 async fn restored_session_turns_continue_after_persisted_maximum_position() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
     persist_session_open(&persistence, &sid, "acp-restored").await;
     persist_initial_turn(&persistence, &sid, "acp-restored", "first user").await;
     persist_assistant_turn(
@@ -4159,8 +4249,8 @@ async fn restored_session_turns_continue_after_persisted_maximum_position() {
 #[tokio::test]
 async fn mixed_elicitation_and_ordinary_turns_load_and_prune_chronologically() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
     persist_session_open(&persistence, &sid, "acp-mixed").await;
     persist_initial_turn(&persistence, &sid, "acp-mixed", "first user").await;
     persist_assistant_turn(
@@ -4249,8 +4339,8 @@ fn transcript_position_allocator_is_unique_across_concurrent_reservations() {
 #[tokio::test]
 async fn duplicate_stop_reason_does_not_persist_an_empty_assistant_turn() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
     persist_session_open(&persistence, &sid, "acp-duplicate").await;
     persist_initial_turn(&persistence, &sid, "acp-duplicate", "user text").await;
 
@@ -4278,15 +4368,15 @@ async fn duplicate_stop_reason_does_not_persist_an_empty_assistant_turn() {
 async fn initial_anchor_upsert_and_child_turn_succeed_on_notnull_schema() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
     let conn = persistence.acquire_connection().await.expect("connection");
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     // Anchor upsert as the initial-turn path issues it: a real acp_session_id
     // but no config options and no available commands.
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             agent_name: "agent-a",
             session_name: "chat-1",
             acp_session_id: Some("acp-sid-1"),
@@ -4308,7 +4398,7 @@ async fn initial_anchor_upsert_and_child_turn_succeed_on_notnull_schema() {
     insert_discuss_chat_turn(
         &conn,
         DiscussChatTurnInsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             position: 0,
             role: "user",
             acp_session_id: None,
@@ -4344,13 +4434,13 @@ async fn initial_anchor_upsert_and_child_turn_succeed_on_notnull_schema() {
 async fn anchor_upsert_with_absent_session_id_inserts_and_normalizes() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
     let conn = persistence.acquire_connection().await.expect("connection");
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             agent_name: "agent-b",
             session_name: "chat-2",
             acp_session_id: None,
@@ -4396,8 +4486,8 @@ async fn anchor_upsert_with_absent_session_id_inserts_and_normalizes() {
 #[tokio::test]
 async fn titleless_metadata_update_inserts_on_notnull_display_title_schema() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     // A provider config update in the real SDK wire shape — sessionId +
     // options, but no `title`.
@@ -4435,14 +4525,14 @@ async fn titleless_metadata_update_inserts_on_notnull_display_title_schema() {
 async fn explicit_title_clear_maps_to_safe_empty_display_on_notnull_schema() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
     let conn = persistence.acquire_connection().await.expect("connection");
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     // Seed a row with a real title.
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             agent_name: "agent-clear",
             session_name: "chat-clear",
             acp_session_id: Some("acp-sid-clear"),
@@ -4466,7 +4556,7 @@ async fn explicit_title_clear_maps_to_safe_empty_display_on_notnull_schema() {
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             agent_name: "agent-clear",
             session_name: "chat-clear",
             acp_session_id: None,
@@ -4507,14 +4597,14 @@ async fn explicit_title_clear_maps_to_safe_empty_display_on_notnull_schema() {
 async fn partial_metadata_update_preserves_existing_values() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
     let conn = persistence.acquire_connection().await.expect("connection");
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
 
     // Seed a fully-populated anchor row.
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             agent_name: "agent-c",
             session_name: "chat-3",
             acp_session_id: Some("acp-sid-3"),
@@ -4541,7 +4631,7 @@ async fn partial_metadata_update_preserves_existing_values() {
     upsert_discuss_session(
         &conn,
         DiscussSessionUpsert {
-            sluice_session_id: &sid,
+            discuss_session_id: &sid,
             agent_name: "agent-c",
             session_name: "chat-3",
             acp_session_id: None,
@@ -4601,8 +4691,8 @@ async fn list_sessions_does_not_materialize_unknown_provider_sessions() {
 
     let session_name = "local-chat";
     let agent_name = "agent-a";
-    let sluice_session_id = SluiceSessionId::new();
-    let sluice_session_id_text = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let discuss_session_id_text = discuss_session_id.to_string();
     {
         let conn = actor
             .persistence
@@ -4612,7 +4702,7 @@ async fn list_sessions_does_not_materialize_unknown_provider_sessions() {
         upsert_discuss_session(
             &conn,
             DiscussSessionUpsert {
-                sluice_session_id: &sluice_session_id_text,
+                discuss_session_id: &discuss_session_id_text,
                 session_name,
                 agent_name,
                 acp_session_id: Some("acp-local-1"),
@@ -4659,7 +4749,7 @@ async fn list_sessions_does_not_materialize_unknown_provider_sessions() {
     });
 
     actor.worker_registry.insert(
-        sluice_session_id,
+        discuss_session_id,
         WorkerEntry {
             agent_name: "agent-a".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
@@ -4670,7 +4760,7 @@ async fn list_sessions_does_not_materialize_unknown_provider_sessions() {
         },
     );
     actor.worker_capabilities.insert(
-        sluice_session_id,
+        discuss_session_id,
         SessionCapabilitiesCache {
             list: true,
             ..SessionCapabilitiesCache::default()
@@ -4684,7 +4774,7 @@ async fn list_sessions_does_not_materialize_unknown_provider_sessions() {
     // The mock worker's join handle is owned by the registry entry; the
     // handler consumed the ListProviderSessions command so the worker task
     // has completed. Abort the handle to avoid leaking if it hasn't finished.
-    if let Some(entry) = actor.worker_registry.remove(&sluice_session_id) {
+    if let Some(entry) = actor.worker_registry.remove(&discuss_session_id) {
         entry.join_handle.abort();
     }
 
@@ -4693,7 +4783,7 @@ async fn list_sessions_does_not_materialize_unknown_provider_sessions() {
             assert_eq!(
                 sessions.len(),
                 1,
-                "only the local Sluice session must appear; provider noise must not materialize"
+                "only the local session must appear; provider noise must not materialize"
             );
             assert_eq!(sessions[0].session_name, session_name);
             assert_eq!(sessions[0].agent_name, agent_name);
@@ -4736,12 +4826,12 @@ async fn list_sessions_returns_local_persisted_rows() {
             .acquire_connection()
             .await
             .expect("connection");
-        let sid_a = SluiceSessionId::new().to_string();
-        let sid_b = SluiceSessionId::new().to_string();
+        let sid_a = DiscussSessionId::new().to_string();
+        let sid_b = DiscussSessionId::new().to_string();
         upsert_discuss_session(
             &conn,
             DiscussSessionUpsert {
-                sluice_session_id: &sid_a,
+                discuss_session_id: &sid_a,
                 agent_name: "agent-a",
                 session_name: "chat-a",
                 acp_session_id: Some("acp-a"),
@@ -4761,7 +4851,7 @@ async fn list_sessions_returns_local_persisted_rows() {
         upsert_discuss_session(
             &conn,
             DiscussSessionUpsert {
-                sluice_session_id: &sid_b,
+                discuss_session_id: &sid_b,
                 agent_name: "agent-b",
                 session_name: "chat-b",
                 acp_session_id: None,
@@ -4802,7 +4892,7 @@ fn dedupe_session_list_collapses_identity_and_acp_session_id() {
         DiscussSessionInfo {
             is_task_session: false,
             team_leader_id: None,
-            sluice_session_id: SluiceSessionId::from_str("00000000-0000-0000-0000-000000000001").expect("uuid"),
+            discuss_session_id: DiscussSessionId::from_str("00000000-0000-0000-0000-000000000001").expect("uuid"),
             session_name: "chat-1".to_string(),
             agent_name: "agent-a".to_string(),
             acp_session_id: Some("acp-1".to_string()),
@@ -4817,7 +4907,7 @@ fn dedupe_session_list_collapses_identity_and_acp_session_id() {
         DiscussSessionInfo {
             is_task_session: false,
             team_leader_id: None,
-            sluice_session_id: SluiceSessionId::from_str("00000000-0000-0000-0000-000000000001").expect("uuid"),
+            discuss_session_id: DiscussSessionId::from_str("00000000-0000-0000-0000-000000000001").expect("uuid"),
             session_name: "chat-1".to_string(),
             agent_name: "agent-a".to_string(),
             acp_session_id: Some("acp-1".to_string()),
@@ -4832,7 +4922,7 @@ fn dedupe_session_list_collapses_identity_and_acp_session_id() {
         DiscussSessionInfo {
             is_task_session: false,
             team_leader_id: None,
-            sluice_session_id: SluiceSessionId::from_str("00000000-0000-0000-0000-000000000002").expect("uuid"),
+            discuss_session_id: DiscussSessionId::from_str("00000000-0000-0000-0000-000000000002").expect("uuid"),
             session_name: "chat-2".to_string(),
             agent_name: "agent-a".to_string(),
             acp_session_id: Some("acp-1".to_string()),
@@ -4847,7 +4937,7 @@ fn dedupe_session_list_collapses_identity_and_acp_session_id() {
         DiscussSessionInfo {
             is_task_session: false,
             team_leader_id: None,
-            sluice_session_id: SluiceSessionId::from_str("00000000-0000-0000-0000-000000000003").expect("uuid"),
+            discuss_session_id: DiscussSessionId::from_str("00000000-0000-0000-0000-000000000003").expect("uuid"),
             session_name: "chat-3".to_string(),
             agent_name: "agent-b".to_string(),
             acp_session_id: Some("acp-3".to_string()),
@@ -4867,7 +4957,7 @@ fn dedupe_session_list_collapses_identity_and_acp_session_id() {
     assert_eq!(deduped[1].session_name, "chat-3");
 }
 
-/// Migration 0030 enforces uniqueness on `sluice_session_id` (PRIMARY KEY).
+/// Migration 0030 enforces uniqueness on `discuss_session_id` (PRIMARY KEY).
 #[tokio::test]
 async fn session_name_agent_name_uniqueness_is_enforced() {
     let (bus_requester, _mock) = MockBus::new(8);
@@ -4881,7 +4971,7 @@ async fn session_name_agent_name_uniqueness_is_enforced() {
 
     conn.execute(
         "INSERT INTO discuss_sessions (
-                sluice_session_id, agent_name, session_name, acp_session_id,
+                discuss_session_id, agent_name, session_name, acp_session_id,
                 display_title, last_user_prompt, latest_config_options_json,
                 available_commands_json, first_prompt_at, last_interaction_at
             ) VALUES ('00000000-0000-0000-0000-000000000001', 'agent', 'dup', NULL, NULL, NULL, NULL, NULL, 0, 0)",
@@ -4893,7 +4983,7 @@ async fn session_name_agent_name_uniqueness_is_enforced() {
     let second = conn
         .execute(
             "INSERT INTO discuss_sessions (
-                    sluice_session_id, agent_name, session_name, acp_session_id,
+                    discuss_session_id, agent_name, session_name, acp_session_id,
                     display_title, last_user_prompt, latest_config_options_json,
                     available_commands_json, first_prompt_at, last_interaction_at
                 ) VALUES ('00000000-0000-0000-0000-000000000001', 'agent', 'dup', NULL, NULL, NULL, NULL, NULL, 0, 1)",
@@ -4902,7 +4992,7 @@ async fn session_name_agent_name_uniqueness_is_enforced() {
         .await;
     assert!(
         second.is_err(),
-        "primary key on sluice_session_id must reject duplicates"
+        "primary key on discuss_session_id must reject duplicates"
     );
 }
 
@@ -4914,8 +5004,8 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
 
-    let sluice_session_id = SluiceSessionId::new();
-    let sid = sluice_session_id.to_string();
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
     {
         let conn = actor
             .persistence
@@ -4925,7 +5015,7 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
         upsert_discuss_session(
             &conn,
             DiscussSessionUpsert {
-                sluice_session_id: &sid,
+                discuss_session_id: &sid,
                 agent_name: "agent-a",
                 session_name: "remove-me",
                 acp_session_id: Some("acp-rm"),
@@ -4945,7 +5035,7 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
         insert_discuss_chat_turn(
             &conn,
             DiscussChatTurnInsert {
-                sluice_session_id: &sid,
+                discuss_session_id: &sid,
                 position: 0,
                 role: "user",
                 acp_session_id: Some("acp-rm"),
@@ -4958,7 +5048,7 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
         insert_discuss_chat_turn(
             &conn,
             DiscussChatTurnInsert {
-                sluice_session_id: &sid,
+                discuss_session_id: &sid,
                 position: 1,
                 role: "assistant",
                 acp_session_id: Some("acp-rm"),
@@ -4975,7 +5065,7 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
         drop(_command_rx);
     });
     actor.worker_registry.insert(
-        sluice_session_id,
+        discuss_session_id,
         WorkerEntry {
             agent_name: "agent-a".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
@@ -4986,7 +5076,7 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
         },
     );
     actor.worker_capabilities.insert(
-        sluice_session_id,
+        discuss_session_id,
         SessionCapabilitiesCache {
             list: true,
             load: true,
@@ -4995,17 +5085,17 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
     );
 
     let response = actor
-        .handle_remove_session(sluice_session_id)
+        .handle_remove_session(discuss_session_id)
         .await
         .expect("remove succeeds");
     assert!(matches!(response, DiscussResponse::Success));
 
     assert!(
-        !actor.worker_registry.contains_key(&sluice_session_id),
+        !actor.worker_registry.contains_key(&discuss_session_id),
         "live worker registry entry must be dropped"
     );
     assert!(
-        !actor.worker_capabilities.contains_key(&sluice_session_id),
+        !actor.worker_capabilities.contains_key(&discuss_session_id),
         "capability cache entry must be dropped"
     );
 
@@ -5019,7 +5109,7 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
 
     let mut turns = conn
         .query(
-            "SELECT COUNT(*) FROM discuss_chat_turns WHERE sluice_session_id = ?1",
+            "SELECT COUNT(*) FROM discuss_chat_turns WHERE discuss_session_id = ?1",
             (sid.clone(),),
         )
         .await
@@ -5036,13 +5126,13 @@ async fn remove_session_is_idempotent_for_missing_row() {
     let (broadcast_tx, _) = mpsc::channel(1);
     let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
 
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let (command_tx, _command_rx) = mpsc::channel(1);
     let join_handle = tokio::spawn(async move {
         drop(_command_rx);
     });
     actor.worker_registry.insert(
-        sluice_session_id,
+        discuss_session_id,
         WorkerEntry {
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
@@ -5054,15 +5144,15 @@ async fn remove_session_is_idempotent_for_missing_row() {
     );
     actor
         .worker_capabilities
-        .insert(sluice_session_id, SessionCapabilitiesCache::default());
+        .insert(discuss_session_id, SessionCapabilitiesCache::default());
 
     let response = actor
-        .handle_remove_session(sluice_session_id)
+        .handle_remove_session(discuss_session_id)
         .await
         .expect("remove missing is success");
     assert!(matches!(response, DiscussResponse::Success));
-    assert!(!actor.worker_registry.contains_key(&sluice_session_id));
-    assert!(!actor.worker_capabilities.contains_key(&sluice_session_id));
+    assert!(!actor.worker_registry.contains_key(&discuss_session_id));
+    assert!(!actor.worker_capabilities.contains_key(&discuss_session_id));
 }
 
 /// A warm worker must not announce a desktop association until a real
@@ -5076,10 +5166,10 @@ async fn warm_worker_readiness_does_not_emit_premature_desktop_association() {
     let ready_tx = actor.worker_ready_tx.clone();
     let actor_task = tokio::spawn(run_actor(actor));
 
-    let warm_id = SluiceSessionId::new();
+    let warm_id = DiscussSessionId::new();
     ready_tx
         .send(WorkerReady {
-            sluice_session_id: warm_id,
+            discuss_session_id: warm_id,
             acp_session_id: SessionId::from("provider-warm"),
             announce_desktop_association: false,
             transient_connectivity: false,
@@ -5091,10 +5181,10 @@ async fn warm_worker_readiness_does_not_emit_premature_desktop_association() {
     tokio::task::yield_now().await;
     assert!(matches!(broadcast_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
 
-    let new_id = SluiceSessionId::new();
+    let new_id = DiscussSessionId::new();
     ready_tx
         .send(WorkerReady {
-            sluice_session_id: new_id,
+            discuss_session_id: new_id,
             acp_session_id: SessionId::from("provider-new"),
             announce_desktop_association: true,
             transient_connectivity: false,
@@ -5118,13 +5208,13 @@ async fn desktop_attach_reuses_ready_warmed_worker() {
     let (broadcast_tx, mut broadcast_rx) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let (command_tx, _command_rx) = mpsc::channel(1);
     let join_handle = tokio::spawn(async move {
         drop(_command_rx);
     });
     actor.worker_registry.insert(
-        sluice_session_id,
+        discuss_session_id,
         WorkerEntry {
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
@@ -5137,9 +5227,10 @@ async fn desktop_attach_reuses_ready_warmed_worker() {
 
     let response = actor
         .spawn_session(
-            sluice_session_id,
+            discuss_session_id,
             "agent",
             SpawnSessionOptions {
+                launch_config: None,
                 name: Some("local-session".to_string()),
                 setup: None,
                 session_config_overrides: std::collections::BTreeMap::new(),
@@ -5147,7 +5238,7 @@ async fn desktop_attach_reuses_ready_warmed_worker() {
                 announce_desktop_association: true,
                 transient_connectivity: false,
                 session_cwd: None,
-                sluice_mcp_enabled: None,
+                application_mcp_enabled: None,
                 node_token: None,
                 flow_mcp_endpoints: None,
             },
@@ -5159,7 +5250,7 @@ async fn desktop_attach_reuses_ready_warmed_worker() {
     assert_eq!(actor.worker_registry.len(), 1);
     assert!(matches!(
         broadcast_rx.recv().await,
-        Some(DiscussResponse::NewSession { session_id }) if session_id == sluice_session_id
+        Some(DiscussResponse::NewSession { session_id }) if session_id == discuss_session_id
     ));
 }
 
@@ -5171,11 +5262,11 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
     let (broadcast_tx, mut broadcast_rx) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let (command_tx, _command_rx) = mpsc::channel(1);
     let join_handle = tokio::spawn(std::future::pending::<()>());
     actor.worker_registry.insert(
-        sluice_session_id,
+        discuss_session_id,
         WorkerEntry {
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
@@ -5188,9 +5279,10 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
 
     let response = actor
         .spawn_session(
-            sluice_session_id,
+            discuss_session_id,
             "agent",
             SpawnSessionOptions {
+                launch_config: None,
                 name: Some("local-session".to_string()),
                 setup: None,
                 session_config_overrides: std::collections::BTreeMap::new(),
@@ -5198,7 +5290,7 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
                 announce_desktop_association: true,
                 transient_connectivity: false,
                 session_cwd: None,
-                sluice_mcp_enabled: None,
+                application_mcp_enabled: None,
                 node_token: None,
                 flow_mcp_endpoints: None,
             },
@@ -5211,7 +5303,7 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
     assert!(
         actor
             .worker_registry
-            .get(&sluice_session_id)
+            .get(&discuss_session_id)
             .is_some_and(|entry| entry.desktop_association_requested)
     );
 
@@ -5219,7 +5311,7 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
     let actor_task = tokio::spawn(run_actor(actor));
     ready_tx
         .send(WorkerReady {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id: SessionId::from("provider-session"),
             announce_desktop_association: false,
             transient_connectivity: false,
@@ -5231,7 +5323,7 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
 
     assert!(matches!(
         broadcast_rx.recv().await,
-        Some(DiscussResponse::NewSession { session_id }) if session_id == sluice_session_id
+        Some(DiscussResponse::NewSession { session_id }) if session_id == discuss_session_id
     ));
     actor_task.abort();
 }
@@ -5249,12 +5341,12 @@ async fn start_server_skips_stale_persisted_session_anchors_idempotently() {
         .await
         .expect("connection");
     for (session_name, acp_session_id) in [("stale-one", "provider-one"), ("stale-two", "provider-two")] {
-        let sluice_session_id = SluiceSessionId::new();
-        let sluice_session_id_text = sluice_session_id.to_string();
+        let discuss_session_id = DiscussSessionId::new();
+        let discuss_session_id_text = discuss_session_id.to_string();
         upsert_discuss_session(
             &conn,
             DiscussSessionUpsert {
-                sluice_session_id: &sluice_session_id_text,
+                discuss_session_id: &discuss_session_id_text,
                 session_name,
                 agent_name: "removed-agent",
                 acp_session_id: Some(acp_session_id),
@@ -5316,7 +5408,7 @@ async fn prepare_subagent_parent(persistence: &DiscussPersistence, session_id: &
 #[tokio::test]
 async fn subagent_records_round_trip_with_typed_load() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let session_id = SluiceSessionId::new().to_string();
+    let session_id = DiscussSessionId::new().to_string();
     prepare_subagent_parent(&persistence, &session_id).await;
     let mut expected = test_subagent("capture-1", DiscussSubagentSurfaceState::Live, 10);
     expected.child_session_id = Some("child-1".to_string());
@@ -5335,7 +5427,7 @@ async fn subagent_records_round_trip_with_typed_load() {
 #[tokio::test]
 async fn subagent_upsert_preserves_child_id_and_terminal_state() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let session_id = SluiceSessionId::new().to_string();
+    let session_id = DiscussSessionId::new().to_string();
     prepare_subagent_parent(&persistence, &session_id).await;
     let mut done = test_subagent("capture-1", DiscussSubagentSurfaceState::Done, 20);
     done.child_session_id = Some("child-1".to_string());
@@ -5381,7 +5473,7 @@ async fn subagent_upsert_preserves_child_id_and_terminal_state() {
 #[tokio::test]
 async fn subagent_retention_keeps_the_newest_records_across_all_states() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let session_id = SluiceSessionId::new().to_string();
+    let session_id = DiscussSessionId::new().to_string();
     prepare_subagent_parent(&persistence, &session_id).await;
     for index in 0..12 {
         let record = test_subagent(&format!("done-{index:02}"), DiscussSubagentSurfaceState::Done, index);
@@ -5419,7 +5511,7 @@ async fn subagent_retention_keeps_the_newest_records_across_all_states() {
 #[tokio::test]
 async fn subagent_retention_limit_zero_removes_all_records() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let session_id = SluiceSessionId::new().to_string();
+    let session_id = DiscussSessionId::new().to_string();
     prepare_subagent_parent(&persistence, &session_id).await;
     let record = test_subagent("active", DiscussSubagentSurfaceState::Live, 1);
 
@@ -5439,7 +5531,7 @@ async fn subagent_retention_limit_zero_removes_all_records() {
 #[tokio::test]
 async fn persistence_queue_reads_the_current_subagent_retention_limit() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let session_id = SluiceSessionId::new().to_string();
+    let session_id = DiscussSessionId::new().to_string();
     prepare_subagent_parent(&persistence, &session_id).await;
     let (bus_requester, mut mock) = MockBus::new(1);
     let (queue, drain) = spawn_persistence_queue(
@@ -5485,7 +5577,7 @@ async fn persistence_queue_reads_the_current_subagent_retention_limit() {
 #[tokio::test]
 async fn deleting_parent_cascades_subagent_records() {
     let (persistence, _temp) = persistence_with_notnull_schema().await;
-    let session_id = SluiceSessionId::new().to_string();
+    let session_id = DiscussSessionId::new().to_string();
     prepare_subagent_parent(&persistence, &session_id).await;
     persist_subagent(
         &persistence,
@@ -5708,7 +5800,7 @@ fn discuss_team_responses_serde_roundtrip() {
 #[test]
 fn discuss_broadcast_session_ready_serde_roundtrip() {
     let broadcast = DiscussBroadcast::SessionReady {
-        sluice_session_id: SluiceSessionId::new(),
+        discuss_session_id: DiscussSessionId::new(),
     };
 
     let json = serde_json::to_value(&broadcast).expect("serialize");
@@ -5721,7 +5813,7 @@ fn discuss_broadcast_session_ready_serde_roundtrip() {
 #[test]
 fn discuss_broadcast_session_warning_serde_roundtrip() {
     let broadcast = DiscussBroadcast::SessionWarning {
-        sluice_session_id: SluiceSessionId::new(),
+        discuss_session_id: DiscussSessionId::new(),
         acp_session_id: agent_client_protocol::schema::v1::SessionId::from("acp-2"),
         warning: "missing MCP-over-ACP capability".to_string(),
     };
@@ -5742,10 +5834,10 @@ fn discuss_broadcast_session_warning_serde_roundtrip() {
 /// so a JSON **string** value must deserialize at the RPC contract boundary.
 #[test]
 fn set_config_option_accepts_string_value() {
-    let sluice_id = SluiceSessionId::new();
+    let discuss_id = DiscussSessionId::new();
     let json = serde_json::json!({
         "SetConfigOption": {
-            "sluice_session_id": sluice_id,
+            "discuss_session_id": discuss_id,
             "config_id": "model",
             "value": "gpt-4"
         }
@@ -5765,11 +5857,11 @@ fn set_config_option_accepts_string_value() {
 /// RPC contract boundary and can never reach ACP dispatch.
 #[test]
 fn set_config_option_rejects_non_string_value() {
-    let sluice_id = SluiceSessionId::new();
+    let discuss_id = DiscussSessionId::new();
     for non_string in [serde_json::json!(1), serde_json::json!(true), serde_json::json!(null)] {
         let json = serde_json::json!({
             "SetConfigOption": {
-                "sluice_session_id": sluice_id,
+                "discuss_session_id": discuss_id,
                 "config_id": "model",
                 "value": non_string.clone()
             }
@@ -6086,34 +6178,34 @@ fn dispatch_response_error_serde_roundtrip() {
     assert!(matches!(roundtripped, AcpDispatchResponsePayload::Error { .. }));
 }
 
-// ── SluiceSessionId / PermissionRequestId ───────────────────────────────
+// ── DiscussSessionId / PermissionRequestId ───────────────────────────────
 
-/// `SluiceSessionId::new()` must produce distinct UUIDs.
+/// `DiscussSessionId::new()` must produce distinct UUIDs.
 #[test]
-fn sluice_session_id_new_produces_distinct_uuids() {
-    let a = SluiceSessionId::new();
-    let b = SluiceSessionId::new();
-    assert_ne!(a, b, "two new SluiceSessionIds must be distinct");
+fn discuss_session_id_new_produces_distinct_uuids() {
+    let a = DiscussSessionId::new();
+    let b = DiscussSessionId::new();
+    assert_ne!(a, b, "two new DiscussSessionIds must be distinct");
 }
 
-/// `SluiceSessionId` must roundtrip through its string representation.
+/// `DiscussSessionId` must roundtrip through its string representation.
 #[test]
-fn sluice_session_id_string_roundtrip() {
-    let id = SluiceSessionId::new();
+fn discuss_session_id_string_roundtrip() {
+    let id = DiscussSessionId::new();
     let typed_uuid: SpectaUuid = id.0;
     assert_eq!(typed_uuid.0, id.0.0);
     let s = id.to_string();
-    let parsed: SluiceSessionId = s.parse().expect("parse");
+    let parsed: DiscussSessionId = s.parse().expect("parse");
     assert_eq!(id, parsed);
 }
 
 #[test]
-fn session_dto_keeps_sluice_identity_typed_at_the_domain_boundary() {
-    let id = SluiceSessionId::new();
+fn session_dto_keeps_discuss_identity_typed_at_the_domain_boundary() {
+    let id = DiscussSessionId::new();
     let dto = DiscussSessionInfo {
         is_task_session: false,
         team_leader_id: Some("sector-analyst".to_string()),
-        sluice_session_id: id,
+        discuss_session_id: id,
         session_name: "session".to_string(),
         agent_name: "agent".to_string(),
         acp_session_id: None,
@@ -6126,11 +6218,11 @@ fn session_dto_keeps_sluice_identity_typed_at_the_domain_boundary() {
         last_interaction_at: None,
     };
     let encoded = serde_json::to_value(&dto).expect("serialize session DTO");
-    assert_eq!(encoded["sluiceSessionId"], id.to_string());
+    assert_eq!(encoded["discussSessionId"], id.to_string());
     assert_eq!(encoded["teamLeaderId"], "sector-analyst");
     assert!(
         serde_json::from_value::<DiscussSessionInfo>(serde_json::json!({
-            "sluiceSessionId": "not-a-uuid",
+            "discussSessionId": "not-a-uuid",
             "sessionName": "session",
             "agentName": "agent"
         }))
@@ -6176,7 +6268,7 @@ fn permission_option_serde_roundtrip() {
 #[test]
 fn stream_event_agent_message_serde_roundtrip() {
     let event = DiscussStreamEvent::AgentMessage {
-        sluice_session_id: SluiceSessionId::new(),
+        discuss_session_id: DiscussSessionId::new(),
         acp_session_id: SessionId::from("acp-1"),
         payload: AcpAgentMessagePayload::StopReason {
             session_id: "acp-1".to_string(),
@@ -6198,9 +6290,9 @@ fn stream_event_agent_message_serde_roundtrip() {
 /// `DiscussStreamEvent::SessionFailed` retains the typed Discuss error.
 #[test]
 fn stream_event_session_failed_serde_roundtrip() {
-    let sluice_session_id = SluiceSessionId::new();
+    let discuss_session_id = DiscussSessionId::new();
     let event = DiscussStreamEvent::SessionFailed {
-        sluice_session_id,
+        discuss_session_id,
         error: DiscussError::ProtocolError {
             message: "adapter rejected configuration".to_string(),
         },
@@ -6213,10 +6305,10 @@ fn stream_event_session_failed_serde_roundtrip() {
     assert!(matches!(
         roundtripped,
         DiscussStreamEvent::SessionFailed {
-            sluice_session_id: roundtripped_id,
+            discuss_session_id: roundtripped_id,
             error: DiscussError::ProtocolError { .. },
             terminal_auth_methods,
-        } if roundtripped_id == sluice_session_id && terminal_auth_methods.is_empty()
+        } if roundtripped_id == discuss_session_id && terminal_auth_methods.is_empty()
     ));
 }
 

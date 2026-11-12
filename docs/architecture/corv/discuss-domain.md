@@ -61,7 +61,7 @@ For new AgentNode runs, Flow asks Discuss's actor-serialized `WorkspaceCopySourc
 
 ## Identity and stream
 
-`sluiceSessionId` is the only routing key. Five `DiscussStreamEvent` variants: `SessionFailed`, `AgentMessage`, `UtilityUpdate`, `PermissionRequested`, `ElicitationRequested`.
+`discussSessionId` is the only routing key. Five `DiscussStreamEvent` variants: `SessionFailed`, `AgentMessage`, `UtilityUpdate`, `PermissionRequested`, `ElicitationRequested`.
 
 ## Control and broadcasts
 

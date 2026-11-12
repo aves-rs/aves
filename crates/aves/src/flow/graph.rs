@@ -304,7 +304,7 @@ mod tests {
             ("OrderNode", r#""command":"submit""#),
             (
                 "AgentNode",
-                r#""providerName":"provider","agentName":"agent","prompt":"act","maxTurns":null,"maxToolCalls":null,"maxDuration":null,"configOverrides":{},"sluiceMcpEnabled":false,"workspace":null"#,
+                r#""providerName":"provider","agentName":"agent","prompt":"act","maxTurns":null,"maxToolCalls":null,"maxDuration":null,"configOverrides":{},"applicationMcpEnabled":false,"workspace":null"#,
             ),
         ] {
             assert!(

@@ -18,8 +18,8 @@ use super::elicitation::classify_elicitation_schema;
 use super::plugins::{DiscussAgentPlugin, PluginCaptureState};
 use super::types::{
     AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussElicitationAnswer, DiscussError,
-    DiscussPermissionOption, DiscussStreamEvent, DiscussUtilityPayload, DiscussUtilityUpdate, ElicitationRequestId,
-    PendingElicitation, PermissionRequestId, SluiceSessionId,
+    DiscussPermissionOption, DiscussSessionId, DiscussStreamEvent, DiscussUtilityPayload, DiscussUtilityUpdate,
+    ElicitationRequestId, PendingElicitation, PermissionRequestId,
 };
 
 /// Handles an incoming permission request from the agent.
@@ -32,7 +32,7 @@ use super::types::{
 ///
 /// The actor is responsible for:
 /// 1. Inserting the `PendingPermission` into its registry keyed by
-///    `(sluice_session_id, permission_request_id)`.
+///    `(discuss_session_id, permission_request_id)`.
 /// 2. Publishing `DiscussStreamEvent::PermissionRequested` on the stream.
 /// 3. If the stream send fails, removing the just-inserted pending entry and
 ///    resolving the provider responder as cancelled.
@@ -266,7 +266,7 @@ pub(super) enum AgentMessageForwardOutcome {
 
 pub(super) struct AgentMessageForwardContext<'a> {
     pub(super) stream_tx: &'a mpsc::Sender<DiscussStreamEvent>,
-    pub(super) sluice_session_id: SluiceSessionId,
+    pub(super) discuss_session_id: DiscussSessionId,
     pub(super) session: &'a SessionId,
     pub(super) agent_plugin: &'a dyn DiscussAgentPlugin,
     pub(super) capture_state: &'a mut PluginCaptureState,
@@ -285,7 +285,7 @@ pub(super) async fn send_message_to_user(
 ) -> Result<AgentMessageForwardOutcome, AcpCrateError> {
     let AgentMessageForwardContext {
         stream_tx,
-        sluice_session_id,
+        discuss_session_id,
         session,
         agent_plugin,
         capture_state,
@@ -312,7 +312,7 @@ pub(super) async fn send_message_to_user(
     // Forward the typed payload to Zeus via the bounded stream.
     stream_tx
         .send(DiscussStreamEvent::AgentMessage {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id: session.clone(),
             payload,
         })
@@ -323,10 +323,10 @@ pub(super) async fn send_message_to_user(
     if let Some(payload) = utility_payload {
         stream_tx
             .send(DiscussStreamEvent::UtilityUpdate {
-                sluice_session_id,
+                discuss_session_id,
                 acp_session_id: session.clone(),
                 utility: DiscussUtilityUpdate {
-                    sluice_session_id,
+                    discuss_session_id,
                     payload,
                 },
             })
@@ -632,7 +632,7 @@ mod tests {
 
     use super::super::elicitation::{DiscussRestrictedFormFieldType, sdk_to_restricted_schema};
     use super::super::types::{
-        AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussStreamEvent, SluiceSessionId,
+        AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussSessionId, DiscussStreamEvent,
     };
     use super::{
         AgentMessageForwardContext, AgentMessageForwardOutcome, AssistantTurnBuffer, PluginCaptureState,
@@ -1054,7 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_to_user_stop_reason_returns_turn_boundary() {
         let (stream_tx, mut stream_rx) = mpsc::channel(8);
-        let sluice_id = SluiceSessionId::new();
+        let discuss_id = DiscussSessionId::new();
         let session = SessionId::from("stop-session");
         let mut buffer = AssistantTurnBuffer::default();
         buffer.append_text("assistant reply");
@@ -1063,7 +1063,7 @@ mod tests {
         let outcome = send_message_to_user(
             AgentMessageForwardContext {
                 stream_tx: &stream_tx,
-                sluice_session_id: sluice_id,
+                discuss_session_id: discuss_id,
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
@@ -1086,15 +1086,15 @@ mod tests {
             other => panic!("expected TurnBoundary, got {other:?}"),
         }
 
-        // The stream event must carry the sluice_session_id and the payload.
+        // The stream event must carry the discuss_session_id and the payload.
         let event = stream_rx.recv().await.expect("stream event forwarded");
         match event {
             DiscussStreamEvent::AgentMessage {
-                sluice_session_id,
+                discuss_session_id,
                 acp_session_id,
                 payload,
             } => {
-                assert_eq!(sluice_session_id, sluice_id);
+                assert_eq!(discuss_session_id, discuss_id);
                 assert_eq!(acp_session_id, session);
                 match payload {
                     AcpAgentMessagePayload::StopReason { stop_reason, .. } => {
@@ -1117,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_to_user_empty_stop_reason_forwards_turn_boundary() {
         let (stream_tx, mut stream_rx) = mpsc::channel(8);
-        let sluice_id = SluiceSessionId::new();
+        let discuss_id = DiscussSessionId::new();
         let session = SessionId::from("empty-stop-session");
         let mut buffer = AssistantTurnBuffer::default();
         let mut capture_state = PluginCaptureState::for_plugin(super::super::plugins::for_agent("custom-agent"));
@@ -1125,7 +1125,7 @@ mod tests {
         let outcome = send_message_to_user(
             AgentMessageForwardContext {
                 stream_tx: &stream_tx,
-                sluice_session_id: sluice_id,
+                discuss_session_id: discuss_id,
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
@@ -1156,7 +1156,7 @@ mod tests {
         use agent_client_protocol::UntypedMessage;
 
         let (stream_tx, mut stream_rx) = mpsc::channel(1);
-        let sluice_id = SluiceSessionId::new();
+        let discuss_id = DiscussSessionId::new();
         let session = SessionId::from("replayed-session");
         let mut buffer = AssistantTurnBuffer::default();
         let mut capture_state = PluginCaptureState::for_plugin(super::super::plugins::for_agent("custom-agent"));
@@ -1175,7 +1175,7 @@ mod tests {
         let dispatch_outcome = send_message_to_user(
             AgentMessageForwardContext {
                 stream_tx: &stream_tx,
-                sluice_session_id: sluice_id,
+                discuss_session_id: discuss_id,
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
@@ -1191,7 +1191,7 @@ mod tests {
         let outcome = send_message_to_user(
             AgentMessageForwardContext {
                 stream_tx: &stream_tx,
-                sluice_session_id: sluice_id,
+                discuss_session_id: discuss_id,
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
@@ -1221,7 +1221,7 @@ mod tests {
         use agent_client_protocol::UntypedMessage;
 
         let (stream_tx, mut stream_rx) = mpsc::channel(8);
-        let sluice_id = SluiceSessionId::new();
+        let discuss_id = DiscussSessionId::new();
         let session = SessionId::from("dispatch-session");
 
         let notification =
@@ -1232,7 +1232,7 @@ mod tests {
         let outcome = send_message_to_user(
             AgentMessageForwardContext {
                 stream_tx: &stream_tx,
-                sluice_session_id: sluice_id,
+                discuss_session_id: discuss_id,
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
@@ -1248,8 +1248,8 @@ mod tests {
 
         let event = stream_rx.recv().await.expect("stream event forwarded");
         match event {
-            DiscussStreamEvent::AgentMessage { sluice_session_id, .. } => {
-                assert_eq!(sluice_session_id, sluice_id);
+            DiscussStreamEvent::AgentMessage { discuss_session_id, .. } => {
+                assert_eq!(discuss_session_id, discuss_id);
             }
             other => panic!("expected AgentMessage event, got {other:?}"),
         }

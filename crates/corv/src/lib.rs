@@ -4,6 +4,7 @@ mod agents;
 mod boot;
 mod config;
 mod database;
+mod discovery;
 mod domain;
 mod elicitation;
 mod handle;
@@ -30,6 +31,9 @@ mod test_library;
 use domain::{DiscussKernelServices, DiscussProviderConfigSudoServiceImpl, DiscussStreamingServiceImpl};
 
 pub use boot::{DiscussBootOptions, DiscussSettings};
+pub use discovery::{
+    DiscoveredProvider, DiscoveryOutcome, DiscoverySource, ProviderEnvironment, ProviderLaunch, discover_providers,
+};
 pub use domain::{DiscussDomain, DiscussStreamingService};
 pub use elicitation::{
     DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload,
@@ -45,20 +49,25 @@ pub use mcp_http::run_mcp;
 pub use messages::{
     AddProviderInput, AnswerElicitationInput, AnswerPermissionInput, CancelElicitationInput, CancelSessionInput,
     CancelTurnInput, ConfigOptionsOutput, DiscussBroadcast, DiscussResponse, DisposeInspectorInput,
-    GetConfigOptionsInput, GetServerStatusInput, ListProvidersInput, ListSessionsInput, LoadSessionInput,
-    NewSessionInput, ProviderRemoveSuccessOutput, ProvidersListOutput, RemoveProviderInput, RemoveSessionInput,
-    RenameSessionInput, ReserveInspectorInput, ReserveInspectorOutput, SendUserTurnInput, SessionListOutput,
-    SessionLoadOutput, SetConfigOptionInput, StartInspectorInput, StartServerInput, StopServerInput, SuccessOutput,
+    GetConfigOptionsInput, GetServerStatusInput, InstallTeamAndStartSessionInput, InstallTeamInput, InstallTeamOutput,
+    ListProvidersInput, ListSessionsInput, LoadSessionInput, NewSessionInput, ProviderRemoveSuccessOutput,
+    ProvidersListOutput, RemoveProviderInput, RemoveSessionInput, RenameSessionInput, ReserveInspectorInput,
+    ReserveInspectorOutput, SendUserTurnInput, SessionListOutput, SessionLoadOutput, SetConfigOptionInput,
+    StartInspectorInput, StartServerInput, StopServerInput, SuccessOutput,
     discuss_operation_descriptors_with_root_error, dispatch_add_provider, dispatch_get_config_options,
-    dispatch_get_server_status, dispatch_list_providers, dispatch_list_sessions, dispatch_load_session,
-    dispatch_remove_provider, dispatch_remove_session, dispatch_rename_session, dispatch_set_config_option,
-    dispatch_start_server, dispatch_stop_server, rpc_router, send_new_session,
+    dispatch_get_server_status, dispatch_install_team, dispatch_install_team_and_start_session,
+    dispatch_list_providers, dispatch_list_sessions, dispatch_load_session, dispatch_remove_provider,
+    dispatch_remove_session, dispatch_rename_session, dispatch_set_config_option, dispatch_start_server,
+    dispatch_stop_server, rpc_router, send_new_session,
 };
+pub use plugins::install_team_at_root;
 pub use types::{
-    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, AcpProvider, CleanupWarning,
-    DiscussChatTurnRecord, DiscussConfigOption, DiscussConfigOptionValue, DiscussError, DiscussMcpStatus,
-    DiscussPermissionOption, DiscussSessionInfo, DiscussSessionSetup, DiscussStreamEvent, DiscussSubagentRecord,
-    DiscussSubagentSurfaceState, DiscussTerminalAuthMethod, DiscussTodoItem, DiscussTodoSnapshot, DiscussTodoStatus,
-    DiscussUtilityPayload, DiscussUtilityUpdate, ElicitationRequestId, InspectorBinding, PermissionRequestId,
-    ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus, SluiceSessionId,
+    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, AcpProvider, AgentThemeColor,
+    CleanupWarning, DiscussChatTurnRecord, DiscussConfigOption, DiscussConfigOptionValue, DiscussError,
+    DiscussMcpStatus, DiscussMemberOverrides, DiscussPermissionOption, DiscussSessionId, DiscussSessionInfo,
+    DiscussSessionSetup, DiscussStreamEvent, DiscussSubagentRecord, DiscussSubagentSurfaceState,
+    DiscussTerminalAuthMethod, DiscussTodoItem, DiscussTodoSnapshot, DiscussTodoStatus, DiscussUtilityPayload,
+    DiscussUtilityUpdate, Effect, ElicitationRequestId, InspectorBinding, Operation, PermissionRequestId,
+    ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus, Rule, RuleSet, SessionCliLogin,
+    SessionCliTool, SessionLaunchConfig,
 };

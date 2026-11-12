@@ -21,7 +21,7 @@ references:
 
 # Aves Iroh Peer Runtime
 
-Aves owns one shared native Iroh endpoint/router (`IrohSubstrate` / `RunningIrohSubstrate`) and five ALPN slots: the Bus's generated public-operation ALPN (`BUS_ALPN = b"sluice/bus"`), Auth's first-contact ALPN (`AUTH_ALPN = b"sluice/auth"`), and the three native Iroh protocols (`iroh_blobs::protocol::ALPN`, `iroh_gossip::net::GOSSIP_ALPN`, `iroh_docs::net::ALPN`). Each pluggable surface owns a distinct concern; the substrate only owns transport lifecycle.
+Aves owns one shared native Iroh endpoint/router (`IrohSubstrate` / `RunningIrohSubstrate`) and five ALPN slots: the Bus's generated public-operation ALPN (`BUS_ALPN = b"aves_app/bus"`), Auth's first-contact ALPN (`AUTH_ALPN = b"aves_app/auth"`), and the three native Iroh protocols (`iroh_blobs::protocol::ALPN`, `iroh_gossip::net::GOSSIP_ALPN`, `iroh_docs::net::ALPN`). Each pluggable surface owns a distinct concern; the substrate only owns transport lifecycle.
 
 ## Ownership
 
@@ -34,7 +34,7 @@ Aves owns one shared native Iroh endpoint/router (`IrohSubstrate` / `RunningIroh
 
 `PeerConfig` (`crates/aves/src/auth/peer.rs`) is the sole durable peer store: a JSON file holding `peers: Vec<PeerRecord { peer: PublicKey, endpoint: PeerEndpoint, state: PeerTrustState::{Confirmed,Revoked}, updated_at }>`. `PairingCoordinator::load` reads it, enforces `record.endpoint.public_key() == record.peer`, and `persist` writes atomically via a temp file + rename.
 
-Trust is **unilateral**: each machine maintains its own `PeerConfig`; there is no transitive trust propagation. Native Iroh already authenticates the QUIC connection via `connection.remote_id()`. Sluice uses N0 discovery, so the remote machine's `EndpointId` is sufficient dialing information; persisted `EndpointAddr` metadata is learned during authenticated first contact rather than embedded in the invitation.
+Trust is **unilateral**: each machine maintains its own `PeerConfig`; there is no transitive trust propagation. Native Iroh already authenticates the QUIC connection via `connection.remote_id()`. Aves uses N0 discovery, so the remote machine's `EndpointId` is sufficient dialing information; persisted `EndpointAddr` metadata is learned during authenticated first contact rather than embedded in the invitation.
 
 `CreatePairingInvitation` returns the compact form `pair::<machine-id>::<one-time-secret>`. Auth stores only the secret's SHA-256 digest with its expiry and consumed state. `FirstContact` parses the invitation, dials its machine ID through Iroh discovery, and sends the one-time secret with `FirstContactMetadata { machine_id, endpoint, audience, refresh, invitation_secret }`. The receiving `AuthFirstContactHandler` atomically validates and consumes that secret before recording the authenticated candidate. The token admits exactly one first-contact attempt; it is not identity proof and does not grant trust. Identity remains the Iroh-authenticated `connection.remote_id()`.
 
@@ -48,7 +48,7 @@ The runtime owns no second cache: every reload rebuilds the in-memory `peers` ve
 
 ## Generated public operations over native QUIC
 
-The Bus ALPN (`BUS_ALPN = b"sluice/bus"`, `crates/aves/src/bus/remote.rs:17`) carries exactly one payload shape: `RemoteOperationRequest { qualified_operation, input, jwt }`. `RemoteOperationInstaller::for_operations` wraps the existing `DomainPublication` descriptors — privileged operations are absent — into an `IrohProtocolHandler`. `RemoteOperationRequest` is `serde_json` (limit `MAX_OPERATION_BYTES = 512 * 1024`); the reply is `RemoteOperationReply::{Success, DomainError, Rejected}`. `call<Request,Response>` (`crates/aves/src/bus/remote.rs:193`) opens a QUIC bidirectional stream on the substrate endpoint, writes the JSON, finishes the send half, and reads up to `MAX_OPERATION_BYTES` for the response. Identity is checked at the Iroh layer (`connection.remote_id() == target.id`); admission is checked at the JWT layer. The substrate's `IrohProtocolHandler` accepts raw reads up to `MAX_REQUEST_SIZE = 1024 * 1024`; the dispatch layer enforces the tighter `MAX_OPERATION_BYTES`.
+The Bus ALPN (`BUS_ALPN = b"aves_app/bus"`, `crates/aves/src/bus/remote.rs:17`) carries exactly one payload shape: `RemoteOperationRequest { qualified_operation, input, jwt }`. `RemoteOperationInstaller::for_operations` wraps the existing `DomainPublication` descriptors — privileged operations are absent — into an `IrohProtocolHandler`. `RemoteOperationRequest` is `serde_json` (limit `MAX_OPERATION_BYTES = 512 * 1024`); the reply is `RemoteOperationReply::{Success, DomainError, Rejected}`. `call<Request,Response>` (`crates/aves/src/bus/remote.rs:193`) opens a QUIC bidirectional stream on the substrate endpoint, writes the JSON, finishes the send half, and reads up to `MAX_OPERATION_BYTES` for the response. Identity is checked at the Iroh layer (`connection.remote_id() == target.id`); admission is checked at the JWT layer. The substrate's `IrohProtocolHandler` accepts raw reads up to `MAX_REQUEST_SIZE = 1024 * 1024`; the dispatch layer enforces the tighter `MAX_OPERATION_BYTES`.
 
 ## source_peer_key validated against AuthProjection.issuer
 

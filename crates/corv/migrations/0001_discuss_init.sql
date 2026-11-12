@@ -1,5 +1,5 @@
 CREATE TABLE discuss_sessions (
-    sluice_session_id           TEXT    NOT NULL PRIMARY KEY,
+    discuss_session_id           TEXT    NOT NULL PRIMARY KEY,
     agent_name                  TEXT    NOT NULL,
     session_name                TEXT    NOT NULL,
     display_title               TEXT    NULL,
@@ -19,15 +19,15 @@ CREATE INDEX idx_discuss_sessions_interaction
     ON discuss_sessions (last_interaction_at DESC);
 
 CREATE TABLE discuss_chat_turns (
-    sluice_session_id TEXT NOT NULL,
+    discuss_session_id TEXT NOT NULL,
     position          INTEGER NOT NULL,
     role              TEXT CHECK (role IN ('user', 'assistant', 'permission', 'notification', 'system', 'elicitation')),
     acp_session_id    TEXT NULL,
     content_json      TEXT NOT NULL,
     created_at        INTEGER NOT NULL,
-    PRIMARY KEY (sluice_session_id, position),
-    FOREIGN KEY (sluice_session_id)
-        REFERENCES discuss_sessions(sluice_session_id) ON DELETE CASCADE
+    PRIMARY KEY (discuss_session_id, position),
+    FOREIGN KEY (discuss_session_id)
+        REFERENCES discuss_sessions(discuss_session_id) ON DELETE CASCADE
 );
 
 CREATE TABLE discuss_agent_config (
@@ -48,7 +48,7 @@ CREATE TABLE discuss_team_installation (
 );
 
 CREATE TABLE discuss_subagents (
-    sluice_session_id    TEXT    NOT NULL,
+    discuss_session_id    TEXT    NOT NULL,
     capture_id           TEXT    NOT NULL,
     child_session_id     TEXT    NULL,
     agent_name           TEXT    NOT NULL,
@@ -56,10 +56,10 @@ CREATE TABLE discuss_subagents (
     fallback_capability  TEXT    NULL,
     surface_state        TEXT    NOT NULL CHECK (surface_state IN ('loading', 'live', 'done', 'error')),
     last_updated_at      INTEGER NOT NULL,
-    PRIMARY KEY (sluice_session_id, capture_id),
-    FOREIGN KEY (sluice_session_id)
-        REFERENCES discuss_sessions(sluice_session_id) ON DELETE CASCADE
+    PRIMARY KEY (discuss_session_id, capture_id),
+    FOREIGN KEY (discuss_session_id)
+        REFERENCES discuss_sessions(discuss_session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_discuss_subagents_retention
-    ON discuss_subagents (sluice_session_id, surface_state, last_updated_at DESC, capture_id);
+    ON discuss_subagents (discuss_session_id, surface_state, last_updated_at DESC, capture_id);

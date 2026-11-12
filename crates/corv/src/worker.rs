@@ -45,8 +45,8 @@ use super::supervisor::{
 };
 use super::types::{
     DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload, DiscussError,
-    DiscussPermissionOption, DiscussStreamEvent, DiscussUtilityPayload, DiscussUtilityUpdate, PendingPermission,
-    ProviderSessionInfo, SluiceSessionId, WorkerCommand,
+    DiscussPermissionOption, DiscussSessionId, DiscussStreamEvent, DiscussUtilityPayload, DiscussUtilityUpdate,
+    PendingPermission, ProviderSessionInfo, WorkerCommand,
 };
 
 pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -> Result<(), SessionWorkerFailure> {
@@ -76,7 +76,7 @@ pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -
             params
                 .capabilities_update_tx
                 .send((
-                    params.sluice_session_id,
+                    params.discuss_session_id,
                     SessionCapabilitiesCache::from_agent_capabilities(agent_plugin, &init_response.agent_capabilities),
                 ))
                 .await
@@ -108,8 +108,9 @@ pub(super) async fn run_connected_session(
 ) -> Result<(), agent_client_protocol::Error> {
     let setup = prepare_worker_session(&params, connection).await?;
     let WorkerSessionParams {
+        launch_config: _launch_config,
         stream_tx,
-        sluice_session_id,
+        discuss_session_id,
         auth_launch_server,
         session_name,
         agent_name,
@@ -146,7 +147,7 @@ pub(super) async fn run_connected_session(
 
     let (persistence_queue, persistence_drain) = spawn_persistence_queue(
         persistence,
-        sluice_session_id.to_string(),
+        discuss_session_id.to_string(),
         agent_name.clone(),
         session_name,
         root_context.clone(),
@@ -155,7 +156,7 @@ pub(super) async fn run_connected_session(
     let agent_plugin = plugins::for_agent(&agent_name);
     acknowledge_worker_ready(
         &persistence_queue,
-        sluice_session_id,
+        discuss_session_id,
         session.session_id(),
         &latest_config_options,
         &session_settings,
@@ -167,7 +168,7 @@ pub(super) async fn run_connected_session(
     .await?;
 
     let mut capture_state = PluginCaptureState::for_plugin(agent_plugin);
-    tracing::info!(%sluice_session_id, acp_session_id = %session.session_id(), "ACP session started and ready for a prompt");
+    tracing::info!(%discuss_session_id, acp_session_id = %session.session_id(), "ACP session started and ready for a prompt");
     let (resolved_subagent_tx, mut resolved_subagent_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     if let PluginCaptureState::OpenCode(state) = &mut capture_state {
         state.configure_db_lookup(&auth_launch_server, session.session_id(), resolved_subagent_tx);
@@ -189,7 +190,7 @@ pub(super) async fn run_connected_session(
                 handle_session_update(
                     &session,
                     &stream_tx,
-                    sluice_session_id,
+                    discuss_session_id,
                     agent_plugin,
                     &mut capture_state,
                     update?,
@@ -225,7 +226,7 @@ pub(super) async fn run_connected_session(
                 forward_resolved_subagent(
                     subagent,
                     &stream_tx,
-                    sluice_session_id,
+                    discuss_session_id,
                     session.session_id(),
                     &persistence_queue,
                 )
@@ -283,14 +284,14 @@ pub(super) async fn run_connected_session(
                             &mut agent_node_terminal_state,
                             &mut agent_node_deadline,
                             &mut agent_node_terminal,
-                            sluice_session_id,
+                            discuss_session_id,
                         )
                         .await?;
                     }
                     Some(WorkerCommand::CancelTurn { reply }) => {
                         cancel_turn(
                             &session,
-                            sluice_session_id,
+                            discuss_session_id,
                             &mut agent_node_terminal,
                             &mut buffer,
                             &persistence_queue,
@@ -443,7 +444,7 @@ async fn load_provider_session(
 )]
 async fn acknowledge_worker_ready(
     persistence_queue: &mpsc::Sender<PersistenceJob>,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     acp_session_id: &SessionId,
     latest_config_options: &[super::types::DiscussConfigOption],
     session_settings: &super::plugins::ConfigSettings,
@@ -505,7 +506,7 @@ async fn acknowledge_worker_ready(
     }
     worker_ready_tx
         .send(WorkerReady {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id: acp_session_id.clone(),
             announce_desktop_association,
             transient_connectivity,
@@ -538,7 +539,7 @@ async fn prepare_worker_session(
     connection: ConnectionTo<Agent>,
 ) -> Result<WorkerSessionSetup, agent_client_protocol::Error> {
     let (callback_tx, callback_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
-    tracing::debug!(%params.sluice_session_id, provider = %params.agent_name, cwd = %params.agents_workspace.display(), "Preparing ACP session transports");
+    tracing::debug!(%params.discuss_session_id, provider = %params.agent_name, cwd = %params.agents_workspace.display(), "Preparing ACP session transports");
     let PreparedMcpTransports {
         mcp_transport,
         mcp_shims,
@@ -548,10 +549,10 @@ async fn prepare_worker_session(
     } = prepare_mcp_transports(
         &connection,
         params.shared_mcp_capabilities,
-        params.sluice_mcp_enabled,
+        params.application_mcp_enabled,
         params.flow_mcp_endpoints.as_deref(),
         params.mcp_domains,
-        params.sluice_session_id,
+        params.discuss_session_id,
         &params.root_context,
         &params.worker_jwt,
         &params.bus_service,
@@ -562,12 +563,12 @@ async fn prepare_worker_session(
         .shared_mcp_registrations
         .as_ref()
         .filter(|_| provisioned_mcp)
-        .map(|registrations| registrations.claim(&params.agents_workspace, params.sluice_session_id));
+        .map(|registrations| registrations.claim(&params.agents_workspace, params.discuss_session_id));
     let opened = open_worker_session(
         connection,
         &params.agents_workspace,
         &params.agent_name,
-        params.sluice_session_id,
+        params.discuss_session_id,
         params.callback_router.clone(),
         params.callback_routes.clone(),
         &callback_tx,
@@ -581,7 +582,7 @@ async fn prepare_worker_session(
             persisted_config_options: params.persisted_config_options.clone(),
         },
         mcp_transport,
-        params.sluice_mcp_enabled,
+        params.application_mcp_enabled,
         provisioned_mcp,
     )
     .await?;
@@ -612,22 +613,22 @@ async fn open_worker_session(
     connection: ConnectionTo<Agent>,
     agents_workspace: &std::path::Path,
     agent_name: &str,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     callback_router: Arc<Mutex<CallbackRouter>>,
     callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
     callback_tx: &mpsc::Sender<CallbackEvent>,
     broadcast_tx: &mpsc::Sender<super::messages::DiscussResponse>,
     options: OpenConfiguredSessionOptions,
     mcp_transport: McpTransportSelection,
-    sluice_mcp_enabled: bool,
+    application_mcp_enabled: bool,
     provisioned_mcp: bool,
 ) -> Result<OpenedWorkerSession, agent_client_protocol::Error> {
     ensure_agents_workspace_dir(agents_workspace).await;
-    tracing::debug!(%sluice_session_id, provider = %agent_name, cwd = %agents_workspace.display(), mcp_servers = options.mcp_servers.len(), "Opening configured ACP session");
+    tracing::debug!(%discuss_session_id, provider = %agent_name, cwd = %agents_workspace.display(), mcp_servers = options.mcp_servers.len(), "Opening configured ACP session");
     let configured = open_configured_session(
         connection,
         agent_name,
-        CallbackRouteTarget::Chat { sluice_session_id },
+        CallbackRouteTarget::Chat { discuss_session_id },
         callback_router,
         callback_routes,
         Some(callback_tx.clone()),
@@ -636,22 +637,22 @@ async fn open_worker_session(
     .await
     .map_err(agent_client_protocol::Error::into_internal_error)?;
     let session = configured.session;
-    tracing::debug!(%sluice_session_id, acp_session_id = %session.session_id(), "ACP session configuration completed");
+    tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), "ACP session configuration completed");
     let latest_config_options = configured.config_options;
     let session_settings = configured.applied_settings;
     let supports_config_updates = configured.supports_config_updates;
     let mut capability_warning = McpAcpCapabilityWarningState::default();
-    if sluice_mcp_enabled && mcp_transport == McpTransportSelection::None {
+    if application_mcp_enabled && mcp_transport == McpTransportSelection::None {
         capability_warning
-            .publish_once(broadcast_tx, sluice_session_id, session.session_id(), agent_name)
+            .publish_once(broadcast_tx, discuss_session_id, session.session_id(), agent_name)
             .await
             .map_err(agent_client_protocol::Error::into_internal_error)?;
     }
     publish_mcp_status(
         broadcast_tx,
-        sluice_session_id,
+        discuss_session_id,
         session.session_id(),
-        mcp_status_for_transport(sluice_mcp_enabled, mcp_transport, provisioned_mcp),
+        mcp_status_for_transport(application_mcp_enabled, mcp_transport, provisioned_mcp),
     )
     .await
     .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -678,16 +679,16 @@ struct PreparedMcpTransports {
 async fn prepare_mcp_transports(
     connection: &ConnectionTo<Agent>,
     shared_mcp_capabilities: Option<(bool, bool)>,
-    sluice_mcp_enabled: bool,
+    application_mcp_enabled: bool,
     flow_mcp_endpoints: Option<&[BusMcpEndpoint]>,
     mcp_domains: fn() -> Result<Vec<DiscussMcpDomain>, DiscussError>,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     root_context: &BusRpcContext,
     worker_jwt: &Jwt,
     bus_service: &ServiceReader<dyn BusSudoService>,
 ) -> Result<PreparedMcpTransports, agent_client_protocol::Error> {
     let mcp_transport = shared_mcp_capabilities
-        .map(|(native, http)| select_mcp_transport(sluice_mcp_enabled, native, http))
+        .map(|(native, http)| select_mcp_transport(application_mcp_enabled, native, http))
         .unwrap_or(McpTransportSelection::None);
     let mut mcp_shims = Vec::new();
     let mut mcp_handlers: Vec<DynamicHandlerGuard<Agent>> = Vec::new();
@@ -697,7 +698,7 @@ async fn prepare_mcp_transports(
         for domain in mcp_domains().map_err(agent_client_protocol::Error::into_internal_error)? {
             let shim = McpAcpShim::new(
                 &domain,
-                sluice_session_id.to_string(),
+                discuss_session_id.to_string(),
                 root_context.with_jwt(worker_jwt.clone()),
                 worker_jwt.clone(),
             );
@@ -715,7 +716,7 @@ async fn prepare_mcp_transports(
         );
     } else if mcp_transport == McpTransportSelection::Http
         && let Some(service) = bus_service.get()
-        && let Ok(lease) = McpHttpLease::open(sluice_session_id.to_string(), service, worker_jwt.clone()).await
+        && let Ok(lease) = McpHttpLease::open(discuss_session_id.to_string(), service, worker_jwt.clone()).await
     {
         mcp_descriptors.extend(lease.descriptors().to_vec());
         mcp_http_lease = Some(lease);
@@ -765,7 +766,7 @@ async fn handle_send_user_turn(
 
 async fn cancel_turn(
     session: &WorkerSession,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     agent_node_terminal: &mut Option<oneshot::Sender<AgentNodeTerminalResult>>,
     buffer: &mut AssistantTurnBuffer,
     persistence_queue: &mpsc::Sender<PersistenceJob>,
@@ -774,7 +775,7 @@ async fn cancel_turn(
 ) -> Result<(), agent_client_protocol::Error> {
     if let Some(terminal) = agent_node_terminal.take() {
         let _ = terminal.send(AgentNodeTerminalResult::Failed {
-            error: DiscussError::SessionCancelled { sluice_session_id },
+            error: DiscussError::SessionCancelled { discuss_session_id },
         });
     }
     if let Some(flush) = flush_cancelled_assistant_turn(buffer)
@@ -825,17 +826,17 @@ fn handle_agent_node_deadline(
 async fn forward_resolved_subagent(
     subagent: super::types::DiscussSubagentRecord,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     acp_session_id: &SessionId,
     persistence_queue: &mpsc::Sender<PersistenceJob>,
 ) -> Result<(), agent_client_protocol::Error> {
     let payload = DiscussUtilityPayload::Subagent { subagent };
     stream_tx
         .send(DiscussStreamEvent::UtilityUpdate {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id: acp_session_id.clone(),
             utility: DiscussUtilityUpdate {
-                sluice_session_id,
+                discuss_session_id,
                 payload: payload.clone(),
             },
         })
@@ -869,9 +870,9 @@ async fn handle_agent_node_turn(
     agent_node_terminal_state: &mut AgentNodeTerminalState,
     agent_node_deadline: &mut Option<Instant>,
     agent_node_terminal: &mut Option<oneshot::Sender<AgentNodeTerminalResult>>,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
 ) -> Result<(), agent_client_protocol::Error> {
-    tracing::debug!(%sluice_session_id, acp_session_id = %session.session_id(), awaiting_turn = *awaiting_turn, "Agent task prompt command received");
+    tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), awaiting_turn = *awaiting_turn, "Agent task prompt command received");
     if !*awaiting_turn || agent_node_terminal.is_some() {
         let _ = accepted.send(Err(DiscussError::Validation {
             message: "AgentNode turn received while another turn is active".to_string(),
@@ -893,9 +894,9 @@ async fn handle_agent_node_turn(
         return Ok(());
     }
     *suppress_transcript = false;
-    tracing::debug!(%sluice_session_id, acp_session_id = %session.session_id(), "Sending Agent task prompt to ACP");
+    tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), "Sending Agent task prompt to ACP");
     session.send_prompt(text)?;
-    tracing::debug!(%sluice_session_id, acp_session_id = %session.session_id(), "Agent task prompt submitted to ACP");
+    tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), "Agent task prompt submitted to ACP");
     *awaiting_turn = false;
     *agent_node_limits = Some(limits);
     *agent_node_turns = agent_node_turns.saturating_add(1);
@@ -931,7 +932,7 @@ async fn handle_elicitation_callback(
     transient_connectivity: bool,
 ) -> Result<(), agent_client_protocol::Error> {
     let CallbackRouteTarget::Chat {
-        sluice_session_id: viewer_session_id,
+        discuss_session_id: viewer_session_id,
     } = target;
     if matches!(&request.mode, ElicitationMode::Url(_)) {
         responder.respond(CreateElicitationResponse::new(ElicitationAction::Decline))?;
@@ -951,7 +952,7 @@ async fn handle_elicitation_callback(
     let (registration_ack, registration_ack_rx) = oneshot::channel();
     if let Err(send_error) = pending_elicitation_tx
         .send(PendingElicitationRegistration {
-            sluice_session_id: viewer_session_id,
+            discuss_session_id: viewer_session_id,
             elicitation_request_id,
             pending,
             registration_ack,
@@ -972,7 +973,7 @@ async fn handle_elicitation_callback(
             let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
             let _ = pending_elicitation_cancel_tx
                 .send(PendingElicitationCancel {
-                    sluice_session_id: viewer_session_id,
+                    discuss_session_id: viewer_session_id,
                     elicitation_request_id: Some(elicitation_request_id),
                     cancellation_ack,
                 })
@@ -994,7 +995,7 @@ async fn handle_elicitation_callback(
         }
     }
     let stream_event = DiscussStreamEvent::ElicitationRequested {
-        sluice_session_id: viewer_session_id,
+        discuss_session_id: viewer_session_id,
         acp_session_id,
         elicitation_request_id,
         payload: Box::new(payload),
@@ -1003,7 +1004,7 @@ async fn handle_elicitation_callback(
         let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
         if pending_elicitation_cancel_tx
             .send(PendingElicitationCancel {
-                sluice_session_id: viewer_session_id,
+                discuss_session_id: viewer_session_id,
                 elicitation_request_id: Some(elicitation_request_id),
                 cancellation_ack,
             })
@@ -1090,14 +1091,14 @@ async fn handle_permission_callback(
     transient_connectivity: bool,
 ) -> Result<(), agent_client_protocol::Error> {
     let CallbackRouteTarget::Chat {
-        sluice_session_id: viewer_session_id,
+        discuss_session_id: viewer_session_id,
     } = target;
     let (permission_request_id, offered_option_ids, responder_rx, responder_tx) =
         prepare_permission_request(&request.session_id, &request);
     let (registration_ack, registration_ack_rx) = oneshot::channel();
     if let Err(send_error) = pending_permission_tx
         .send(PendingPermissionRegistration {
-            sluice_session_id: viewer_session_id,
+            discuss_session_id: viewer_session_id,
             permission_request_id,
             pending: PendingPermission {
                 offered_option_ids,
@@ -1131,7 +1132,7 @@ async fn handle_permission_callback(
         }
     }
     let stream_event = DiscussStreamEvent::PermissionRequested {
-        sluice_session_id: viewer_session_id,
+        discuss_session_id: viewer_session_id,
         acp_session_id: request.session_id.clone(),
         permission_request_id,
         payload: Box::new(request),
@@ -1140,7 +1141,7 @@ async fn handle_permission_callback(
         let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
         if pending_permission_cancel_tx
             .send(PendingPermissionCancel {
-                sluice_session_id: viewer_session_id,
+                discuss_session_id: viewer_session_id,
                 permission_request_id,
                 cancellation_ack,
             })
@@ -1176,7 +1177,7 @@ async fn attach_inspector(
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
     agent_plugin: &'static dyn DiscussAgentPlugin,
     attached_readers: &mut AttachedInspectorReaders,
-    viewer_session_id: SluiceSessionId,
+    viewer_session_id: DiscussSessionId,
     child_session_id: &SessionId,
 ) -> Result<(), DiscussError> {
     if attached_readers.0.contains_key(&viewer_session_id) {
@@ -1197,7 +1198,7 @@ async fn attach_inspector(
         session.connection().clone(),
         child_response,
         CallbackRouteTarget::Chat {
-            sluice_session_id: viewer_session_id,
+            discuss_session_id: viewer_session_id,
         },
         callback_router.clone(),
         callback_routes.clone(),
@@ -1213,7 +1214,7 @@ async fn attach_inspector(
                 Err(error) => {
                     let _ = stream_tx
                         .send(DiscussStreamEvent::SessionFailed {
-                            sluice_session_id: viewer_session_id,
+                            discuss_session_id: viewer_session_id,
                             error: DiscussError::from(error),
                             terminal_auth_methods: Vec::new(),
                         })
@@ -1224,7 +1225,7 @@ async fn attach_inspector(
             match send_message_to_user(
                 AgentMessageForwardContext {
                     stream_tx: &stream_tx,
-                    sluice_session_id: viewer_session_id,
+                    discuss_session_id: viewer_session_id,
                     session: child.session_id(),
                     agent_plugin,
                     capture_state: &mut capture_state,
@@ -1242,7 +1243,7 @@ async fn attach_inspector(
                 Err(error) => {
                     let _ = stream_tx
                         .send(DiscussStreamEvent::SessionFailed {
-                            sluice_session_id: viewer_session_id,
+                            discuss_session_id: viewer_session_id,
                             error: DiscussError::from(error),
                             terminal_auth_methods: Vec::new(),
                         })
@@ -1263,7 +1264,7 @@ async fn attach_inspector(
 async fn handle_session_update(
     session: &WorkerSession,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
-    sluice_session_id: SluiceSessionId,
+    discuss_session_id: DiscussSessionId,
     agent_plugin: &'static dyn DiscussAgentPlugin,
     capture_state: &mut PluginCaptureState,
     update: SessionMessage,
@@ -1280,7 +1281,7 @@ async fn handle_session_update(
     let outcome = send_message_to_user(
         AgentMessageForwardContext {
             stream_tx,
-            sluice_session_id,
+            discuss_session_id,
             session: session.session_id(),
             agent_plugin,
             capture_state,
@@ -1343,7 +1344,7 @@ async fn handle_session_update(
             *awaiting_turn = true;
             if let Some(terminal) = agent_node_terminal.take() {
                 let result = agent_node_terminal_state.finish(terminal_output);
-                tracing::info!(%sluice_session_id, acp_session_id = %session.session_id(), "Agent task turn stopped");
+                tracing::info!(%discuss_session_id, acp_session_id = %session.session_id(), "Agent task turn stopped");
                 let _ = terminal.send(result);
             }
             *agent_node_limits = None;

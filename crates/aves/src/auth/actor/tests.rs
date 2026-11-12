@@ -282,7 +282,7 @@ async fn closed_auth_sudo_surface_returns_a_typed_error_without_hanging() {
 }
 
 #[test]
-fn aves_source_has_no_hard_coded_sluice_namespace_literal() {
+fn aves_source_has_no_hard_coded_namespace_literal() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let needle = ['"', 's', 'l', 'u', 'i', 'c', 'e', '"']
         .iter()
@@ -303,7 +303,7 @@ fn aves_source_has_no_hard_coded_sluice_namespace_literal() {
 
     assert!(
         offenders.is_empty(),
-        "Aves source hard-codes the Sluice namespace: {offenders:?}"
+        "Aves source hard-codes the application namespace: {offenders:?}"
     );
 }
 

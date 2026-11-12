@@ -29,7 +29,7 @@ not permitted.
 ## Key points
 
 - One MCP tool per qualified bus op; non-privileged `#[operation]`s generate into both RPC and MCP (`mcp_eligible: true`). Privileged variants are omitted from generated descriptors.
-- Chat MCP policy is Provider-level `AcpProvider.sluice_mcp_enabled` (defaults false). Sharing a connection does not inherit descriptors or leases.
+- Chat MCP policy is Provider-level `AcpProvider.application_mcp_enabled` (defaults false). Sharing a connection does not inherit descriptors or leases.
 - `ApplicationMcpService` collates descriptors and calls the generated dispatcher with a caller-supplied `BusRpcContext`.
 
 ## Transport selection
@@ -37,7 +37,7 @@ not permitted.
 `select_mcp_transport` in `crates/corv/src/actor.rs` runs on new and loaded/reconnected sessions:
 
 ```text
-sluice_mcp_enabled=false  → None (no MCP server)
+application_mcp_enabled=false  → None (no MCP server)
 native mcp_capabilities.acp → NativeAcp (McpServer::Acp via mcp_direct.rs)
 no native ACP + http cap  → Http (loopback lease via mcp_relay.rs)
 no supported transport    → None + SessionWarning broadcast
@@ -59,13 +59,13 @@ and adds it to each bus-provided `McpServer::Http` descriptor as an
 `Authorization: Bearer <JWT>` header.
 `run_mcp` in `crates/corv/src/mcp_http.rs` serves `/mcp/{domain}` via `require_http_mcp_bearer` middleware, validates exactly one well-formed compact JWT bearer header, and forwards the extracted token as `HttpMcpBearer` in request extensions; missing, malformed, duplicated, empty, or non-compact-JWT headers are rejected with UNAUTHORIZED before bus ingress.
 
-- Loopback only; reconnect opens a fresh lease; close is bus `close_mcp`. Lease open failure keeps the ACP session alive without Sluice tools and emits a `SessionWarning`.
+- Loopback only; reconnect opens a fresh lease; close is bus `close_mcp`. Lease open failure keeps the ACP session alive without Discuss tools and emits a `SessionWarning`.
 - The worker JWT is never logged, persisted, or broadcast. Its JTI is revoked through `AuthSudoService` on every terminal path; 30-day expiry is the fallback.
 
 ### Unsupported transport
 
 When policy enables MCP but the agent advertises neither native ACP
-nor HTTP MCP capability, the session continues without Sluice tools and a
+nor HTTP MCP capability, the session continues without Corv tools and a
 `DiscussBroadcast::SessionWarning` is published once per session.
 
 ## Shared MCP core
@@ -89,7 +89,7 @@ Both transports reach the same `ApplicationMcpService` with a worker-local `BusR
 - **Do not add an external MCP endpoint.** Loopback admission is deliberate.
 - **Do not persist lease material.** Reconnect opens a fresh loopback listener.
 - **Do not bypass the shared `ApplicationMcpService`.** Both transports must dispatch through it; no parallel tool registry.
-- **Sharing a connection ≠ sharing MCP.** Chat uses Provider `sluice_mcp_enabled`. Descriptors/leases stay per-worker.
+- **Sharing a connection ≠ sharing MCP.** Chat uses Provider `application_mcp_enabled`. Descriptors/leases stay per-worker.
 - **Do not write “Discuss omitted from `mcp_publications()`."** Eligibility is per-operation.
 - **Do not add `readOnlyHint` to image tools.** The user explicitly declined that article recommendation.
 

@@ -28,8 +28,8 @@ use super::messages::{
     CancelAgentExecutionInput, CancelSessionInput, DiscussResponse, StartAgentInput, TickAgentInput,
 };
 use super::types::{
-    AgentNodeTerminalResult, AgentNodeTickResult, DiscussConfigValues, DiscussError, SluiceSessionId, TaskSessionStart,
-    WorkspaceCopySourcePort, resolve_agent_node_limits,
+    AgentNodeTerminalResult, AgentNodeTickResult, DiscussConfigValues, DiscussError, DiscussSessionId,
+    SessionLaunchConfig, TaskSessionStart, WorkspaceCopySourcePort, resolve_agent_node_limits,
 };
 
 impl Actor {
@@ -38,10 +38,11 @@ impl Actor {
     pub(super) async fn start_agent(
         &mut self,
         correlation: LifecycleCorrelation,
+        launch_config: Option<SessionLaunchConfig>,
         provider_name: String,
         agent_name: String,
         config_overrides: DiscussConfigValues,
-        sluice_mcp_enabled: bool,
+        application_mcp_enabled: bool,
         prompt: String,
         session_cwd: PathBuf,
         max_turns: Option<i64>,
@@ -61,10 +62,11 @@ impl Actor {
         let limits = resolve_agent_node_limits(max_turns, max_tool_calls, max_duration)?;
         let started = self
             .start_task_session(TaskSessionStart {
+                launch_config,
                 provider_name,
                 agent_name,
                 config_overrides,
-                sluice_mcp_enabled,
+                application_mcp_enabled,
                 prompt,
                 session_cwd: session_cwd.clone(),
                 limits,
@@ -113,7 +115,7 @@ struct AgentNodeOwnerState {
     lifecycle: Arc<dyn DiscussAgentNodeLifecycleService>,
     streaming: ServiceReader<dyn DiscussStreamingService>,
     copy_source_port: ServiceReader<WorkspaceCopySourcePort>,
-    sessions: Mutex<HashMap<NodeExecutionId, (FlowExecutionId, SluiceSessionId)>>,
+    sessions: Mutex<HashMap<NodeExecutionId, (FlowExecutionId, DiscussSessionId)>>,
 }
 
 pub(super) fn agent_node_registration(
@@ -148,7 +150,7 @@ pub(super) fn agent_node_registration(
             let correlation = context.correlation.clone();
             let execution_root = context.execution_root.clone();
             let node_token = context.node_token.clone();
-            let flow_mcp_endpoints = if configuration.sluice_mcp_enabled {
+            let flow_mcp_endpoints = if configuration.application_mcp_enabled {
                 Some(
                     context
                         .mcp_ports
@@ -246,7 +248,7 @@ pub(super) fn agent_node_registration(
                         .get()
                         .expect("Discuss streaming must be published before Flow execution")
                         .cancel_session(CancelSessionInput {
-                            sluice_session_id: session_id,
+                            discuss_session_id: session_id,
                         }),
                 )
                 .await
@@ -266,7 +268,7 @@ pub(super) fn agent_node_registration(
                 tracing::warn!(?error, "could not clear cancelled AgentNode completion");
             }
             let error = match session_id {
-                Some(sluice_session_id) => DiscussError::SessionCancelled { sluice_session_id },
+                Some(discuss_session_id) => DiscussError::SessionCancelled { discuss_session_id },
                 None => DiscussError::AgentNodeCompletionNotFound {
                     node_execution_id: correlation.node_execution_id,
                 },
@@ -340,10 +342,15 @@ fn agent_node_start_input(
     let to_limit = |value: Option<u64>| value.map(i64::try_from).transpose().map_err(owner_error);
     Ok(StartAgentInput {
         correlation,
+        launch_config: configuration
+            .launch_config
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(owner_error)?,
         provider_name: configuration.provider_name,
         agent_name: configuration.agent_name,
         config_overrides: configuration.config_overrides,
-        sluice_mcp_enabled: configuration.sluice_mcp_enabled,
+        application_mcp_enabled: configuration.application_mcp_enabled,
         prompt: configuration.prompt,
         session_cwd: agent_node_session_cwd(execution_root),
         max_turns: to_limit(configuration.max_turns)?,
@@ -364,7 +371,7 @@ fn agent_node_prompt(prompt: String, inputs: &BoundInputs) -> Result<String, Flo
     }
     let inputs_json = to_string(&inputs.as_value()).map_err(owner_error)?;
     Ok(format!(
-        "{prompt}\n\n--- Sluice task inputs ---\n```json\n{inputs_json}\n```\n--- End Sluice task inputs ---"
+        "{prompt}\n\n--- Task inputs ---\n```json\n{inputs_json}\n```\n--- End Task inputs ---"
     ))
 }
 
@@ -391,6 +398,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_node_launch_config_round_trips_and_absence_stays_absent() {
+        let mut node: AgentNodeConfig = serde_json::from_value(serde_json::json!({
+            "providerName": "opencode",
+            "agentName": "",
+            "prompt": "work",
+            "configOverrides": {},
+            "applicationMcpEnabled": false
+        }))
+        .unwrap();
+        assert!(node.launch_config.is_none());
+        let config = SessionLaunchConfig {
+            plugin_references: vec!["plugin-example".to_owned()],
+            ..Default::default()
+        };
+        config.set_on_agent_node(&mut node).unwrap();
+        let restored: AgentNodeConfig = serde_json::from_value(serde_json::to_value(node).unwrap()).unwrap();
+        let restored_config: SessionLaunchConfig = serde_json::from_value(restored.launch_config.unwrap()).unwrap();
+        assert_eq!(restored_config.plugin_references, ["plugin-example"]);
+    }
+
+    #[test]
     fn agent_node_start_uses_the_common_execution_root_as_session_cwd() {
         let execution_root = PathBuf::from("/tmp/flow-execution");
         let session_cwd = agent_node_session_cwd(execution_root.clone());
@@ -414,7 +442,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             agent_node_prompt("configured prompt".into(), &inputs).unwrap(),
-            "configured prompt\n\n--- Sluice task inputs ---\n```json\n{\"alpha\":{\"nested\":\"value\"},\"zeta\":[1,false,null]}\n```\n--- End Sluice task inputs ---"
+            "configured prompt\n\n--- Task inputs ---\n```json\n{\"alpha\":{\"nested\":\"value\"},\"zeta\":[1,false,null]}\n```\n--- End Task inputs ---"
         );
     }
 }

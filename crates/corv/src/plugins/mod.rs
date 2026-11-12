@@ -22,6 +22,7 @@ use super::library::{
 };
 use super::types::{
     DiscussConfigOption, DiscussConfigOptionValue, DiscussError, DiscussMemberOverrides, DiscussUtilityPayload,
+    SessionLaunchConfig,
 };
 
 use claude::{CLAUDE_PLUGIN_NAME, PLUGIN as CLAUDE_AGENT_PLUGIN};
@@ -310,6 +311,23 @@ pub trait DiscussAgentPlugin: Sync {
         server.clone()
     }
 
+    /// Return an isolated launch when a Team requires workspace-local assets.
+    fn team_launch_server(&self, _server: &McpServer, _workspace: &Path) -> Result<Option<McpServer>, DiscussError> {
+        Ok(None)
+    }
+
+    /// Apply explicitly supplied session configuration to a private process.
+    fn configured_launch_server(
+        &self,
+        _server: &McpServer,
+        _workspace: &Path,
+        _config: &SessionLaunchConfig,
+    ) -> Result<McpServer, DiscussError> {
+        Err(DiscussError::Validation {
+            message: "Provider does not support session launch configuration".to_string(),
+        })
+    }
+
     /// Reconcile an advertised `session/list` capability with provider-adapter
     /// compatibility knowledge.
     fn supports_session_list(&self, advertised: bool) -> bool {
@@ -547,6 +565,19 @@ pub fn resolve_team(library: AssetLibrary, leader_id: &AgentId) -> Result<&'stat
             asset_id: leader_id.to_string(),
             violation: "team definition is not registered".to_string(),
         })
+}
+
+/// Materialize a registered Team's assets under an explicit root (for example an
+/// execution workspace), without touching the central Agent workspace or any
+/// installation record. Members use default settings.
+pub fn install_team_at_root(
+    provider_name: &str,
+    library: AssetLibrary,
+    root: &Path,
+    leader_id: &AgentId,
+) -> Result<(), DiscussError> {
+    let team = resolve_team(library, leader_id)?;
+    for_agent(provider_name).install_team_with_member_overrides(library, root, team, &BTreeMap::new())
 }
 
 pub fn resolve_skill(library: AssetLibrary, skill_id: &SkillId) -> Result<&'static SkillDefinition, DiscussError> {
@@ -804,8 +835,8 @@ mod tests {
             .expect("sector analyst team");
         let customizer_team = test_library::library()
             .teams_for()
-            .find(|team| team.leader.as_ref() == "sluice-customizer")
-            .expect("Sluice customizer team");
+            .find(|team| team.leader.as_ref() == "application-customizer")
+            .expect("Application customizer team");
         // Keep the retained Team distinct from the removed Team's leader while
         // exercising retention with a Team member shared by the fixture.
         let shared_follower = equity_team
@@ -843,7 +874,7 @@ mod tests {
                 .expect("sector team installs");
             plugin
                 .install_team_with_member_overrides(library, directory.path(), customizer_team, &BTreeMap::new())
-                .expect("Sluice customizer team installs");
+                .expect("Application customizer team installs");
 
             assert_agent_materialized(&layout, directory.path(), &equity_team.leader);
             for follower in &equity_team.followers {
@@ -905,5 +936,58 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod install_team_at_root_tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn install_team_at_root_materializes_leader_and_followers_under_the_given_root_only() {
+        let library = crate::test_library::library();
+        let team = library
+            .teams_for()
+            .find(|team| !team.followers.is_empty())
+            .expect("team with follower");
+        let root = tempdir().expect("execution root");
+        let central = tempdir().expect("central workspace");
+
+        install_team_at_root("opencode", library, root.path(), &team.leader).expect("team installs at root");
+
+        let leader_path = root
+            .path()
+            .join(".opencode/agents")
+            .join(format!("{}.md", team.leader.normalized_destination()));
+        assert!(
+            leader_path.is_file(),
+            "leader must be materialized in the execution root"
+        );
+        let follower_path = root
+            .path()
+            .join(".opencode/agents")
+            .join(format!("{}.md", team.followers[0].normalized_destination()));
+        assert!(
+            follower_path.is_file(),
+            "followers must be materialized in the execution root"
+        );
+        assert!(
+            fs::read_dir(central.path())
+                .expect("central entries")
+                .next()
+                .is_none(),
+            "the central workspace must not be written"
+        );
+    }
+
+    #[test]
+    fn install_team_at_root_rejects_an_unregistered_leader() {
+        let root = tempdir().expect("execution root");
+        let missing = AgentId::new("no-such-leader").expect("canonical id");
+        assert!(install_team_at_root("opencode", crate::test_library::library(), root.path(), &missing).is_err());
     }
 }

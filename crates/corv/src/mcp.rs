@@ -200,7 +200,7 @@ where
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_03_26)
             .with_server_info(Implementation::new(self.application_name, env!("CARGO_PKG_VERSION")))
-            .with_instructions("Sluice tools")
+            .with_instructions("Application tools")
     }
 
     async fn list_tools(

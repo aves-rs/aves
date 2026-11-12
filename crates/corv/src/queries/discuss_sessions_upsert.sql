@@ -1,8 +1,8 @@
--- Upsert a Discuss session anchor keyed by `sluice_session_id`; names are metadata.
+-- Upsert a Discuss session anchor keyed by `discuss_session_id`; names are metadata.
 -- Nullable metadata accepts NULL. Callers bind final values; ACP identity is retained
 -- when absent, and task-session origin remains sticky.
 INSERT INTO discuss_sessions (
-    sluice_session_id,
+    discuss_session_id,
     agent_name,
     session_name,
     display_title,
@@ -18,7 +18,7 @@ INSERT INTO discuss_sessions (
     is_task_session
 )
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-ON CONFLICT(sluice_session_id) DO UPDATE SET
+ON CONFLICT(discuss_session_id) DO UPDATE SET
     agent_name                  = excluded.agent_name,
     session_name                = excluded.session_name,
     display_title               = excluded.display_title,

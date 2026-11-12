@@ -118,7 +118,7 @@ mod tests {
         ports.start(first).await;
         ports.start(second).await;
         let endpoint = BusMcpEndpoint {
-            server_name: "Sluice Knowledge".to_owned(),
+            server_name: "Application Knowledge - Primary".to_owned(),
             domain: "knowledge".to_owned(),
             url: "http://127.0.0.1:1234/mcp/knowledge".to_owned(),
         };

@@ -75,23 +75,23 @@ aves::domain! {
 
     outbound DiscussResponse => DiscussBroadcast {
         DiscussResponse::NewSession { session_id } => DiscussBroadcast::SessionReady {
-            sluice_session_id: session_id,
+            discuss_session_id: session_id,
         },
         DiscussResponse::SessionWarning {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id,
             warning,
         } => DiscussBroadcast::SessionWarning {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id,
             warning,
         },
         DiscussResponse::McpStatus {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id,
             status,
         } => DiscussBroadcast::McpStatus {
-            sluice_session_id,
+            discuss_session_id,
             acp_session_id,
             status,
         },

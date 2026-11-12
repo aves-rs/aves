@@ -27,13 +27,13 @@ use super::types::{ScriptNodeCompletion, TasksError};
 const QUICKJS_RUNTIME: &[u8] = include_bytes!("./runtime/qjs-wasi-reactor.wasm");
 const STDOUT_CAPACITY: usize = 64 * 1024;
 const STDERR_CAPACITY: usize = 64 * 1024;
-const GUEST_RPC_PREFIX: &str = "\u{1e}SLUICE_RPC ";
-const GUEST_OUTPUT_PREFIX: &str = "\u{1e}SLUICE_OUTPUT ";
+const GUEST_RPC_PREFIX: &str = "\u{1e}APP_RPC ";
+const GUEST_OUTPUT_PREFIX: &str = "\u{1e}APP_OUTPUT ";
 const USER_MODULE_ALIASES: &str = concat!(
-    "const __sluice_outputs = globalThis.__sluice_outputs; ",
-    "const __sluice_errors = globalThis.__sluice_errors; ",
-    "const __sluice_logs = globalThis.__sluice_logs; ",
-    "const sluice = globalThis.sluice;\n",
+    "const __application_outputs = globalThis.__application_outputs; ",
+    "const __application_errors = globalThis.__application_errors; ",
+    "const __application_logs = globalThis.__application_logs; ",
+    "const applicatiton = globalThis.application;\n",
 );
 
 #[derive(Deserialize)]
@@ -251,8 +251,8 @@ impl ScriptSandbox {
 
 fn staging_filenames(correlation: LifecycleCorrelation) -> (String, String) {
     (
-        format!(".sluice-script-{}.mjs", correlation.node_execution_id),
-        format!(".sluice-bootstrap-{}.mjs", correlation.node_execution_id),
+        format!(".application-script-{}.mjs", correlation.node_execution_id),
+        format!(".application-bootstrap-{}.mjs", correlation.node_execution_id),
     )
 }
 
@@ -516,13 +516,13 @@ fn wrapper(
 ) -> Result<String, TasksError> {
     Ok(format!(
         r#"
-globalThis.__sluice_inputs = {input};
-globalThis.__sluice_logs = {{ log: [], error: [], warn: [], info: [], debug: [] }};
-globalThis.__sluice_outputs = Object.create(null);
-globalThis.__sluice_errors = [];
+globalThis.__application_inputs = {input};
+globalThis.__application_logs = {{ log: [], error: [], warn: [], info: [], debug: [] }};
+globalThis.__application_outputs = Object.create(null);
+globalThis.__application_errors = [];
 
 const __fmt = value => typeof value === "string" ? value : JSON.stringify(value);
-const __cap = (level, ...args) => globalThis.__sluice_logs[level].push(args.map(__fmt).join(" "));
+const __cap = (level, ...args) => globalThis.__application_logs[level].push(args.map(__fmt).join(" "));
 
 globalThis.console = {{
   log: (...args) => __cap("log", ...args),
@@ -532,14 +532,14 @@ globalThis.console = {{
   debug: (...args) => __cap("debug", ...args),
 }};
 
-globalThis.sluice = Object.freeze({{
+globalThis.application = Object.freeze({{
   rpc: (operation, input) => {{
     std.out.puts({rpc_prefix} + JSON.stringify({{ operation, input }}) + "\n");
     std.out.flush();
     const line = std.in.getline();
-    if (line === null) throw new Error("Sluice RPC bridge closed");
+    if (line === null) throw new Error("Application RPC bridge closed");
     const response = JSON.parse(line);
-    if (!response.ok) throw new Error(response.error || "Sluice RPC failed");
+    if (!response.ok) throw new Error(response.error || "Application RPC failed");
     return response.value;
   }},
 }});
@@ -549,9 +549,9 @@ await Promise.resolve();
 
 std.out.puts({output_prefix} + JSON.stringify({{
   correlation: {correlation},
-  outputs: globalThis.__sluice_outputs,
-  errors: globalThis.__sluice_errors,
-  logs: globalThis.__sluice_logs,
+  outputs: globalThis.__application_outputs,
+  errors: globalThis.__application_errors,
+  logs: globalThis.__application_logs,
 }}) + "\n");
 
 std.out.flush();
@@ -843,8 +843,8 @@ mod tests {
         assert!(rendered.contains("outputs"));
         assert!(rendered.contains("errors"));
         assert!(rendered.contains("logs"));
-        assert!(rendered.contains("__sluice_inputs"));
-        assert!(rendered.contains(r#"\u001eSLUICE_OUTPUT "#));
+        assert!(rendered.contains("__application_inputs"));
+        assert!(rendered.contains(r#"\u001eAPP_OUTPUT "#));
         assert!(!rendered.contains("decisions"));
         assert!(!rendered.contains("global_errors"));
         assert!(!rendered.contains("triggered_at"));
@@ -861,7 +861,7 @@ mod tests {
                 ScriptSandbox::new().unwrap().run(
                     execution(
                         correlation,
-                        r#"__sluice_outputs.summary = "complete"; __sluice_outputs.metrics = { count: 2, values: [true, null] }; console.log("kept separate");"#,
+                        r#"__application_outputs.summary = "complete"; __application_outputs.metrics = { count: 2, values: [true, null] }; console.log("kept separate");"#,
                         100_000_000,
                         30,
                         workspace_path,
@@ -919,7 +919,7 @@ mod tests {
                 ScriptExecution::new(
                     correlation(),
                     CompiledScript::new(
-                        "const response = sluice.rpc('test.read', { value: 7 }); if (response.answer !== 42) throw new Error('wrong response'); console.log(response.answer);".to_owned(),
+                        "const response = application.rpc('test.read', { value: 7 }); if (response.answer !== 42) throw new Error('wrong response'); console.log(response.answer);".to_owned(),
                         "script.ts".to_owned(),
                     ),
                     serde_json::json!({}),
@@ -949,7 +949,7 @@ mod tests {
                 ScriptExecution::new(
                     correlation(),
                     CompiledScript::new(
-                        format!(r#"const file = std.open("inside.txt", "w"); file.puts("workspace"); file.close(); const escaped_error = {{}}; const escaped = std.open("../{outside_name}", "w", escaped_error); if (escaped !== null) {{ escaped.puts("escape"); escaped.close(); }} else {{ __sluice_errors.push(`workspace escape rejected (${{escaped_error.errno}})`); }}"#).to_owned(),
+                        format!(r#"const file = std.open("inside.txt", "w"); file.puts("workspace"); file.close(); const escaped_error = {{}}; const escaped = std.open("../{outside_name}", "w", escaped_error); if (escaped !== null) {{ escaped.puts("escape"); escaped.close(); }} else {{ __application_errors.push(`workspace escape rejected (${{escaped_error.errno}})`); }}"#).to_owned(),
                         "script.ts".to_owned(),
                     ),
                     serde_json::json!({}),
@@ -988,7 +988,7 @@ mod tests {
                 ScriptExecution::new(
                     correlation(),
                     CompiledScript::new(
-                        r#"import { value } from './helper.js'; __sluice_outputs.imported = value; Promise.resolve().then(() => { __sluice_outputs.async = 'first'; }).then(() => { __sluice_outputs.async = 'drained'; });"#.to_owned(),
+                        r#"import { value } from './helper.js'; __application_outputs.imported = value; Promise.resolve().then(() => { __application_outputs.async = 'first'; }).then(() => { __application_outputs.async = 'drained'; });"#.to_owned(),
                         "src/main.ts".to_owned(),
                     ),
                     serde_json::json!({}),

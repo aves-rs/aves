@@ -658,7 +658,7 @@ mod tests {
             }
             "OrderNode" => serde_json::json!({"command": "place"}),
             "AgentNode" => {
-                serde_json::json!({"providerName": "provider", "agentName": "agent", "prompt": "run", "maxTurns": null, "maxToolCalls": null, "maxDuration": null, "configOverrides": {}, "sluiceMcpEnabled": false, "workspace": null})
+                serde_json::json!({"providerName": "provider", "agentName": "agent", "prompt": "run", "maxTurns": null, "maxToolCalls": null, "maxDuration": null, "configOverrides": {}, "applicationMcpEnabled": false, "workspace": null})
             }
             _ => unreachable!(),
         };

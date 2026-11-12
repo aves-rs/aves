@@ -1088,7 +1088,7 @@ fn agent_definition(flow_id: FlowId, root: super::super::ast::ContentAddressedRo
                     "maxToolCalls": null,
                     "maxDuration": null,
                     "configOverrides": {},
-                    "sluiceMcpEnabled": false,
+                    "applicationMcpEnabled": false,
                     "workspace": root
                 }
             }
@@ -1132,11 +1132,28 @@ async fn actor_for_with_agent_and_retention(
     agent_copy_sources: Vec<WorkspaceSeed>,
     retention_completed_runs: u32,
 ) -> (Actor, mpsc::Sender<FlowRequest>) {
+    let (actor, tx, _broadcasts) =
+        actor_for_with_broadcasts(path, tasks, agent, agent_copy_sources, retention_completed_runs).await;
+    (actor, tx)
+}
+
+/// Same fixture as `actor_for_with_agent_and_retention`, but keeps the Flow broadcast receiver alive.
+async fn actor_for_with_broadcasts(
+    path: &std::path::Path,
+    tasks: Arc<dyn TasksLifecycleSudoService>,
+    agent: Option<Arc<TestAgent>>,
+    agent_copy_sources: Vec<WorkspaceSeed>,
+    retention_completed_runs: u32,
+) -> (
+    Actor,
+    mpsc::Sender<FlowRequest>,
+    mpsc::Receiver<super::super::messages::FlowBroadcast>,
+) {
     let options = super::super::types::FlowBootOptions::open(path.to_path_buf())
         .await
         .unwrap();
     let (tx, rx) = mpsc::channel(16);
-    let (broadcast_tx, _) = mpsc::channel(16);
+    let (broadcast_tx, broadcast_rx) = mpsc::channel(16);
     let native_fixture = NativeDocsFixture::open(path).await;
     let sync_services = native_fixture.sync_services();
     let mobility_service: Arc<dyn super::super::mobility::FlowMobilityService> = Arc::new(RejectingMobilityService);
@@ -1172,7 +1189,7 @@ async fn actor_for_with_agent_and_retention(
     )
     .await
     .unwrap();
-    (actor, tx)
+    (actor, tx, broadcast_rx)
 }
 
 #[tokio::test]
@@ -2315,6 +2332,66 @@ async fn due_cron_skips_active_flow_and_advances_cursor() {
         actor.triggers.get(&trigger.trigger_id).cloned().unwrap(),
     )
     .await;
+    actor.shutdown().await.unwrap();
+}
+
+fn saw_triggers_changed(broadcasts: &mut mpsc::Receiver<super::super::messages::FlowBroadcast>) -> bool {
+    let mut seen = false;
+    while let Ok(broadcast) = broadcasts.try_recv() {
+        seen |= matches!(broadcast, super::super::messages::FlowBroadcast::TriggersChanged);
+    }
+    seen
+}
+
+#[tokio::test]
+async fn due_cron_notifies_triggers_changed_when_active_start_is_skipped() {
+    let directory = tempfile::tempdir().unwrap();
+    let flow_id = FlowId(Uuid::new_v4());
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: std::sync::Mutex::new(None),
+    });
+    let (mut actor, _, mut broadcasts) =
+        actor_for_with_broadcasts(directory.path(), tasks.clone(), None, Vec::new(), 10).await;
+    actor.running = true;
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    actor.set_flow_enabled(flow_id, true).await.unwrap();
+    start_flow(&mut actor, flow_id).await;
+    actor.create_trigger(due_trigger(flow_id, 1)).await.unwrap();
+    while broadcasts.try_recv().is_ok() {}
+
+    let trigger_errors = actor.fire_due_triggers().await;
+    assert!(trigger_errors.is_empty());
+    assert_eq!(tasks.starts.load(Ordering::SeqCst), 1);
+    assert!(saw_triggers_changed(&mut broadcasts));
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn due_cron_notifies_triggers_changed_when_start_fails_after_cursor_advance() {
+    let directory = tempfile::tempdir().unwrap();
+    let flow_id = FlowId(Uuid::new_v4());
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: std::sync::Mutex::new(None),
+    });
+    let (mut actor, _, mut broadcasts) =
+        actor_for_with_broadcasts(directory.path(), tasks.clone(), None, Vec::new(), 10).await;
+    actor.running = true;
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    actor.set_flow_enabled(flow_id, true).await.unwrap();
+    actor.create_trigger(due_trigger(flow_id, 1)).await.unwrap();
+    while broadcasts.try_recv().is_ok() {}
+    // Dropping the in-memory definition makes admit_start fail before takeoff; the cursor is already persisted.
+    actor.definitions.remove(&flow_id);
+
+    let trigger_errors = actor.fire_due_triggers().await;
+    assert_eq!(trigger_errors.len(), 1);
+    assert_eq!(tasks.starts.load(Ordering::SeqCst), 0);
+    assert!(actor.execution.is_empty());
+    assert!(saw_triggers_changed(&mut broadcasts));
     actor.shutdown().await.unwrap();
 }
 

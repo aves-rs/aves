@@ -458,7 +458,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aves"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "aves_macros",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "aves-corv"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "aves-kea"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "aves",
  "chrono",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "aves-tyto"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-imap",
  "async-trait",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "aves_macros"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -21,7 +21,7 @@ use super::super::library::{
 };
 use super::super::types::{
     DiscussError, DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTodoItem, DiscussTodoSnapshot,
-    DiscussTodoStatus, DiscussUtilityPayload,
+    DiscussTodoStatus, DiscussUtilityPayload, SessionCliLogin, SessionLaunchConfig,
 };
 use super::{
     ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PluginCaptureState, render_skill_file, resolve_agent,
@@ -130,6 +130,189 @@ impl DiscussAgentPlugin for OpenCodePlugin {
             .env
             .push(EnvVariable::new("OPENCODE_CONFIG_DIR", directory));
         Ok(Some(McpServer::Stdio(server)))
+    }
+
+    fn configured_launch_server(
+        &self,
+        server: &McpServer,
+        workspace: &Path,
+        config: &SessionLaunchConfig,
+    ) -> Result<McpServer, DiscussError> {
+        // ACP terminal authentication is provider-wide, not a per-session CLI login.
+        if config
+            .cli_tools
+            .iter()
+            .any(|tool| tool.login == SessionCliLogin::Required)
+        {
+            return Err(DiscussError::SessionCliLoginUnsupported);
+        }
+        if !config.cli_tools.is_empty() {
+            return Err(DiscussError::SessionCliToolUnsupported);
+        }
+        if let McpServer::Stdio(provider) = server {
+            let directory = match provider
+                .env
+                .iter()
+                .rev()
+                .find(|entry| entry.name == "OPENCODE_CONFIG_DIR")
+            {
+                Some(entry) => Some(entry.value.clone()),
+                None => match std::env::var("OPENCODE_CONFIG_DIR") {
+                    Ok(value) => Some(value),
+                    Err(std::env::VarError::NotPresent) => None,
+                    Err(std::env::VarError::NotUnicode(_)) => {
+                        return Err(DiscussError::Validation {
+                            message: "OpenCode custom configuration directory is not UTF-8".to_string(),
+                        });
+                    }
+                },
+            };
+            if directory.is_some_and(|value| Path::new(&value) != workspace.join(".opencode")) {
+                return Err(DiscussError::Validation {
+                    message: "OpenCode custom configuration directory cannot be combined with Team assets".to_string(),
+                });
+            }
+        }
+        let Some(McpServer::Stdio(mut server)) = self.team_launch_server(server, workspace)? else {
+            return Err(DiscussError::Validation {
+                message: "OpenCode requires a stdio provider".to_string(),
+            });
+        };
+        if config.rule_sources.is_empty() && config.mcp_servers.is_empty() && config.plugin_references.is_empty() {
+            return Ok(McpServer::Stdio(server));
+        }
+        let inline = server
+            .env
+            .iter()
+            .rev()
+            .find(|entry| entry.name == "OPENCODE_CONFIG_CONTENT")
+            .map(|entry| Ok(Some(entry.value.clone())))
+            .unwrap_or_else(|| match std::env::var("OPENCODE_CONFIG_CONTENT") {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => Err(DiscussError::Validation {
+                    message: "OpenCode inline configuration is not UTF-8".to_string(),
+                }),
+            })?;
+        let mut content = if let Some(inline) = inline {
+            serde_json::from_str::<serde_json::Value>(&inline)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .ok_or_else(|| DiscussError::Validation {
+                    message: "OpenCode inline configuration must be a JSON object".to_string(),
+                })?
+        } else {
+            serde_json::Map::new()
+        };
+        if !config.rule_sources.is_empty() {
+            if ["permission", "permissions", "policies"]
+                .iter()
+                .any(|key| content.contains_key(*key))
+            {
+                return Err(DiscussError::Validation {
+                    message: "OpenCode inline security policy conflicts with session rules".to_string(),
+                });
+            }
+            let translation = permissions::translate(&config.rule_sources);
+            if translation.resolution.is_err() {
+                return Err(DiscussError::Validation {
+                    message: "Incomplete session rule sources".to_string(),
+                });
+            }
+            let fragment = serde_json::to_value(translation.config)?;
+            if let serde_json::Value::Object(fragment) = fragment {
+                content.extend(fragment);
+            }
+        }
+        if !config.mcp_servers.is_empty() {
+            let mut servers = serde_json::Map::new();
+            for descriptor in &config.mcp_servers {
+                let (name, value) = match descriptor {
+                    McpServer::Stdio(mcp) => {
+                        let mut command = vec![mcp.command.to_string_lossy().into_owned()];
+                        command.extend(mcp.args.iter().cloned());
+                        let environment: BTreeMap<_, _> = mcp
+                            .env
+                            .iter()
+                            .map(|entry| (entry.name.clone(), entry.value.clone()))
+                            .collect();
+                        (
+                            mcp.name.clone(),
+                            serde_json::json!({"type": "local", "command": command, "environment": environment}),
+                        )
+                    }
+                    McpServer::Http(mcp) => {
+                        let headers: BTreeMap<_, _> = mcp
+                            .headers
+                            .iter()
+                            .map(|entry| (entry.name.clone(), entry.value.clone()))
+                            .collect();
+                        (
+                            mcp.name.clone(),
+                            serde_json::json!({"type": "remote", "url": mcp.url, "headers": headers}),
+                        )
+                    }
+                    _ => {
+                        return Err(DiscussError::Validation {
+                            message: "Unsupported OpenCode MCP transport".to_string(),
+                        });
+                    }
+                };
+                if servers.insert(name, value).is_some() {
+                    return Err(DiscussError::Validation {
+                        message: "Duplicate session MCP server name".to_string(),
+                    });
+                }
+            }
+            let mcp = content
+                .entry("mcp".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            let mcp = mcp
+                .as_object_mut()
+                .ok_or_else(|| DiscussError::Validation {
+                    message: "Unsupported OpenCode inline MCP configuration".to_string(),
+                })?;
+            let existing = mcp
+                .entry("servers".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            let existing = existing
+                .as_object_mut()
+                .ok_or_else(|| DiscussError::Validation {
+                    message: "Unsupported OpenCode inline MCP servers".to_string(),
+                })?;
+            for (name, value) in servers {
+                if existing.contains_key(&name) {
+                    return Err(DiscussError::Validation {
+                        message: "OpenCode inline MCP server conflicts with session server".to_string(),
+                    });
+                }
+                existing.insert(name, value);
+            }
+        }
+        if !config.plugin_references.is_empty() {
+            let plugins = content
+                .entry("plugins".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            let plugins = plugins
+                .as_array_mut()
+                .ok_or_else(|| DiscussError::Validation {
+                    message: "Unsupported OpenCode inline plugins configuration".to_string(),
+                })?;
+            for reference in &config.plugin_references {
+                let value = serde_json::Value::String(reference.clone());
+                if !plugins.contains(&value) {
+                    plugins.push(value);
+                }
+            }
+        }
+        server
+            .env
+            .retain(|entry| entry.name != "OPENCODE_CONFIG_CONTENT");
+        server.env.push(EnvVariable::new(
+            "OPENCODE_CONFIG_CONTENT",
+            serde_json::to_string(&content)?,
+        ));
+        Ok(McpServer::Stdio(server))
     }
 
     // Source-verified OpenCode contracts: `todowrite` accepts `{ todos }`, and
@@ -736,6 +919,164 @@ mod tests {
             panic!("expected stdio")
         };
         assert!(original.env.is_empty());
+    }
+
+    #[test]
+    fn configured_launch_does_not_invent_permissions() {
+        let workspace = tempdir().unwrap();
+        let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));
+        let config = SessionLaunchConfig {
+            plugin_references: vec!["example-plugin".to_string()],
+            mcp_servers: vec![McpServer::Stdio(McpServerStdio::new("example", "server"))],
+            ..Default::default()
+        };
+        let McpServer::Stdio(server) = PLUGIN
+            .configured_launch_server(&original, workspace.path(), &config)
+            .unwrap()
+        else {
+            panic!("expected stdio");
+        };
+        let content = &server
+            .env
+            .iter()
+            .find(|entry| entry.name == "OPENCODE_CONFIG_CONTENT")
+            .unwrap()
+            .value;
+        let content: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert!(content.get("permissions").is_none());
+        assert!(content.get("policies").is_none());
+        assert_eq!(content["plugins"][0], "example-plugin");
+        assert_eq!(content["mcp"]["servers"]["example"]["command"][0], "server");
+    }
+
+    #[test]
+    fn configured_launch_keeps_empty_overlay_inline_content() {
+        let workspace = tempdir().unwrap();
+        let mut provider = McpServerStdio::new("OpenCode", "opencode");
+        let original = r#"{"permission":{"edit":"deny"},"theme":"night"}"#;
+        provider
+            .env
+            .push(EnvVariable::new("OPENCODE_CONFIG_CONTENT", original));
+        let McpServer::Stdio(server) = PLUGIN
+            .configured_launch_server(
+                &McpServer::Stdio(provider),
+                workspace.path(),
+                &SessionLaunchConfig::default(),
+            )
+            .unwrap()
+        else {
+            panic!("expected stdio")
+        };
+        assert!(
+            server
+                .env
+                .iter()
+                .any(|entry| entry.name == "OPENCODE_CONFIG_CONTENT" && entry.value == original)
+        );
+        assert!(
+            server
+                .env
+                .iter()
+                .any(|entry| entry.name == "OPENCODE_CONFIG_DIR")
+        );
+    }
+
+    #[test]
+    fn configured_launch_merges_inline_content_and_rejects_policy_conflict() {
+        let workspace = tempdir().unwrap();
+        let mut provider = McpServerStdio::new("OpenCode", "opencode");
+        provider.env.push(EnvVariable::new("OPENCODE_CONFIG_CONTENT", r#"{"permission":{"edit":"deny"},"theme":"night","plugins":["old"],"mcp":{"servers":{"old":{"type":"local"}}}}"#));
+        let server = McpServer::Stdio(provider);
+        let config = SessionLaunchConfig {
+            plugin_references: vec!["new".to_string()],
+            mcp_servers: vec![McpServer::Stdio(McpServerStdio::new("new", "server"))],
+            ..Default::default()
+        };
+        let McpServer::Stdio(launch) = PLUGIN
+            .configured_launch_server(&server, workspace.path(), &config)
+            .unwrap()
+        else {
+            panic!("expected stdio")
+        };
+        let inline = &launch
+            .env
+            .iter()
+            .find(|entry| entry.name == "OPENCODE_CONFIG_CONTENT")
+            .unwrap()
+            .value;
+        let content: serde_json::Value = serde_json::from_str(inline).unwrap();
+        assert_eq!(content["permission"]["edit"], "deny");
+        assert_eq!(content["theme"], "night");
+        assert_eq!(content["plugins"], serde_json::json!(["old", "new"]));
+        assert!(content["mcp"]["servers"].get("old").is_some());
+        assert!(content["mcp"]["servers"].get("new").is_some());
+        let conflicting = SessionLaunchConfig {
+            rule_sources: vec![Default::default()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            PLUGIN.configured_launch_server(&server, workspace.path(), &conflicting),
+            Err(DiscussError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn configured_launch_denies_omitted_operations_from_partial_rules() {
+        use crate::types::{Effect, Operation, Rule, RuleSet};
+
+        let workspace = tempdir().unwrap();
+        let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));
+        let config = SessionLaunchConfig {
+            rule_sources: vec![RuleSet {
+                rules: vec![Rule {
+                    operation: Operation::Read,
+                    effect: Effect::Allow,
+                }],
+            }],
+            ..Default::default()
+        };
+        let McpServer::Stdio(server) = PLUGIN
+            .configured_launch_server(&original, workspace.path(), &config)
+            .expect("partial rule sources launch")
+        else {
+            panic!("expected stdio");
+        };
+        let content = &server
+            .env
+            .iter()
+            .find(|entry| entry.name == "OPENCODE_CONFIG_CONTENT")
+            .unwrap()
+            .value;
+        let content: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(content["permissions"][1]["action"], "read");
+        assert_eq!(content["permissions"][1]["effect"], "allow");
+        assert_eq!(content["permissions"][2]["action"], "edit");
+        assert_eq!(content["permissions"][2]["effect"], "deny");
+        assert_eq!(content["permissions"][3]["action"], "shell");
+        assert_eq!(content["permissions"][3]["effect"], "deny");
+    }
+
+    #[test]
+    fn configured_launch_rejects_explicit_cli_tools_without_exposing_credentials() {
+        use super::super::super::types::SessionCliTool;
+
+        let workspace = tempdir().unwrap();
+        let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));
+        for (login, expected_login_error) in [(SessionCliLogin::None, false), (SessionCliLogin::Required, true)] {
+            let config = SessionLaunchConfig {
+                cli_tools: vec![SessionCliTool {
+                    command: "example".into(),
+                    login,
+                }],
+                ..Default::default()
+            };
+            let result = PLUGIN.configured_launch_server(&original, workspace.path(), &config);
+            assert!(match result {
+                Err(DiscussError::SessionCliLoginUnsupported) => expected_login_error,
+                Err(DiscussError::SessionCliToolUnsupported) => !expected_login_error,
+                _ => false,
+            });
+        }
     }
 
     #[test]

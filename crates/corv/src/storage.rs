@@ -6,7 +6,7 @@ use aves::utils::database::{DatabaseError, connect_database};
 
 use super::types::{
     ConfigSettings, DiscussConfigOption, DiscussError, DiscussSessionId, DiscussSubagentRecord,
-    DiscussSubagentSurfaceState,
+    DiscussSubagentSurfaceState, SessionLaunchConfig,
 };
 
 pub const DISCUSS_SESSIONS_UPSERT_SQL: &str = include_str!("queries/discuss_sessions_upsert.sql");
@@ -15,7 +15,9 @@ pub const DISCUSS_SESSIONS_TODO_SNAPSHOT_UPDATE_SQL: &str = include_str!("querie
 pub const DISCUSS_SESSIONS_LOAD_REFRESH_SQL: &str = include_str!("queries/discuss_sessions_load_refresh.sql");
 pub const DISCUSS_SESSIONS_LIST_RECENT_SQL: &str = include_str!("queries/discuss_sessions_list_recent.sql");
 pub const DISCUSS_SESSIONS_LOAD_SQL: &str = include_str!("queries/discuss_sessions_load.sql");
+const DISCUSS_SESSIONS_SETUP_KIND_SQL: &str = include_str!("queries/discuss_sessions_setup_kind.sql");
 const DISCUSS_SESSIONS_LAUNCH_CONTEXT_SQL: &str = include_str!("queries/discuss_sessions_launch_context.sql");
+const DISCUSS_SESSIONS_LAUNCH_CONFIG_SQL: &str = include_str!("queries/discuss_sessions_launch_config.sql");
 pub const DISCUSS_SESSIONS_DELETE_SQL: &str = include_str!("queries/session_delete.sql");
 pub const DISCUSS_SESSIONS_RENAME_SQL: &str = include_str!("queries/discuss_sessions_rename.sql");
 pub const DISCUSS_CHAT_TURNS_INSERT_SQL: &str = include_str!("queries/discuss_chat_turns_insert.sql");
@@ -43,6 +45,8 @@ pub struct DiscussSessionRow {
     pub(super) is_task_session: bool,
     pub(super) session_cwd_json: Option<String>,
     pub(super) session_mcp_enabled: Option<i64>,
+    pub(super) session_launch_config_json: Option<String>,
+    pub(super) session_setup_kind: Option<String>,
     pub(super) team_leader_id: Option<String>,
     pub(super) discuss_session_id: String,
     pub(super) agent_name: String,
@@ -323,6 +327,35 @@ pub(super) async fn update_session_launch_context(
     conn.execute(
         DISCUSS_SESSIONS_LAUNCH_CONTEXT_SQL,
         (session_id.to_string(), cwd_json, mcp_enabled.map(i64::from)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Persist the restorable setup kind (for example a Team materialized at the session root).
+pub(super) async fn update_session_setup_kind(
+    conn: &Connection,
+    session_id: &str,
+    setup_kind: Option<&str>,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        DISCUSS_SESSIONS_SETUP_KIND_SQL,
+        (session_id.to_string(), setup_kind.map(str::to_string)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Persist the explicitly supplied launch configuration on an existing anchor.
+pub(super) async fn update_session_launch_config(
+    conn: &Connection,
+    session_id: &str,
+    launch_config: Option<&SessionLaunchConfig>,
+) -> Result<(), DiscussError> {
+    let launch_config_json = launch_config.map(serde_json::to_string).transpose()?;
+    conn.execute(
+        DISCUSS_SESSIONS_LAUNCH_CONFIG_SQL,
+        (session_id.to_string(), launch_config_json),
     )
     .await?;
     Ok(())
@@ -632,6 +665,8 @@ fn decode_discuss_session_row(row: &turso::Row) -> Result<DiscussSessionRow, Dis
         is_task_session: row_get::<i64>(row, 13, "discuss_sessions.is_task_session")? != 0,
         session_cwd_json: row_get(row, 14, "discuss_sessions.session_cwd_json")?,
         session_mcp_enabled: row_get(row, 15, "discuss_sessions.session_mcp_enabled")?,
+        session_launch_config_json: row_get(row, 16, "discuss_sessions.session_launch_config_json")?,
+        session_setup_kind: row_get(row, 17, "discuss_sessions.session_setup_kind")?,
         team_leader_id: row_get::<Option<String>>(row, 12, "discuss_sessions.team_leader_id")?,
         discuss_session_id: row_get::<String>(row, 0, "discuss_sessions.discuss_session_id")?,
         agent_name: row_get::<String>(row, 1, "discuss_sessions.agent_name")?,

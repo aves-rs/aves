@@ -16,6 +16,8 @@ SELECT
     team_leader_id,
     is_task_session,
     session_cwd_json,
-    session_mcp_enabled
+    session_mcp_enabled,
+    session_launch_config_json,
+    session_setup_kind
 FROM discuss_sessions
 ORDER BY last_interaction_at DESC NULLS LAST

@@ -183,6 +183,9 @@ pub struct AgentNodeConfig {
     pub max_duration_secs: Option<u64>,
     /// Sparse Provider/Agent configuration overrides.
     pub config_overrides: BTreeMap<String, String>,
+    /// Provider-owned session launch configuration, validated by the node owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_config: Option<Value>,
     /// Whether the session may receive the applicatiton's consolidated MCP tools.
     pub application_mcp_enabled: bool,
     /// Immutable workspace root materialized as the session CWD by Flow.

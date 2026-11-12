@@ -34,7 +34,7 @@ use aves::utils::database::{
 use aves::utils::test_support::{MockBus, reply_with};
 use aves::utils::uuid::SpectaUuid;
 
-use super::super::boot::DiscussBootOptions;
+use super::super::boot::{DiscussBootOptions, DiscussSettings};
 use super::super::library::AgentId;
 use super::super::migration::MIGRATIONS as DISCUSS_MIGRATIONS;
 use super::super::sessions::dedupe_session_list;
@@ -205,6 +205,48 @@ async fn inspector_reader_reap_aborts_then_awaits_the_reader() {
 fn make_local_mcp_server(cmd: &str) -> AcpProvider {
     let server = McpServerStdio::new(cmd, "/bin/sh").args(vec!["-c".to_string(), format!("sleep 60 # {cmd}")]);
     AcpProvider::from(McpServer::Stdio(server))
+}
+
+#[test]
+fn legacy_provider_mcp_setting_round_trips_as_canonical_config() {
+    for enabled in [true, false] {
+        let legacy = json!({
+            "agents": {
+                "example": {
+                    "type": "acp",
+                    "serverId": "server-1",
+                    "name": "Original server",
+                    "sluice_mcp_enabled": enabled,
+                    "default_session_config": {
+                        "model": "careful",
+                        "options": {"reasoning": "high", "temperature": 0.2}
+                    },
+                    "workspace_copy_sources": ["notes"]
+                }
+            }
+        });
+        let settings: DiscussSettings = serde_json::from_value(legacy).expect("legacy Discuss settings");
+        assert_eq!(settings.agents["example"].application_mcp_enabled(), enabled);
+
+        let canonical = serde_json::to_value(&settings).expect("canonical Discuss settings");
+        let provider = &canonical["agents"]["example"];
+        assert_eq!(provider["application_mcp_enabled"], enabled);
+        assert!(provider.get("sluice_mcp_enabled").is_none());
+        assert_eq!(provider["type"], "acp");
+        assert_eq!(provider["serverId"], "server-1");
+        assert_eq!(provider["name"], "Original server");
+        assert_eq!(provider["workspace_copy_sources"], json!(["notes"]));
+        assert_eq!(
+            provider["default_session_config"],
+            json!({
+                "model": "careful",
+                "options": {"reasoning": "high", "temperature": 0.2}
+            })
+        );
+
+        let reread: DiscussSettings = serde_json::from_value(canonical).expect("canonical Discuss settings");
+        assert_eq!(reread.agents["example"].application_mcp_enabled(), enabled);
+    }
 }
 
 #[test]

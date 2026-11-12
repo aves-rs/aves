@@ -37,6 +37,8 @@ pub enum DiscussRequestPayload {
     #[privileged(reason = "AgentNode lifecycle is admitted only from Aves Flow")]
     StartAgent {
         correlation: LifecycleCorrelation,
+        #[serde(default)]
+        launch_config: Option<SessionLaunchConfig>,
         provider_name: String,
         agent_name: String,
         config_overrides: DiscussConfigValues,
@@ -224,6 +226,27 @@ pub enum DiscussRequestPayload {
         session_cwd: Option<PathBuf>,
         /// Override application MCP for this session; absent uses the Provider default.
         #[serde(default)]
+        application_mcp_enabled: Option<bool>,
+    },
+
+    /// Install a Team and resolve a new session in one serialized actor request.
+    #[operation(name = "installTeamAndStartSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    InstallTeamAndStartSession {
+        /// Team leader to install and use for the session.
+        leader_id: String,
+        /// Exact installed Provider identifier.
+        provider_name: String,
+        /// Caller-generated session identity.
+        discuss_session_id: DiscussSessionId,
+        /// Session setup, which must identify the Team being installed.
+        setup: DiscussSessionSetup,
+        /// Human-readable session name.
+        session_name: Option<String>,
+        /// Optional session-specific launch inputs.
+        launch_config: Option<SessionLaunchConfig>,
+        /// Optional execution directory.
+        session_cwd: Option<PathBuf>,
+        /// Session-specific application MCP selection.
         application_mcp_enabled: Option<bool>,
     },
 

@@ -29,7 +29,7 @@ use super::messages::{
 };
 use super::types::{
     AgentNodeTerminalResult, AgentNodeTickResult, DiscussConfigValues, DiscussError, DiscussSessionId,
-    TaskSessionStart, WorkspaceCopySourcePort, resolve_agent_node_limits,
+    SessionLaunchConfig, TaskSessionStart, WorkspaceCopySourcePort, resolve_agent_node_limits,
 };
 
 impl Actor {
@@ -38,6 +38,7 @@ impl Actor {
     pub(super) async fn start_agent(
         &mut self,
         correlation: LifecycleCorrelation,
+        launch_config: Option<SessionLaunchConfig>,
         provider_name: String,
         agent_name: String,
         config_overrides: DiscussConfigValues,
@@ -61,7 +62,7 @@ impl Actor {
         let limits = resolve_agent_node_limits(max_turns, max_tool_calls, max_duration)?;
         let started = self
             .start_task_session(TaskSessionStart {
-                launch_config: None,
+                launch_config,
                 provider_name,
                 agent_name,
                 config_overrides,
@@ -341,6 +342,11 @@ fn agent_node_start_input(
     let to_limit = |value: Option<u64>| value.map(i64::try_from).transpose().map_err(owner_error);
     Ok(StartAgentInput {
         correlation,
+        launch_config: configuration
+            .launch_config
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(owner_error)?,
         provider_name: configuration.provider_name,
         agent_name: configuration.agent_name,
         config_overrides: configuration.config_overrides,
@@ -390,6 +396,27 @@ fn owner_error(source: impl Error + Send + Sync + 'static) -> FlowAdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_node_launch_config_round_trips_and_absence_stays_absent() {
+        let mut node: AgentNodeConfig = serde_json::from_value(serde_json::json!({
+            "providerName": "opencode",
+            "agentName": "",
+            "prompt": "work",
+            "configOverrides": {},
+            "applicationMcpEnabled": false
+        }))
+        .unwrap();
+        assert!(node.launch_config.is_none());
+        let config = SessionLaunchConfig {
+            plugin_references: vec!["plugin-example".to_owned()],
+            ..Default::default()
+        };
+        config.set_on_agent_node(&mut node).unwrap();
+        let restored: AgentNodeConfig = serde_json::from_value(serde_json::to_value(node).unwrap()).unwrap();
+        let restored_config: SessionLaunchConfig = serde_json::from_value(restored.launch_config.unwrap()).unwrap();
+        assert_eq!(restored_config.plugin_references, ["plugin-example"]);
+    }
 
     #[test]
     fn agent_node_start_uses_the_common_execution_root_as_session_cwd() {

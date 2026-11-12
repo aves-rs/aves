@@ -31,14 +31,15 @@ use super::storage::{
     DiscussSessionRow, ElicitationPersistenceInput, LoadedSessionRefresh, delete_discuss_session,
     list_recent_discuss_sessions, load_discuss_agent_config, load_discuss_chat_turns_window, load_discuss_session,
     load_discuss_subagents, load_discuss_team_installation, merge_refresh_discuss_session, present_acp_session_id,
-    provider_updated_at_ms, rename_discuss_session, update_session_launch_context, upsert_discuss_agent_config,
+    provider_updated_at_ms, rename_discuss_session, update_session_launch_config, update_session_launch_context,
+    update_session_setup_kind, upsert_discuss_agent_config,
 };
 use super::supervisor::{CallbackRouter, ProviderSupervisor, ProviderSupervisorResources};
 use super::types::{
     AcpProvider, ConfigSettings, DiscussChatTurnRecord, DiscussConfigOption, DiscussElicitationAnswer, DiscussError,
     DiscussMemberOverrides, DiscussPermissionOption, DiscussSessionId, DiscussSessionInfo, DiscussSessionSetup,
     DiscussStreamEvent, ElicitationRequestId, InspectorBinding, PendingElicitation, PermissionRequestId,
-    TaskSessionStarted, WorkerCommand, WorkerEntry,
+    SessionLaunchConfig, TaskSessionStarted, WorkerCommand, WorkerEntry,
 };
 
 impl Actor {
@@ -231,6 +232,12 @@ impl Actor {
             .and_then(|row| row.session_cwd_json.as_deref())
             .map(serde_json::from_str::<PathBuf>)
             .transpose()?;
+        let launch_config = stored_launch
+            .as_ref()
+            .and_then(|row| row.session_launch_config_json.as_deref())
+            .map(serde_json::from_str::<SessionLaunchConfig>)
+            .transpose()?
+            .or(launch_config);
         let session_cwd = stored_cwd.or(session_cwd);
         let requested_application_mcp_enabled = stored_launch
             .as_ref()
@@ -242,7 +249,7 @@ impl Actor {
             next_turn_position,
             persisted_config_options,
             mut session_settings,
-            team_leader_id,
+            restored_setup,
         ) = if transient_connectivity {
             (false, 0, Vec::new(), ConfigSettings::new(), None)
         } else if reconnect_acp_session_id.is_some() {
@@ -267,25 +274,33 @@ impl Actor {
                 next_position,
                 persisted_config_options,
                 session_settings,
-                row.and_then(|row| row.team_leader_id),
+                row.as_ref().and_then(Self::restored_team_setup),
             )
         } else {
             (false, 0, Vec::new(), ConfigSettings::new(), None)
         };
+        // Resolve the restored setup before choosing the launch: a root-materialized Team
+        // needs an isolated launch configured against its restored session root, even when
+        // the caller supplied no launch config.
+        let setup = if reconnect_acp_session_id.is_some() {
+            restored_setup
+        } else {
+            setup
+        };
         let plugin = plugins::for_agent(key);
         let mut launch_server = plugin.launch_server(agent_spec.server());
-        let team_requested = if reconnect_acp_session_id.is_some() {
-            team_leader_id.is_some()
-        } else {
-            matches!(&setup, Some(DiscussSessionSetup::Team { .. }))
-        };
-        let isolated_team = if team_requested {
-            if let Some(team_server) = plugin.team_launch_server(&launch_server, &self.agents_workspace)? {
-                launch_server = team_server;
-                true
-            } else {
-                false
+        let root_default_config = SessionLaunchConfig::default();
+        let launch_workspace = Self::launch_workspace(setup.as_ref(), session_cwd.as_ref(), &self.agents_workspace)?;
+        let launch_inputs = match launch_config.as_ref() {
+            Some(config) => Some((config, launch_workspace)),
+            None if matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. })) => {
+                Some((&root_default_config, launch_workspace))
             }
+            None => None,
+        };
+        let isolated_configured = if let Some((config, workspace)) = launch_inputs {
+            launch_server = plugin.configured_launch_server(&launch_server, workspace, config)?;
+            true
         } else {
             false
         };
@@ -293,7 +308,7 @@ impl Actor {
         let (callback_router, callback_routes, shared_connection, shared_mcp_capabilities, shared_mcp_registrations) =
             self.provider_supervisors
                 .get(key)
-                .filter(|_| !isolated_team)
+                .filter(|_| !isolated_configured)
                 .and_then(|supervisor| match &supervisor.resources {
                     ProviderSupervisorResources::Shared {
                         connection: Some(connection),
@@ -325,11 +340,7 @@ impl Actor {
                 .unwrap_or(configured_defaults)
         };
         drop(conn);
-        let setup = if reconnect_acp_session_id.is_some() {
-            team_leader_id.map(|leader_id| DiscussSessionSetup::Team { leader_id })
-        } else {
-            setup
-        };
+        let persisted_setup_kind = Self::setup_kind_for(setup.as_ref());
         let (assigned_agent_name, setup_settings) = self.resolve_session_setup(key, setup).await?;
         if reconnect_acp_session_id.is_none() {
             session_settings.extend(setup_settings);
@@ -359,6 +370,8 @@ impl Actor {
                 requested_application_mcp_enabled,
             )
             .await?;
+            update_session_launch_config(&conn, &discuss_session_id.to_string(), launch_config.as_ref()).await?;
+            update_session_setup_kind(&conn, &discuss_session_id.to_string(), persisted_setup_kind).await?;
         }
         let application_mcp_enabled =
             requested_application_mcp_enabled.unwrap_or_else(|| agent_spec.application_mcp_enabled());
@@ -477,6 +490,37 @@ impl Actor {
         Ok(DiscussResponse::Success)
     }
 
+    /// Workspace a launch is configured against. A root-materialized Team must launch from its
+    /// restored session root and never falls back to the central homebase; other launches keep the homebase.
+    fn launch_workspace<'a>(
+        setup: Option<&DiscussSessionSetup>,
+        session_cwd: Option<&'a PathBuf>,
+        homebase: &'a PathBuf,
+    ) -> Result<&'a PathBuf, DiscussError> {
+        match (setup, session_cwd) {
+            (Some(DiscussSessionSetup::TeamAtRoot { .. }), Some(root)) => Ok(root),
+            (Some(DiscussSessionSetup::TeamAtRoot { leader_id }), None) => Err(DiscussError::Validation {
+                message: format!("Team `{leader_id}` has no execution root to launch from"),
+            }),
+            _ => Ok(homebase),
+        }
+    }
+
+    /// Setup kind persisted beside the anchor; only the root-materialized Team needs restoring.
+    fn setup_kind_for(setup: Option<&DiscussSessionSetup>) -> Option<&'static str> {
+        matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. })).then_some("team_at_root")
+    }
+
+    /// Rebuild the Team setup from an anchor row, preserving the root-materialized variant.
+    fn restored_team_setup(row: &DiscussSessionRow) -> Option<DiscussSessionSetup> {
+        let leader_id = row.team_leader_id.clone()?;
+        Some(if row.session_setup_kind.as_deref() == Some("team_at_root") {
+            DiscussSessionSetup::TeamAtRoot { leader_id }
+        } else {
+            DiscussSessionSetup::Team { leader_id }
+        })
+    }
+
     pub(super) async fn resolve_session_setup(
         &self,
         provider_name: &str,
@@ -485,6 +529,7 @@ impl Actor {
         match setup {
             None => Ok((None, ConfigSettings::new())),
             Some(DiscussSessionSetup::Provider { config_overrides }) => Ok((None, config_overrides)),
+            Some(DiscussSessionSetup::TeamAtRoot { leader_id }) => Ok((Some(leader_id), ConfigSettings::new())),
             Some(DiscussSessionSetup::Team { leader_id }) => {
                 let conn = self.persistence.acquire_connection().await?;
                 let Some(installation) = load_discuss_team_installation(&conn, &leader_id).await? else {
@@ -1557,4 +1602,156 @@ pub(super) fn dedupe_session_list(sessions: Vec<DiscussSessionInfo>) -> Vec<Disc
     }
 
     out
+}
+
+#[cfg(test)]
+mod team_at_root_setup_tests {
+    use super::*;
+    use crate::storage::DiscussSessionRow;
+
+    fn row(team_leader_id: Option<&str>, setup_kind: Option<&str>) -> DiscussSessionRow {
+        DiscussSessionRow {
+            is_task_session: false,
+            session_cwd_json: None,
+            session_mcp_enabled: None,
+            session_launch_config_json: None,
+            session_setup_kind: setup_kind.map(str::to_string),
+            team_leader_id: team_leader_id.map(str::to_string),
+            discuss_session_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            agent_name: "opencode".to_string(),
+            session_name: "ticket".to_string(),
+            acp_session_id: None,
+            display_title: None,
+            last_user_prompt: None,
+            latest_todo_snapshot_json: None,
+            latest_config_options_json: None,
+            config_settings_json: None,
+            available_commands_json: None,
+            first_prompt_at: None,
+            last_interaction_at: None,
+        }
+    }
+
+    #[test]
+    fn only_root_materialized_team_persists_a_setup_kind() {
+        let leader = "chief-of-staff".to_string();
+        assert_eq!(
+            Actor::setup_kind_for(Some(&DiscussSessionSetup::TeamAtRoot {
+                leader_id: leader.clone()
+            })),
+            Some("team_at_root")
+        );
+        assert_eq!(
+            Actor::setup_kind_for(Some(&DiscussSessionSetup::Team {
+                leader_id: leader.clone()
+            })),
+            None
+        );
+        assert_eq!(
+            Actor::setup_kind_for(Some(&DiscussSessionSetup::Provider {
+                config_overrides: Default::default()
+            })),
+            None
+        );
+        assert_eq!(Actor::setup_kind_for(None), None);
+    }
+
+    #[test]
+    fn reconnect_restores_root_materialized_team_with_exact_leader() {
+        let restored = Actor::restored_team_setup(&row(Some("chief-of-staff"), Some("team_at_root")));
+        assert_eq!(
+            restored,
+            Some(DiscussSessionSetup::TeamAtRoot {
+                leader_id: "chief-of-staff".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_team_rows_still_restore_the_central_team_setup() {
+        // Rows written before migration 4 have no setup kind and must keep the central path.
+        let restored = Actor::restored_team_setup(&row(Some("sector-analyst"), None));
+        assert_eq!(
+            restored,
+            Some(DiscussSessionSetup::Team {
+                leader_id: "sector-analyst".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn provider_sessions_without_a_leader_restore_no_team() {
+        assert_eq!(Actor::restored_team_setup(&row(None, None)), None);
+        assert_eq!(Actor::restored_team_setup(&row(None, Some("team_at_root"))), None);
+    }
+
+    #[test]
+    fn root_materialized_team_launches_from_the_restored_session_root() {
+        let homebase = std::path::PathBuf::from("/central/homebase");
+        let root = std::path::PathBuf::from("/tickets/execution-root");
+        let setup = DiscussSessionSetup::TeamAtRoot {
+            leader_id: "lead".to_string(),
+        };
+        assert_eq!(
+            Actor::launch_workspace(Some(&setup), Some(&root), &homebase).expect("root launch"),
+            &root
+        );
+    }
+
+    #[test]
+    fn root_team_without_a_session_root_fails_validation() {
+        let homebase = std::path::PathBuf::from("/central/homebase");
+        let setup = DiscussSessionSetup::TeamAtRoot {
+            leader_id: "lead".to_string(),
+        };
+        assert!(matches!(
+            Actor::launch_workspace(Some(&setup), None, &homebase),
+            Err(DiscussError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn central_team_and_provider_launches_keep_the_homebase_workspace() {
+        let homebase = std::path::PathBuf::from("/central/homebase");
+        let root = std::path::PathBuf::from("/tickets/execution-root");
+        let team = DiscussSessionSetup::Team {
+            leader_id: "lead".to_string(),
+        };
+        let provider = DiscussSessionSetup::Provider {
+            config_overrides: Default::default(),
+        };
+        assert_eq!(
+            Actor::launch_workspace(Some(&team), Some(&root), &homebase).expect("team"),
+            &homebase
+        );
+        assert_eq!(
+            Actor::launch_workspace(Some(&provider), Some(&root), &homebase).expect("provider"),
+            &homebase
+        );
+        assert_eq!(
+            Actor::launch_workspace(None, Some(&root), &homebase).expect("no setup"),
+            &homebase
+        );
+    }
+
+    #[test]
+    fn reconnect_restores_root_team_launch_workspace_from_the_stored_root() {
+        let homebase = std::path::PathBuf::from("/central/homebase");
+        let root = std::path::PathBuf::from("/tickets/execution-root");
+        let restored = Actor::restored_team_setup(&row(Some("lead"), Some("team_at_root")));
+        assert_eq!(
+            Actor::launch_workspace(restored.as_ref(), Some(&root), &homebase).expect("reconnect"),
+            &root
+        );
+    }
+
+    #[test]
+    fn setup_kind_round_trips_through_reconnect() {
+        let setup = DiscussSessionSetup::TeamAtRoot {
+            leader_id: "chief-of-staff".to_string(),
+        };
+        let kind = Actor::setup_kind_for(Some(&setup));
+        let restored = Actor::restored_team_setup(&row(Some("chief-of-staff"), kind));
+        assert_eq!(restored, Some(setup));
+    }
 }

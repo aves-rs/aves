@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use aves::auth::{AvesAuthError, Jwt};
 use aves::bus::{BusControlError, BusMcpEndpoint, DispatchContextError};
+use aves::flow::AgentNodeConfig;
 use aves::flow::NodeExecutionId;
 use aves::runtime::GeneratedCallError;
 use aves::utils::errors::SharedInfraError;
@@ -51,6 +52,25 @@ pub struct RuleSet {
     pub rules: Vec<Rule>,
 }
 
+/// Explicit command-line tool identity, without credentials or process arguments.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ::schemars::JsonSchema)]
+pub struct SessionCliTool {
+    /// Executable name or path selected by the user.
+    pub command: PathBuf,
+    /// Whether this session requires a separately provisioned login.
+    pub login: SessionCliLogin,
+}
+
+/// Authentication requirement; credential material is never part of the launch configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCliLogin {
+    /// No per-session login is requested.
+    None,
+    /// A per-session login must be provisioned securely.
+    Required,
+}
+
 /// Session-specific inputs for a future provider launch.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ::schemars::JsonSchema)]
 pub struct SessionLaunchConfig {
@@ -60,6 +80,17 @@ pub struct SessionLaunchConfig {
     pub mcp_servers: Vec<McpServer>,
     #[serde(default)]
     pub plugin_references: Vec<String>,
+    /// Explicit CLI tool requests; empty unless supplied by the caller.
+    #[serde(default)]
+    pub cli_tools: Vec<SessionCliTool>,
+}
+
+impl SessionLaunchConfig {
+    /// Set the typed launch configuration on a Flow AgentNode definition.
+    pub fn set_on_agent_node(&self, node: &mut AgentNodeConfig) -> Result<(), serde_json::Error> {
+        node.launch_config = Some(serde_json::to_value(self)?);
+        Ok(())
+    }
 }
 
 impl Type for SessionLaunchConfig {
@@ -79,7 +110,7 @@ pub struct AcpProvider {
     server: McpServer,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     default_session_config: serde_json::Value,
-    #[serde(default)]
+    #[serde(default, alias = "sluice_mcp_enabled")]
     application_mcp_enabled: bool,
     /// Editable paths relative to the agents workspace; None uses provider defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -991,6 +1022,12 @@ pub enum DiscussSessionSetup {
         /// Stable Phanes Team leader identifier.
         leader_id: String,
     },
+    /// Use a Team whose assets the caller materialized in the session root (for example a
+    /// ticket execution workspace). The central installation is not consulted.
+    TeamAtRoot {
+        /// Stable Phanes Team leader identifier.
+        leader_id: String,
+    },
     /// Use the Provider directly with the reviewed per-session selections.
     Provider {
         /// Session-level values layered over the Provider defaults.
@@ -1144,6 +1181,12 @@ pub enum AcpDispatchResponsePayload {
 /// boundaries without carrying raw external error types.
 #[derive(Error, Debug, Clone, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 pub enum DiscussError {
+    /// OpenCode cannot provision a CLI login for a single session securely.
+    #[error("OpenCode does not support secure per-session CLI tool login provisioning")]
+    SessionCliLoginUnsupported,
+    /// OpenCode cannot enforce the requested CLI tool selection for a session.
+    #[error("OpenCode does not support per-session CLI tool provisioning")]
+    SessionCliToolUnsupported,
     /// Channel send error (actor communication).
     #[error("Channel send error")]
     ChannelSend,
@@ -1515,6 +1558,8 @@ impl DiscussError {
     /// Stable client-facing error code for the Discuss domain.
     pub fn rpc_code(&self) -> &'static str {
         match self {
+            DiscussError::SessionCliLoginUnsupported => "SessionCliLoginUnsupported",
+            DiscussError::SessionCliToolUnsupported => "SessionCliToolUnsupported",
             DiscussError::ChannelSend => "ChannelSend",
             DiscussError::ChannelRecv => "ChannelRecv",
             DiscussError::OneshotReply => "OneshotReply",

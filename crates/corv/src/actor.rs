@@ -31,7 +31,7 @@ use super::session::{
 };
 use super::storage::{
     DiscussAgentConfigRow, DiscussPersistence, list_recent_discuss_sessions, load_discuss_agent_config,
-    present_acp_session_id, upsert_discuss_agent_config,
+    load_discuss_team_installation, present_acp_session_id, upsert_discuss_agent_config,
 };
 use super::supervisor::{CallbackRouteRegistry, ProviderSupervisor};
 use super::types::{
@@ -421,6 +421,7 @@ impl Actor {
         let result: Result<DiscussResponse, DiscussError> = match payload {
             DiscussRequestPayload::StartAgent {
                 correlation,
+                launch_config,
                 provider_name,
                 agent_name,
                 config_overrides,
@@ -435,6 +436,7 @@ impl Actor {
             } => {
                 self.start_agent(
                     correlation,
+                    launch_config,
                     provider_name,
                     agent_name,
                     config_overrides,
@@ -497,6 +499,58 @@ impl Actor {
                     .await
             }
             DiscussRequestPayload::UninstallTeam { leader_id } => self.handle_uninstall_team(leader_id).await,
+            DiscussRequestPayload::InstallTeamAndStartSession {
+                leader_id,
+                provider_name,
+                discuss_session_id,
+                setup,
+                session_name,
+                launch_config,
+                session_cwd,
+                application_mcp_enabled,
+            } => {
+                async {
+                    if !matches!(&setup, DiscussSessionSetup::Team { leader_id: selected } if selected == &leader_id) {
+                        return Err(DiscussError::Validation {
+                            message: "Session setup must select the installed Team".to_string(),
+                        });
+                    }
+                    let conn = self.persistence.acquire_connection().await?;
+                    let installation = load_discuss_team_installation(&conn, &leader_id).await?;
+                    drop(conn);
+                    let (member_overrides, theme_color) = match installation {
+                        Some(row) => (
+                            serde_json::from_str(&row.member_overrides_json)?,
+                            row.theme_color_json
+                                .as_deref()
+                                .map(serde_json::from_str)
+                                .transpose()?,
+                        ),
+                        None => (BTreeMap::new(), None),
+                    };
+                    self.handle_install_team(leader_id.clone(), provider_name.clone(), member_overrides, theme_color)
+                        .await?;
+                    self.spawn_session(
+                        discuss_session_id,
+                        &provider_name,
+                        SpawnSessionOptions {
+                            launch_config,
+                            name: session_name,
+                            setup: Some(setup),
+                            session_config_overrides: BTreeMap::new(),
+                            acp_session_id: None,
+                            announce_desktop_association: true,
+                            transient_connectivity: false,
+                            session_cwd,
+                            application_mcp_enabled,
+                            node_token: None,
+                            flow_mcp_endpoints: None,
+                        },
+                    )
+                    .await
+                }
+                .await
+            }
             DiscussRequestPayload::NewSession {
                 launch_config,
                 discuss_session_id,
@@ -932,6 +986,7 @@ fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
         DiscussRequestPayload::RemoveProviderConfig { .. } => "removeProviderConfig",
         DiscussRequestPayload::ListTeamCatalog => "listTeamCatalog",
         DiscussRequestPayload::InstallTeam { .. } => "installTeam",
+        DiscussRequestPayload::InstallTeamAndStartSession { .. } => "installTeamAndStartSession",
         DiscussRequestPayload::EditTeam { .. } => "editTeam",
         DiscussRequestPayload::UninstallTeam { .. } => "uninstallTeam",
         DiscussRequestPayload::NewSession { .. } => "newSession",
@@ -952,6 +1007,7 @@ fn request_requires_running_server(payload: &DiscussRequestPayload) -> bool {
             | DiscussRequestPayload::AddProvider { .. }
             | DiscussRequestPayload::RefreshProviderConfig { .. }
             | DiscussRequestPayload::NewSession { .. }
+            | DiscussRequestPayload::InstallTeamAndStartSession { .. }
             | DiscussRequestPayload::LoadSession { .. }
             | DiscussRequestPayload::GetConfigOptions { .. }
             | DiscussRequestPayload::SetConfigOption { .. }

@@ -546,6 +546,8 @@ impl Actor {
                 continue;
             }
             self.triggers.insert(trigger.trigger_id, trigger.clone());
+            // Every persisted cursor advance is observable, including skipped and failed starts.
+            let _ = self.broadcast_tx.send(FlowBroadcast::TriggersChanged).await;
             if self.has_active_execution(trigger.flow_id) {
                 continue;
             }

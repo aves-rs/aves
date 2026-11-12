@@ -24,7 +24,7 @@ pub(crate) struct OpenCodePermissions {
     pub policies: Vec<OpenCodePolicy>,
 }
 
-/// Indicates an absent source or a source missing one or more operations.
+/// Indicates that no rule source was supplied, so no policy can be resolved.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct UnavailablePolicy;
 
@@ -34,7 +34,7 @@ pub(crate) struct Translation {
     pub resolution: Result<(), UnavailablePolicy>,
 }
 
-/// Intersect all resolved sources. No sources or missing operations deny.
+/// Intersect supplied sources. Omitted operations deny; no sources is unresolved.
 pub(crate) fn translate(sources: &[RuleSet]) -> Translation {
     let effect = |operation| {
         sources
@@ -87,15 +87,14 @@ pub(crate) fn translate(sources: &[RuleSet]) -> Translation {
             });
         }
     }
-    let complete = !sources.is_empty()
-        && sources.iter().all(|source| {
-            [Operation::Read, Operation::Write, Operation::Execute]
-                .iter()
-                .all(|operation| source.rules.iter().any(|rule| rule.operation == *operation))
-        });
+    // Omitted operations already resolved to deny above, so only an absent source set is unresolved.
     Translation {
         config: OpenCodePermissions { permissions, policies },
-        resolution: if complete { Ok(()) } else { Err(UnavailablePolicy) },
+        resolution: if sources.is_empty() {
+            Err(UnavailablePolicy)
+        } else {
+            Ok(())
+        },
     }
 }
 
@@ -125,6 +124,29 @@ mod tests {
             translate(&[unrestricted, readonly]).config.permissions[2].effect,
             Effect::Deny
         );
+    }
+
+    #[test]
+    fn partial_sources_deny_omitted_operations_without_granting_them() {
+        let read_only = RuleSet {
+            rules: vec![Rule {
+                operation: Operation::Read,
+                effect: Effect::Allow,
+            }],
+        };
+        let translation = translate(&[read_only]);
+        assert!(translation.resolution.is_ok());
+        let effect_of = |action: &str| {
+            translation
+                .config
+                .permissions
+                .iter()
+                .find(|rule| rule.action == action)
+                .map(|rule| rule.effect)
+        };
+        assert_eq!(effect_of("read"), Some(Effect::Allow));
+        assert_eq!(effect_of("edit"), Some(Effect::Deny));
+        assert_eq!(effect_of("shell"), Some(Effect::Deny));
     }
 
     #[test]

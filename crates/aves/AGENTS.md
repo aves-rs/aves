@@ -35,14 +35,15 @@ The Bus ALPN carries `RemoteOperationRequest { qualified_operation, input, jwt }
 
 Flow exposes an opt-in `FlowAppWorkspaceHook` through `FlowBootOptions.app_workspace_hook`. With no hook set, Flow's behaviour is unchanged — the embedding application opts in by supplying an implementation.
 
-- **Steps and defaults.** `takeoff`, `checkpoint`, `restore`, `landing`, `release_artifacts`. `checkpoint` defaults to `Ok(FlowAppCheckpoint::Flow)` (Flow captures its own checkpoint); `restore` defaults to a no-op. The other three are required.
-- **Context.** `FlowAppHookContext` carries execution id, flow id, definition revision, execution root and invocation kind. `FlowAppLandingContext` adds terminal status and node correlations for `landing`.
+- **Steps and defaults.** `takeoff`, `checkpoint`, `restore`, `landing`, `release_artifacts`. Application `checkpoint` defaults to an empty capture; `restore` defaults to a no-op. The other three are required.
+- **Context.** `FlowAppHookContext` carries execution id, flow id, definition revision, proposed execution root and invocation kind. `FlowAppLandingContext` adds terminal status and node correlations for `landing`.
 - **Call-site guarantees.**
-  - `takeoff` runs after workspace preparation and before the execution document and first tick. A failure discards the unlinked execution and fails Start with a typed error.
-  - `checkpoint` runs at start and at every transition. `App` means Flow captures no checkpoint of its own (`workspace_checkpoint` is `None` and `workspace_entries` is empty); `Flow` keeps Flow's capture.
+  - `takeoff` is the workspace preparation boundary before the first tick: the application returns `FlowAppTakeoffResult`, or Flow's default prepares inputs, seeds and a native document. An application takeoff failure fails Start with a typed error. Application takeoff must clean up its own failed preparation.
+  - Application takeoff may return a root without a native document. Recovery, later checkpoint roots, landing and cleanup are not yet adapted to application-selected roots.
+  - `checkpoint` runs at start and at every transition. Application captures provide an optional native root and path-to-hash projection directly; without a hook Flow captures its own checkpoint.
   - `restore` runs at restart, after Flow re-materializes its fresh inputs. For an app-owned execution, Flow first rewrites `workflow/trigger.json` from the saved pulse.
-  - `landing` runs after the durable terminal snapshot and before terminal history, for every outcome. Abort takes no checkpoint. A landing failure is logged and does not block terminalization.
-  - `release_artifacts` runs at retention cleanup as idempotent landing → release → directory delete. A hook failure keeps the cleanup anchor for retry without suppressing the new run's terminal broadcasts.
+  - `landing` runs after the durable terminal snapshot and before terminal history, for every outcome. Abort takes no checkpoint and its reply is not terminal; the landing callback is the handoff. A landing failure is logged and does not block terminalization.
+  - `release_artifacts` runs at retention cleanup after a replay of `landing`, followed by directory deletion. Cleanup replays carry no correlations; implementations must handle repeated calls. A hook failure keeps the cleanup anchor for retry without suppressing the new run's terminal broadcasts.
 - **Tests.** `flow/actor/tests.rs` exercises the hook through a `RecordingWorkspaceHook`; the no-hook default is covered by `flow_without_app_workspace_hook_keeps_normal_start_and_terminal_behavior`.
 
 ## References and tests

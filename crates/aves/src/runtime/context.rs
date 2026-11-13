@@ -223,6 +223,12 @@ impl<Service: ?Sized + Send + Sync + 'static> ServiceReader<Service> {
         self.slot.get().cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_slot() -> (Self, ServicePublisher<Service>) {
+        let slot = Arc::new(OnceLock::new());
+        (Self { slot: slot.clone() }, ServicePublisher { slot })
+    }
+
     /// Creates a pre-published reader for isolated downstream tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_published_test_service(service: Arc<Service>) -> Self {

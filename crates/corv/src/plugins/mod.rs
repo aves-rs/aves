@@ -13,7 +13,7 @@ use std::{
     path::Path,
 };
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     McpServer, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions,
 };
 
@@ -627,7 +627,7 @@ mod tests {
         path::Path,
     };
 
-    use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigSelectOption};
+    use agent_client_protocol::v1::schema::{SessionConfigOption, SessionConfigSelectOption};
     use tempfile::tempdir;
 
     use super::super::library::{AgentId, SkillId, TeamDefinition};

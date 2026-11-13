@@ -37,7 +37,7 @@ use super::messages::{FlowResponse, LifecycleCorrelation};
 use super::registration::{
     FlowNodeRegistry, NodeKind, NodeKindRegistration, NodeRegistrationSupply, WorkspacePreparationError,
 };
-use super::snapshot::{ExecutionSnapshot, ExecutionSnapshotStore, NodeExecutionSnapshot};
+use super::snapshot::{ExecutionSnapshot, ExecutionSnapshotStore, NodeExecutionSnapshot, WorkspaceProvenance};
 use super::tick::{FlowDispatch, FlowTickLoop, ReconstructionState};
 
 /// Default number of completed executions retained per Flow.
@@ -418,6 +418,7 @@ pub(super) struct ExecutionState {
     pub(super) workspace_entries: BTreeMap<String, ContentHash>,
     pub(super) workspace_checkpoint: Option<ContentAddressedRoot>,
     pub(super) imported_workspace_root: Option<ContentAddressedRoot>,
+    pub(super) workspace: WorkspaceProvenance,
     pub(super) workspace_mappings: Vec<FlowWorkspaceMapping>,
     pub(super) checkpoint_sequence: u64,
     pub(super) abort_pending: bool,
@@ -456,6 +457,7 @@ impl ExecutionState {
             workspace_checkpoint: self.workspace_checkpoint.clone(),
             workspace_entries: self.workspace_entries.clone(),
             imported_workspace_root: self.imported_workspace_root.clone(),
+            workspace: self.workspace.clone(),
             reconstruction,
             scratchpad: self.tick_loop.scratchpad_snapshot(),
             nodes: self.tick_loop.node_snapshots(),
@@ -543,6 +545,15 @@ pub enum FlowError {
         #[source]
         source: FlowAppHookError,
     },
+    /// Flow checkpoint capture requires a native document prepared at takeoff.
+    #[error("Flow checkpoint requires an execution document")]
+    MissingExecutionDocument,
+    /// The workspace selected at takeoff is unavailable during recovery or cleanup.
+    #[error("application workspace implementation is unavailable for execution {execution_id}")]
+    AppWorkspaceUnavailable { execution_id: FlowExecutionId },
+    /// Application workspace contents cannot be transferred by native mobility.
+    #[error("application workspace mobility is unsupported for execution {execution_id}")]
+    AppWorkspaceMobilityUnsupported { execution_id: FlowExecutionId },
     /// The application workspace hook failed to restore its workspace.
     #[error("application workspace restore failed: {source}")]
     AppWorkspaceRestore {

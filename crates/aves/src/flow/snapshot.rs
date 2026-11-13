@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,6 +19,32 @@ use super::types::{
 pub(super) const UPSERT_EXECUTION_SQL: &str = include_str!("queries/upsert_execution.sql");
 pub(super) const DELETE_NODE_EXECUTIONS_SQL: &str = include_str!("queries/delete_node_executions.sql");
 pub(super) const INSERT_NODE_EXECUTION_SQL: &str = include_str!("queries/insert_node_execution.sql");
+
+/// Persisted selection of the workspace implementation and its execution root.
+#[derive(Clone, Debug, Deserialize, Serialize, Type, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum WorkspaceProvenance {
+    Native {
+        #[specta(type = String)]
+        root: PathBuf,
+    },
+    Application {
+        #[specta(type = String)]
+        root: PathBuf,
+    },
+}
+
+impl WorkspaceProvenance {
+    pub(super) fn root(&self) -> PathBuf {
+        match self {
+            Self::Native { root } | Self::Application { root } => root.clone(),
+        }
+    }
+
+    pub(super) fn is_application(&self) -> bool {
+        matches!(self, Self::Application { .. })
+    }
+}
 
 /// The complete Flow-owned state written as one recovery unit.
 ///
@@ -39,6 +66,7 @@ pub(super) struct ExecutionSnapshot {
     /// The source collection imported for this execution, when mapped input was used.
     #[serde(default)]
     pub(super) imported_workspace_root: Option<ContentAddressedRoot>,
+    pub(super) workspace: WorkspaceProvenance,
     pub(super) reconstruction: ReconstructionState,
     pub(super) scratchpad: ScratchpadSnapshot,
     pub(super) nodes: Vec<NodeExecutionSnapshot>,
@@ -137,6 +165,7 @@ impl ExecutionSnapshotStore {
                 .get::<Option<String>>(11)?
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?;
+            let workspace = serde_json::from_str(&row.get::<String>(12)?)?;
             snapshots.push(ExecutionSnapshot {
                 execution,
                 blackboard: serde_json::from_str(&row.get::<String>(3)?)?,
@@ -145,6 +174,7 @@ impl ExecutionSnapshotStore {
                 workspace_checkpoint,
                 workspace_entries,
                 imported_workspace_root,
+                workspace,
                 reconstruction: serde_json::from_str(&row.get::<String>(5)?)?,
                 scratchpad: serde_json::from_str(&row.get::<String>(6)?)?,
                 nodes: load_nodes(&connection, execution_id).await?,
@@ -224,6 +254,7 @@ pub(super) fn execution_values(snapshot: &ExecutionSnapshot) -> Result<impl Into
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?,
+        serde_json::to_string(&snapshot.workspace)?,
     ))
 }
 
@@ -352,6 +383,25 @@ mod tests {
     use super::super::{FlowExecutionId, FlowId, FlowNodeId, FlowTimestamp, NodeExecutionId};
     use super::*;
 
+    #[test]
+    fn workspace_provenance_preserves_explicit_roots() {
+        let source_root = PathBuf::from("source/executions/run");
+        let application_root = PathBuf::from("application/workspace");
+        let native = WorkspaceProvenance::Native {
+            root: source_root.clone(),
+        };
+        let application = WorkspaceProvenance::Application {
+            root: application_root.clone(),
+        };
+
+        let restored: WorkspaceProvenance = serde_json::from_value(serde_json::to_value(native).unwrap()).unwrap();
+        assert_eq!(restored.root(), source_root);
+        assert!(!restored.is_application());
+        let restored: WorkspaceProvenance = serde_json::from_value(serde_json::to_value(application).unwrap()).unwrap();
+        assert_eq!(restored.root(), application_root);
+        assert!(restored.is_application());
+    }
+
     pub(super) fn maybe_fail_save(
         store: &super::ExecutionSnapshotStore,
         snapshot: &ExecutionSnapshot,
@@ -437,6 +487,9 @@ mod tests {
                 .unwrap(),
             )]),
             imported_workspace_root: None,
+            workspace: WorkspaceProvenance::Native {
+                root: PathBuf::from("workspace"),
+            },
             reconstruction: super::super::tick::ReconstructionState {
                 controller_path: vec![0, 1],
                 active_node: Some(FlowNodeId(Uuid::new_v4())),
@@ -582,6 +635,22 @@ mod tests {
 
         MigrationRunner::new("__flow_migrations", MIGRATIONS)
             .apply(&database)
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE flow_executions SET workspace_provenance_json = ?1 WHERE execution_id = ?2",
+                (
+                    serde_json::to_string(&WorkspaceProvenance::Native {
+                        root: directory
+                            .path()
+                            .join("executions")
+                            .join(execution_id.to_string()),
+                    })
+                    .unwrap(),
+                    execution_id.0.to_string(),
+                ),
+            )
             .await
             .unwrap();
         let store = ExecutionSnapshotStore::new(database.clone());

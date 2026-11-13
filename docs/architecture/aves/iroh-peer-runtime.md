@@ -1,9 +1,9 @@
 ---
 title: Aves Iroh Peer Runtime
 type: architecture
-updated: 2026-10-23
+updated: 2026-11-13
 references:
-  - crates/aves/src/bus/iroh.rs
+  - crates/aves/src/machine/peering.rs
   - crates/aves/src/bus/remote.rs
   - crates/aves/src/bus/mod.rs
   - crates/aves/src/auth/pairing.rs
@@ -25,8 +25,8 @@ Aves owns one shared native Iroh endpoint/router (`IrohSubstrate` / `RunningIroh
 
 ## Ownership
 
-- **Substrate** (`crates/aves/src/bus/iroh.rs`): constructs one `Endpoint`, owns the native `iroh::Router`, hands out `IrohProtocolHandler` slots and the running router handle. Re-exported privately from `crates/aves/src/bus/mod.rs:8`.
-- **Bus** (`crates/aves/src/bus/remote.rs`): installs `BUS_ALPN` via `RemoteOperationInstaller::for_operations`. Transport stays with the substrate; the installer only carries operation descriptors.
+- **Substrate** (`crates/aves/src/machine/peering.rs`): constructs one `Endpoint` and owns the native `iroh::Router` and its running handle.
+- **Bus** (`crates/aves/src/bus/remote.rs`): owns `BUS_ALPN` and `IrohProtocolHandler`; `RemoteOperationInstaller::for_operations` carries operation descriptors. Transport lifecycle stays with the substrate.
 - **Auth** (`crates/aves/src/auth/pairing.rs`, `auth/peer.rs`): owns durable peer state, the `AUTH_ALPN` slot, the `AuthFirstContactHandler`, and `AuthAdmissionRegistry` (`crates/aves/src/auth/types.rs`) — the dynamic issuer/audience projection forwarded into bus admission.
 - **Flow** (`crates/aves/src/flow/sync.rs`, `flow/mobility.rs`, `flow/domain.rs`): owns `FlowSyncServices { blobs, docs_api, gossip, endpoint }` plus the typed `FlowMobilityService` trait (narrow: `import_snapshot` + `promote_replica` only). Select, yield, synchronize, and promote-replica orchestration live on the Flow `Actor`; the trait is the peer-call seam only. Flow borrows the substrate's endpoint and never modifies Bus or Auth admission.
 
@@ -44,15 +44,15 @@ The runtime owns no second cache: every reload rebuilds the in-memory `peers` ve
 
 ## Dynamic JWT issuer/audience admission
 
-`AuthAdmissionRegistry` (`crates/aves/src/auth/types.rs`) holds an immutable local `ApprovedIssuer` (the machine's own `MachineIssuerId`) and an `Arc<RwLock<HashMap<MachineIssuerId, ApprovedIssuer>>>` for remotes. `upsert_remote` / `remove_remote` mutate the map; `replace_remotes` runs after durable pairing reconciliation. `current_issuers` is the projection the runtime forwards into bus admission. JWTs carry `iss`, `aud` (the audience minted at Auth boot), `sub`, `cap`, `jti`, `exp` (`crates/aves/src/auth/jwt.rs`); verification in `verify_jwt_unchecked` pins issuer, audience, and expiration with zero leeway. On the wire, `RemoteOperationRequest.jwt` is checked against the Iroh peer's `PublicKey` (`crates/aves/src/bus/remote.rs:152-159`): `jwt_issuer != peer_issuer` returns `RemoteOperationError::IssuerMismatch` before any operation dispatch.
+`AuthAdmissionRegistry` (`crates/aves/src/auth/types.rs`) holds an immutable local `ApprovedIssuer` (the machine's own `MachineIssuerId`) and an `Arc<RwLock<HashMap<MachineIssuerId, ApprovedIssuer>>>` for remotes. `upsert_remote` / `remove_remote` mutate the map; `replace_remotes` runs after durable pairing reconciliation. `current_issuers` is the projection the runtime forwards into bus admission. JWTs carry `iss`, `aud` (the audience minted at Auth boot), `sub`, `cap`, `jti`, `exp` (`crates/aves/src/auth/jwt.rs`); verification in `verify_jwt_unchecked` pins issuer, audience, and expiration with zero leeway. On the wire, `RemoteOperationRequest.jwt` is checked against the Iroh peer's `PublicKey` (`crates/aves/src/bus/remote.rs`): `jwt_issuer != peer_issuer` returns `RemoteOperationError::IssuerMismatch` before any operation dispatch.
 
 ## Generated public operations over native QUIC
 
-The Bus ALPN (`BUS_ALPN = b"aves_app/bus"`, `crates/aves/src/bus/remote.rs:17`) carries exactly one payload shape: `RemoteOperationRequest { qualified_operation, input, jwt }`. `RemoteOperationInstaller::for_operations` wraps the existing `DomainPublication` descriptors — privileged operations are absent — into an `IrohProtocolHandler`. `RemoteOperationRequest` is `serde_json` (limit `MAX_OPERATION_BYTES = 512 * 1024`); the reply is `RemoteOperationReply::{Success, DomainError, Rejected}`. `call<Request,Response>` (`crates/aves/src/bus/remote.rs:193`) opens a QUIC bidirectional stream on the substrate endpoint, writes the JSON, finishes the send half, and reads up to `MAX_OPERATION_BYTES` for the response. Identity is checked at the Iroh layer (`connection.remote_id() == target.id`); admission is checked at the JWT layer. The substrate's `IrohProtocolHandler` accepts raw reads up to `MAX_REQUEST_SIZE = 1024 * 1024`; the dispatch layer enforces the tighter `MAX_OPERATION_BYTES`.
+The Bus ALPN (`BUS_ALPN = b"aves_app/bus"`, `crates/aves/src/bus/remote.rs`) carries exactly one payload shape: `RemoteOperationRequest { qualified_operation, input, jwt }`. `RemoteOperationInstaller::for_operations` wraps the existing `DomainPublication` descriptors — privileged operations are absent — into an `IrohProtocolHandler`. `RemoteOperationRequest` is `serde_json` (limit `MAX_OPERATION_BYTES = 512 * 1024`); the reply is `RemoteOperationReply::{Success, DomainError, Rejected}`. `call<Request,Response>` opens a QUIC bidirectional stream on the substrate endpoint, writes the JSON, finishes the send half, and reads up to `MAX_OPERATION_BYTES` for the response. Identity is checked at the Iroh layer (`connection.remote_id() == target.id`); admission is checked at the JWT layer. The Bus's `IrohProtocolHandler` accepts raw reads up to `MAX_REQUEST_SIZE = 1024 * 1024`; the dispatch layer enforces the tighter `MAX_OPERATION_BYTES`.
 
 ## source_peer_key validated against AuthProjection.issuer
 
-Flow's `authorize_public_request` (`crates/aves/src/flow/domain.rs:193`) gates `ImportMobilitySnapshot`: the request's `source_peer_key` must equal `projection.issuer` (the authenticated JWT issuer projected from the bus admission layer). Mismatch returns `FlowError::MobilityPeer` before any import work begins. The runtime's `RuntimeFlowMobilityService` (`crates/aves/src/runtime/supervisor.rs:40`) supplies `sourcePeerKey: self.source_issuer` (the local machine's `MachineIssuerId`) as the outbound payload; the remote Flow domain verifies it against the JWT-derived projection.
+Flow's `ensure_caller_has_capabilities` (`crates/aves/src/flow/domain.rs:193`) gates `ImportMobilitySnapshot`: the request's `source_peer_key` must equal `projection.issuer` (the authenticated JWT issuer projected from the bus admission layer). Mismatch returns `FlowError::MobilityPeer` before any import work begins. The runtime's `RuntimeFlowMobilityService` (`crates/aves/src/runtime/supervisor.rs:40`) supplies `sourcePeerKey: self.source_issuer` (the local machine's `MachineIssuerId`) as the outbound payload; the remote Flow domain verifies it against the JWT-derived projection.
 
 ## Native Docs/Gossip/Blobs
 
@@ -70,7 +70,7 @@ Flow's `authorize_public_request` (`crates/aves/src/flow/domain.rs:193`) gates `
 6. `IrohSubstrate::start(remote_handler, first_contact_handler)` — `Router::builder` accepts all five ALPNs and spawns.
 7. `BusHandle::new` finalizes the bus.
 
-**Audience refresh is call-time**, not a startup sweep: `PairingCoordinator::refresh_audience` runs before each outbound peer JWT in `call_remote_operation_with` (`crates/aves/src/runtime/supervisor.rs:108-148`), not at boot.
+**Audience refresh is call-time**, not a startup sweep: `PairingCoordinator::refresh_audience` runs before each outbound peer JWT in `call_remote_operation_with` (`crates/aves/src/machine/peering.rs`), not at boot.
 
 **Shutdown** stops Flow first (sequential, under a 30s cap) so the Flow actor runs `shutdown_runtime` (`crates/aves/src/flow/actor.rs:264`) — draining background tasks, then delegating to `WorkspaceStore::shutdown` (`crates/aves/src/flow/workspace.rs:437`), which closes open documents, waits the blob store idle, and syncs the blob DB. Then remaining domains stop concurrently. Only after domain stops complete does the runtime call `RunningIrohSubstrate::shutdown_router` (30s timeout), then `close_endpoint`, then `bus.shutdown`. Failed bus shutdown resets the guard for retry; successful shutdown is idempotent.
 

@@ -7,6 +7,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+use crate::auth::{AuthSudoService, MachineIssuerId, PairingOwner};
+use crate::machine::{MachinePeerService, PeerConnectivity, call_remote_operation_with};
+use crate::runtime::ServiceReader;
+
 use super::actor::Actor;
 use super::ast::{ContentAddressedRoot, ContentHash};
 use super::cron::FlowTriggerRecord;
@@ -15,8 +19,8 @@ use super::messages::FlowResponse;
 use super::snapshot::ExecutionSnapshot;
 use super::types::{
     FlowDefinition, FlowError, FlowExecutionId, FlowFailure, FlowId, FlowMobilityDestination, FlowMobilityReadiness,
+    WorkspaceError,
 };
-use super::workspace::WorkspaceStore;
 
 impl Actor {
     pub(super) async fn yield_flow_authority(&mut self, flow_id: FlowId) -> Result<FlowResponse, FlowError> {
@@ -141,6 +145,7 @@ impl Actor {
     }
 
     pub(super) async fn synchronize_flow(&mut self, flow_id: FlowId) -> Result<FlowResponse, FlowError> {
+        self.require_peer_service()?;
         if !self.definitions.contains_key(&flow_id) {
             return Err(FlowError::DefinitionNotFound);
         }
@@ -245,21 +250,22 @@ impl Actor {
             .ok_or(FlowError::DefinitionNotFound)?;
         let triggers = self.store.list_triggers(flow_id).await?;
         let executions = self.snapshot_store.load_for_flow(flow_id).await?;
-        let mut native_references = Vec::with_capacity(executions.len());
-        for snapshot in &executions {
-            let document = self
-                .store
-                .load_execution_document(snapshot.execution.execution_id)
-                .await?;
-            native_references.push(WorkspaceStore::native_references(snapshot, &document));
+        if let Some(execution) = executions
+            .iter()
+            .find(|execution| execution.workspace.is_application())
+        {
+            return Err(FlowError::AppWorkspaceMobilityUnsupported {
+                execution_id: execution.execution.execution_id,
+            });
         }
-        let snapshot = FlowMobilitySnapshot {
+        let mut snapshot = FlowMobilitySnapshot {
             flow_id,
             definition,
             triggers,
             executions,
-            native_references,
+            native_references: Vec::new(),
         };
+        self.workspace_hook.export_mobility(&mut snapshot).await?;
         self.store.save_mobility_snapshot(&snapshot).await?;
         Ok(snapshot)
     }
@@ -273,8 +279,8 @@ impl Actor {
     }
 }
 
-/// Narrow runtime-owned seam for Flow mobility.
-pub(crate) trait FlowMobilityService: Send + Sync {
+/// Narrow seam for Flow mobility.
+pub(super) trait FlowMobilityService: Send + Sync {
     fn import_snapshot(
         &self,
         destination: FlowMobilityDestination,
@@ -286,6 +292,102 @@ pub(crate) trait FlowMobilityService: Send + Sync {
         destination: FlowMobilityDestination,
         acknowledgement: FlowYieldAcknowledgement,
     ) -> Pin<Box<dyn Future<Output = Result<FlowActivationAcknowledgement, FlowError>> + Send + '_>>;
+}
+
+/// Flow's remote mobility operations over the shared peer bus.
+pub(super) struct RuntimeFlowMobilityService {
+    pub(super) connectivity: PeerConnectivity,
+    pub(super) peer_service: ServiceReader<dyn MachinePeerService>,
+    pub(super) auth_service: ServiceReader<dyn AuthSudoService>,
+    pub(super) pairing_owner: PairingOwner,
+}
+
+impl FlowMobilityService for RuntimeFlowMobilityService {
+    fn import_snapshot(
+        &self,
+        destination: FlowMobilityDestination,
+        snapshot: FlowMobilitySnapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<FlowMobilityCommitAcknowledgement, FlowError>> + Send + '_>> {
+        Box::pin(async move {
+            let peer_service = self
+                .peer_service
+                .get()
+                .ok_or(WorkspaceError::ProviderUnavailable)?;
+            let (endpoint, _) = peer_service.transport().await;
+            let source_issuer: MachineIssuerId = endpoint.id().into();
+            let input = serde_json::json!({ "snapshot": snapshot, "sourcePeerKey": source_issuer });
+            let output = self
+                .call(destination.peer_key, "flow.importMobilitySnapshot", input)
+                .await?;
+
+            #[derive(serde::Deserialize)]
+            struct CommitOutput {
+                acknowledgement: FlowMobilityCommitAcknowledgement,
+            }
+            serde_json::from_value::<CommitOutput>(output)
+                .map(|output| output.acknowledgement)
+                .map_err(|error| FlowError::MobilityPeer {
+                    message: error.to_string(),
+                })
+        })
+    }
+
+    fn promote_replica(
+        &self,
+        destination: FlowMobilityDestination,
+        acknowledgement: FlowYieldAcknowledgement,
+    ) -> Pin<Box<dyn Future<Output = Result<FlowActivationAcknowledgement, FlowError>> + Send + '_>> {
+        Box::pin(async move {
+            let input = serde_json::json!({ "flowId": acknowledgement.flow_id, "acknowledgement": acknowledgement });
+            let output = self
+                .call(destination.peer_key, "flow.promoteFlowReplica", input)
+                .await?;
+
+            #[derive(serde::Deserialize)]
+            struct PromotionOutput {
+                acknowledgement: FlowActivationAcknowledgement,
+            }
+            serde_json::from_value::<PromotionOutput>(output)
+                .map(|output| output.acknowledgement)
+                .map_err(|error| FlowError::MobilityPeer {
+                    message: error.to_string(),
+                })
+        })
+    }
+}
+
+impl RuntimeFlowMobilityService {
+    async fn call(
+        &self,
+        target: MachineIssuerId,
+        qualified_operation: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, FlowError> {
+        let peer_service = self
+            .peer_service
+            .get()
+            .ok_or(WorkspaceError::ProviderUnavailable)?;
+        let (endpoint, _) = peer_service.transport().await;
+        if !self.connectivity.is_enabled() {
+            return Err(WorkspaceError::ProviderUnavailable.into());
+        }
+        let auth_service = self
+            .auth_service
+            .get()
+            .ok_or(WorkspaceError::ProviderUnavailable)?;
+        call_remote_operation_with(
+            &endpoint,
+            &self.pairing_owner,
+            &auth_service,
+            target,
+            qualified_operation.to_owned(),
+            input,
+        )
+        .await
+        .map_err(|error| FlowError::MobilityPeer {
+            message: error.to_string(),
+        })
+    }
 }
 
 /// Native execution document and immutable blob references for one Flow execution.

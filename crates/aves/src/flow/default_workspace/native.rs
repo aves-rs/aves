@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,31 +5,31 @@ use iroh_blobs::store::fs::FsStore;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use crate::bus::PeerConnectivity;
+use crate::machine::{MachineNativeServices, PeerConnectivity};
 use crate::runtime::ServiceReader;
 
-use super::ast::{ContentAddressedPath, ContentAddressedRoot, NodeDataSpace};
-use super::database::ExecutionDocumentLink;
-use super::files::{collect_artifact_paths, collect_files, mapping_destination, validate_mappings};
-use super::graph::FlowGraph;
-use super::mobility::FlowExecutionNativeReferences;
-use super::registration::FlowNodeRegistry;
-use super::snapshot::{ExecutionSnapshot, NodeExecutionSnapshot};
-use super::storage::{EXECUTION_PATH, anyhow_document_api_error};
-use super::sync::{FlowNativeServices, FlowSyncServices};
-use super::types::{
+use super::super::ast::{ContentAddressedPath, ContentAddressedRoot, NodeDataSpace};
+use super::super::database::ExecutionDocumentLink;
+use super::super::graph::FlowGraph;
+use super::super::mobility::FlowExecutionNativeReferences;
+use super::super::registration::FlowNodeRegistry;
+use super::super::snapshot::{ExecutionSnapshot, NodeExecutionSnapshot};
+use super::super::types::{
     FlowError, FlowExecutionId, FlowInvocationKind, FlowNodeId, FlowWorkspaceMapping, FlowWorkspaceMappingMode,
     FlowWorkspaceSourceError, FlowWorkspaceSourceService, ScriptSourceLocation, WorkspaceError,
 };
+use super::files::{collect_artifact_paths, collect_files, mapping_destination};
+use super::storage::{EXECUTION_PATH, anyhow_document_api_error};
+use super::validate_mappings;
 
 #[cfg(test)]
-use super::fixtures::NativeDocsFixture;
+use super::super::fixtures::NativeDocsFixture;
 
 /// Owns execution paths and coordinates storage, native sync, and projection services.
 pub(super) struct WorkspaceStore {
     data_root: PathBuf,
     pub(super) store: FsStore,
-    pub(super) native: Arc<RwLock<FlowNativeServices>>,
+    pub(super) native: Arc<RwLock<MachineNativeServices>>,
     pub(super) connectivity: PeerConnectivity,
     #[cfg(test)]
     _native_fixture: Option<NativeDocsFixture>,
@@ -47,34 +46,6 @@ pub(super) enum WorkspaceInput {
         path: String,
         role: &'static str,
     },
-}
-
-pub(super) fn roots(
-    graph: &FlowGraph,
-    registry: &FlowNodeRegistry,
-) -> Result<(Vec<ContentAddressedRoot>, Vec<ContentAddressedRoot>), FlowError> {
-    let mut code = BTreeMap::new();
-    let mut state = BTreeMap::new();
-    let mut error = None;
-    graph.ast().root.for_each_leaf(&mut |node| {
-        match registry.get(&node.node_kind) {
-            Ok(registration) => {
-                for root in registration.node_content_roots(&node.configuration) {
-                    code.insert(root.digest.as_str().to_owned(), root);
-                }
-            }
-            Err(failure) => error = Some(FlowError::from(failure)),
-        }
-        let data_space = node.data_space();
-        for_each_data_space_path(data_space, |role, path| {
-            let roots = if role == "code" { &mut code } else { &mut state };
-            roots.insert(path.root.digest.as_str().to_owned(), path.root.clone());
-        });
-    });
-    error.map_or_else(
-        || Ok((code.into_values().collect(), state.into_values().collect())),
-        Err,
-    )
 }
 
 pub(super) fn inputs(graph: &FlowGraph, registry: &FlowNodeRegistry) -> Result<Vec<WorkspaceInput>, FlowError> {
@@ -127,12 +98,17 @@ impl WorkspaceStore {
         }
     }
 
-    pub(super) async fn open(data_root: &Path, sync_services: FlowSyncServices) -> Result<Self, WorkspaceError> {
+    pub(super) async fn open(
+        data_root: &Path,
+        store: FsStore,
+        native: Arc<RwLock<MachineNativeServices>>,
+        connectivity: PeerConnectivity,
+    ) -> Result<Self, WorkspaceError> {
         Ok(Self {
             data_root: data_root.to_path_buf(),
-            store: sync_services.blobs,
-            native: sync_services.native,
-            connectivity: sync_services.connectivity,
+            store,
+            native,
+            connectivity,
             #[cfg(test)]
             _native_fixture: None,
         })
@@ -282,7 +258,6 @@ impl WorkspaceStore {
     }
 
     pub(super) fn project_artifacts(
-        &self,
         execution_root: &Path,
         nodes: &mut [NodeExecutionSnapshot],
     ) -> Result<(), WorkspaceError> {
@@ -482,7 +457,7 @@ impl WorkspaceStore {
     }
 
     #[cfg(test)]
-    pub(super) fn attach_native_fixture(&mut self, fixture: super::fixtures::NativeDocsFixture) {
+    pub(super) fn attach_native_fixture(&mut self, fixture: NativeDocsFixture) {
         self._native_fixture = Some(fixture);
     }
 }

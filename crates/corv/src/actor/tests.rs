@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AuthMethod, EnvVariable, McpServer, McpServerStdio, PermissionOptionId, SessionConfigOptionCategory,
     SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionInfo,
     StopReason,
@@ -375,7 +375,7 @@ fn provider_config_options_use_typed_select_fields_and_group_shape() {
         "Recommended",
         vec![SessionConfigSelectOption::new("provider-model", "Provider model")],
     );
-    let option = agent_client_protocol::schema::v1::SessionConfigOption::select(
+    let option = agent_client_protocol::v1::schema::SessionConfigOption::select(
         "model",
         "Model",
         "provider-model",
@@ -5814,7 +5814,7 @@ fn discuss_broadcast_session_ready_serde_roundtrip() {
 fn discuss_broadcast_session_warning_serde_roundtrip() {
     let broadcast = DiscussBroadcast::SessionWarning {
         discuss_session_id: DiscussSessionId::new(),
-        acp_session_id: agent_client_protocol::schema::v1::SessionId::from("acp-2"),
+        acp_session_id: agent_client_protocol::v1::schema::SessionId::from("acp-2"),
         warning: "missing MCP-over-ACP capability".to_string(),
     };
 
@@ -6071,7 +6071,7 @@ fn dispatch_payload_serde_roundtrip() {
 /// `AcpAgentMessagePayload::StopReason` must roundtrip with `kind: "stopReason"`.
 #[test]
 fn stop_reason_payload_serde_roundtrip() {
-    use agent_client_protocol::schema::v1::StopReason;
+    use agent_client_protocol::v1::schema::StopReason;
 
     let payload = AcpAgentMessagePayload::StopReason {
         session_id: "sess-2".to_string(),

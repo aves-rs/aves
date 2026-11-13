@@ -145,7 +145,7 @@ fn capture_write_error(path: &Path, error: std::io::Error) -> DiscussError {
 mod tests {
     use super::super::super::test_library;
     use super::*;
-    use agent_client_protocol::schema::v1::{McpServer, McpServerStdio};
+    use agent_client_protocol::v1::schema::{McpServer, McpServerStdio};
     use tempfile::tempdir;
 
     #[test]

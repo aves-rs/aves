@@ -1,13 +1,12 @@
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-use agent_client_protocol::schema::v1::{
-    CreateElicitationResponse, ElicitationAction, ElicitationMode, ListSessionsRequest, McpServer, NewSessionResponse,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest, SessionConfigOptionValue, SessionId,
-    SetSessionConfigOptionRequest,
+use agent_client_protocol::v1::schema::{
+    CreateElicitationRequest, CreateElicitationResponse, ElicitationAction, ElicitationMode, ListSessionsRequest,
+    McpServer, NewSessionResponse, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SessionConfigOptionValue, SessionId, SetSessionConfigOptionRequest,
 };
-use agent_client_protocol::{
-    AcpAgent, Agent, Client, ConnectionTo, DynamicHandlerGuard, Responder, SessionMessage, UntypedMessage,
-};
+use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
+use agent_client_protocol::{AcpAgent, Agent, Client, DynamicHandlerGuard, Responder, UntypedMessage};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
@@ -60,7 +59,7 @@ pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -
     let captured_terminal_auth_methods_for_connection = captured_terminal_auth_methods.clone();
 
     let result = Client
-        .builder()
+        .v1()
         .name(session_name)
         .connect_with(agent, move |connection: ConnectionTo<Agent>| async move {
             let _callback_handler =
@@ -529,7 +528,7 @@ struct WorkerSessionSetup {
     mcp_shims: Vec<McpAcpShim>,
     mcp_handlers: Vec<DynamicHandlerGuard<Agent>>,
     mcp_http_lease: Option<McpHttpLease>,
-    mcp_descriptors: Vec<agent_client_protocol::schema::v1::McpServer>,
+    mcp_descriptors: Vec<McpServer>,
     mcp_claim: Option<McpRegistrationClaim>,
     opened: OpenedWorkerSession,
 }
@@ -669,7 +668,7 @@ struct PreparedMcpTransports {
     mcp_shims: Vec<McpAcpShim>,
     mcp_handlers: Vec<DynamicHandlerGuard<Agent>>,
     mcp_http_lease: Option<McpHttpLease>,
-    mcp_descriptors: Vec<agent_client_protocol::schema::v1::McpServer>,
+    mcp_descriptors: Vec<McpServer>,
 }
 
 #[expect(
@@ -921,8 +920,8 @@ async fn handle_agent_node_turn(
     reason = "preserve the single worker and existing ACP callback/stream context without introducing new shared state"
 )]
 async fn handle_elicitation_callback(
-    request: agent_client_protocol::schema::v1::CreateElicitationRequest,
-    acp_session_id: agent_client_protocol::schema::v1::SessionId,
+    request: CreateElicitationRequest,
+    acp_session_id: SessionId,
     responder: Responder<CreateElicitationResponse>,
     target: CallbackRouteTarget,
     position_allocator: &TranscriptPositionAllocator,
@@ -1170,7 +1169,7 @@ async fn handle_permission_callback(
 async fn attach_inspector(
     session: &WorkerSession,
     agents_workspace: &std::path::Path,
-    mcp_descriptors: &[agent_client_protocol::schema::v1::McpServer],
+    mcp_descriptors: &[McpServer],
     callback_router: &Arc<Mutex<CallbackRouter>>,
     callback_routes: &Option<Arc<Mutex<CallbackRouteRegistry>>>,
     callback_tx: &mpsc::Sender<CallbackEvent>,

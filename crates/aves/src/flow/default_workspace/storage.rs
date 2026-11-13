@@ -13,13 +13,14 @@ use iroh_blobs::{
 use iroh_docs::{AuthorId, NamespaceId, api::Doc, sync::Capability};
 use uuid::Uuid;
 
-use super::ast::{ContentAddressedPath, ContentAddressedRoot, ContentHash};
-use super::database::ExecutionDocumentLink;
+use crate::machine::MachineNativeServices;
+
+use super::super::ast::{ContentAddressedPath, ContentAddressedRoot, ContentHash};
+use super::super::database::ExecutionDocumentLink;
+use super::super::mobility::FlowExecutionNativeReferences;
+use super::super::types::{FlowExecutionId, WorkspaceError};
 use super::files::{checked_relative, collect_files, mapped_input_path, path_name};
-use super::mobility::FlowExecutionNativeReferences;
-use super::sync::FlowNativeServices;
-use super::types::{FlowExecutionId, WorkspaceError};
-use super::workspace::{WorkspaceInput, WorkspaceStore};
+use super::native::{WorkspaceInput, WorkspaceStore};
 
 pub(super) const EXECUTION_PATH: &str = "flow/execution";
 pub(super) const WORKSPACE_PATH: &str = "flow/workspace";
@@ -83,7 +84,7 @@ impl WorkspaceStore {
 
     /// Opens a cached document or returns a temporary document owned by the caller.
     async fn open_document(
-        native: &FlowNativeServices,
+        native: &MachineNativeServices,
         namespace: NamespaceId,
         identity: &str,
     ) -> Result<(Doc, bool), WorkspaceError> {
@@ -104,7 +105,7 @@ impl WorkspaceStore {
 
     /// Opens or imports a namespace while holding the cache lock through insertion.
     async fn open_or_import_document(
-        native: &FlowNativeServices,
+        native: &MachineNativeServices,
         namespace: NamespaceId,
     ) -> Result<(Doc, bool), WorkspaceError> {
         let mut open_documents = native.open_documents.lock().await;
@@ -885,8 +886,9 @@ mod tests {
     use super::*;
 
     async fn open_test(data_root: &Path) -> Result<WorkspaceStore, WorkspaceError> {
-        let fixture = super::super::fixtures::NativeDocsFixture::open(data_root).await;
-        let mut store = WorkspaceStore::open(data_root, fixture.sync_services()).await?;
+        let fixture = crate::flow::fixtures::NativeDocsFixture::open(data_root).await;
+        let services = fixture.sync_services();
+        let mut store = WorkspaceStore::open(data_root, services.blobs, services.native, services.connectivity).await?;
         store.attach_native_fixture(fixture);
         Ok(store)
     }
@@ -971,7 +973,7 @@ mod tests {
         std::fs::write(&file, "v1").unwrap();
         let store = open_test(directory.path()).await.unwrap();
         let document = store.create_execution_document().await.unwrap();
-        let execution_id = super::super::types::FlowExecutionId(uuid::Uuid::new_v4());
+        let execution_id = FlowExecutionId(uuid::Uuid::new_v4());
 
         let (_, entries) = store
             .capture_checkpoint(execution_id, &execution_root, &document, &BTreeMap::new(), 0)
@@ -1046,7 +1048,7 @@ mod tests {
         std::fs::write(execution_root.join("report.txt"), "report").unwrap();
         let store = open_test(directory.path()).await.unwrap();
         let document = store.create_execution_document().await.unwrap();
-        let execution_id = super::super::types::FlowExecutionId(uuid::Uuid::new_v4());
+        let execution_id = FlowExecutionId(uuid::Uuid::new_v4());
 
         let (checkpoint, entries) = store
             .capture_checkpoint(execution_id, &execution_root, &document, &BTreeMap::new(), 0)
@@ -1112,7 +1114,7 @@ mod tests {
         std::fs::write(execution_root.join("report.txt.bak"), "sibling").unwrap();
         let store = open_test(directory.path()).await.unwrap();
         let document = store.create_execution_document().await.unwrap();
-        let execution_id = super::super::types::FlowExecutionId(uuid::Uuid::new_v4());
+        let execution_id = FlowExecutionId(uuid::Uuid::new_v4());
         let (_, first_entries) = store
             .capture_checkpoint(execution_id, &execution_root, &document, &BTreeMap::new(), 0)
             .await
@@ -1193,7 +1195,7 @@ mod tests {
         let document = store.create_execution_document().await.unwrap();
         let (checkpoint, entries) = store
             .capture_checkpoint(
-                super::super::types::FlowExecutionId(uuid::Uuid::new_v4()),
+                FlowExecutionId(uuid::Uuid::new_v4()),
                 &execution_root,
                 &document,
                 &BTreeMap::new(),
@@ -1260,7 +1262,7 @@ mod tests {
 
         let (first, entries) = store
             .capture_checkpoint(
-                super::super::types::FlowExecutionId(uuid::Uuid::new_v4()),
+                FlowExecutionId(uuid::Uuid::new_v4()),
                 &execution_root,
                 &document,
                 &BTreeMap::new(),
@@ -1272,7 +1274,7 @@ mod tests {
         std::fs::write(execution_root.join("new.txt"), "new").unwrap();
         let (second, updated) = store
             .capture_checkpoint(
-                super::super::types::FlowExecutionId(uuid::Uuid::new_v4()),
+                FlowExecutionId(uuid::Uuid::new_v4()),
                 &execution_root,
                 &document,
                 &entries,

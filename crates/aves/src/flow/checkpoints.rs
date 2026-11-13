@@ -4,7 +4,9 @@ use tokio::time::Instant;
 
 use super::actor::Actor;
 use super::actor::terminal_retention_retry_due;
-use super::hook::{FlowAppCheckpoint, FlowAppHookContext, FlowAppLandingContext};
+use super::hook::{
+    FlowAppCheckpointCommittedContext, FlowAppCheckpointContext, FlowAppHookContext, FlowAppLandingContext,
+};
 use super::mailbox::TerminalResult;
 use super::messages::FlowBroadcast;
 use super::tick::{FlowDispatch, FlowTreeStatus, TickResult};
@@ -88,8 +90,6 @@ impl Actor {
                     .collect::<Vec<_>>()
             })
             .ok_or(FlowError::ExecutionNotFound)?;
-        let execution_root = self.workspace.execution_root(execution_id);
-
         let (previous_entries, superseded_sequence, sequence) = {
             let state = self
                 .execution
@@ -108,33 +108,26 @@ impl Actor {
         if status != FlowExecutionStatus::Active {
             Box::pin(self.request_owner_cancel(execution_id)).await?;
         }
-        let document = self.store.load_execution_document(execution_id).await?;
-        let checkpoint_owner = if let Some(hook) = &self.app_workspace_hook {
-            let state = self
-                .execution
-                .get(&execution_id)
-                .ok_or(FlowError::ExecutionNotFound)?;
-            hook.checkpoint(FlowAppHookContext {
-                execution_id,
-                flow_id: state.active.flow_id(),
-                definition_revision: state.active.revision(),
-                execution_root: execution_root.clone(),
-                invocation_kind: state.active.invocation_kind(),
+        let state = self
+            .execution
+            .get(&execution_id)
+            .ok_or(FlowError::ExecutionNotFound)?;
+        let execution_root = state.workspace.root();
+        let checkpoint = self
+            .workspace_hook
+            .checkpoint(FlowAppCheckpointContext {
+                execution: FlowAppHookContext {
+                    execution_id,
+                    flow_id: state.active.flow_id(),
+                    definition_revision: state.active.revision(),
+                    execution_root,
+                    invocation_kind: state.active.invocation_kind(),
+                },
+                previous_entries,
+                sequence,
             })
             .await
-            .map_err(|source| FlowError::AppWorkspaceCheckpoint { source })?
-        } else {
-            FlowAppCheckpoint::Flow
-        };
-        let (workspace_checkpoint, workspace_entries) = if checkpoint_owner == FlowAppCheckpoint::App {
-            (None, std::collections::BTreeMap::new())
-        } else {
-            let (checkpoint, entries) = self
-                .workspace
-                .capture_checkpoint(execution_id, &execution_root, &document, &previous_entries, sequence)
-                .await?;
-            (Some(checkpoint), entries)
-        };
+            .map_err(|source| FlowError::AppWorkspaceCheckpoint { source })?;
         let dispatches = tick.dispatches;
         let failure_message = pending.iter().find_map(|item| item.failure_message.clone());
         let state = self
@@ -145,8 +138,8 @@ impl Actor {
             state.tick_loop.mark_pending_failed();
         }
         let mut snapshot = state.snapshot(execution_id, status, tick.reconstruction, failure_message);
-        snapshot.workspace_checkpoint = workspace_checkpoint;
-        snapshot.workspace_entries = workspace_entries;
+        snapshot.workspace_checkpoint = checkpoint.workspace_checkpoint;
+        snapshot.workspace_entries = checkpoint.workspace_entries;
         state.prepared_checkpoint_commit = Some(PreparedCheckpointCommit {
             snapshot,
             superseded_sequence,
@@ -262,41 +255,28 @@ impl Actor {
             prepared.snapshot_saved = true;
         }
 
-        if prepared.snapshot.execution.status != FlowExecutionStatus::Active {
-            let (mapping, imported_workspace_root) = self
-                .execution
-                .get(&execution_id)
-                .map(|state| (state.workspace_mappings.clone(), state.imported_workspace_root.clone()))
-                .ok_or(FlowError::ExecutionNotFound)?;
-            if let Err(error) = self
-                .workspace
-                .project_mapped_workspace(
-                    execution_id,
-                    &mapping,
-                    imported_workspace_root.as_ref(),
-                    &self.workspace_source_service,
-                )
-                .await
-            {
-                self.execution
-                    .get_mut(&execution_id)
-                    .ok_or(FlowError::ExecutionNotFound)?
-                    .prepared_checkpoint_commit = Some(prepared);
-                return Err(error);
-            }
-        }
-
-        if let Some(sequence) = prepared.superseded_sequence
-            && let Err(error) = self
-                .workspace
-                .release_checkpoint_pin(execution_id, sequence)
-                .await
-        {
+        let state = self
+            .execution
+            .get(&execution_id)
+            .ok_or(FlowError::ExecutionNotFound)?;
+        let execution_root = prepared.snapshot.workspace.root();
+        let context = FlowAppCheckpointCommittedContext {
+            execution: FlowAppHookContext {
+                execution_id,
+                flow_id: prepared.snapshot.execution.flow_id,
+                definition_revision: prepared.snapshot.execution.revision,
+                execution_root,
+                invocation_kind: prepared.snapshot.execution.invocation_kind,
+            },
+            sequence: state.checkpoint_sequence,
+            superseded_sequence: prepared.superseded_sequence,
+        };
+        if let Err(source) = self.workspace_hook.checkpoint_committed(context).await {
             self.execution
                 .get_mut(&execution_id)
                 .ok_or(FlowError::ExecutionNotFound)?
                 .prepared_checkpoint_commit = Some(prepared);
-            return Err(error.into());
+            return Err(FlowError::AppWorkspaceCheckpoint { source });
         }
         prepared.superseded_sequence = None;
         let state = self
@@ -387,38 +367,43 @@ impl Actor {
 
     /// Removes one terminal execution's workspace projection before its durable row.
     pub(super) async fn cleanup_terminal_execution(&mut self, execution_id: FlowExecutionId) -> Result<(), FlowError> {
-        if let Some(hook) = &self.app_workspace_hook {
-            let snapshot = self
-                .terminal_executions
-                .iter()
-                .find(|snapshot| snapshot.execution_id == execution_id)
-                .ok_or(FlowError::ExecutionNotFound)?;
-            let context = FlowAppHookContext {
-                execution_id,
-                flow_id: snapshot.flow_id,
-                definition_revision: snapshot.revision,
-                execution_root: self.workspace.execution_root(execution_id),
-                invocation_kind: snapshot.invocation_kind,
-            };
-            let landing = FlowAppLandingContext {
-                execution: context.clone(),
-                status: snapshot.status.clone(),
-                correlations: Vec::new(),
-            };
-            hook.landing(landing)
-                .await
-                .map_err(|source| FlowError::AppWorkspaceCleanup { source })?;
-            hook.release_artifacts(context)
-                .await
-                .map_err(|source| FlowError::AppWorkspaceCleanup { source })?;
-        }
-        let document = self
+        let durable = self
+            .snapshot_store
+            .load_all()
+            .await?
+            .into_iter()
+            .find(|snapshot| snapshot.execution.execution_id == execution_id)
+            .ok_or(FlowError::ExecutionNotFound)?;
+        let snapshot = &durable.execution;
+        let execution_root = durable.workspace.root();
+        let mut context = FlowAppHookContext {
+            execution_id,
+            flow_id: snapshot.flow_id,
+            definition_revision: snapshot.revision,
+            execution_root,
+            invocation_kind: snapshot.invocation_kind,
+        };
+        context.execution_root = self.workspace_hook.execution_root(context.clone()).await?;
+        let workspace_mappings = self
             .store
-            .load_execution_document_optional(execution_id)
-            .await?;
-        self.workspace
-            .cleanup_execution(execution_id, document.as_ref())
-            .await?;
+            .load_definition_revision(snapshot.flow_id, snapshot.revision)
+            .await?
+            .workspace_mappings;
+        let landing = FlowAppLandingContext {
+            execution: context.clone(),
+            status: snapshot.status.clone(),
+            correlations: Vec::new(),
+            workspace_mappings,
+            imported_workspace_root: durable.imported_workspace_root,
+        };
+        self.workspace_hook
+            .landing(landing)
+            .await
+            .map_err(|source| FlowError::AppWorkspaceCleanup { source })?;
+        self.workspace_hook
+            .release_artifacts(context)
+            .await
+            .map_err(|source| FlowError::AppWorkspaceCleanup { source })?;
         self.store.delete_execution(execution_id).await?;
         Ok(())
     }

@@ -8,7 +8,7 @@ use crate::utils::database::connect_database;
 
 use super::ast::{BlackboardBinding, FlowNode, NodeConstraints, NodeDataSpace};
 use super::cron::FlowTriggerRecord;
-use super::files::validate_mappings;
+use super::default_workspace::validate_mappings;
 use super::graph::GraphNode;
 use super::mobility::{
     FlowActivationAcknowledgement, FlowAuthorityState, FlowMobilityCommitAcknowledgement, FlowMobilitySnapshot,

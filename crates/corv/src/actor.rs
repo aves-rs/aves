@@ -5,8 +5,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::SessionId;
-use agent_client_protocol::{Agent, ConnectionTo};
+use agent_client_protocol::Agent;
+use agent_client_protocol::v1::{ConnectionTo, schema::SessionId};
 use semver::Version;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;

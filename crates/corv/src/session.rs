@@ -8,15 +8,16 @@ use std::{
 };
 
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AuthCapabilities, AuthMethod, ClientCapabilities, CreateElicitationRequest, CreateElicitationResponse,
     ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities, ElicitationScope, InitializeRequest,
     LoadSessionRequest, McpServer, NewSessionRequest, NewSessionResponse, RequestPermissionRequest,
-    SessionConfigOptionValue, SessionId, SessionInfo, SetSessionConfigOptionRequest,
+    RequestPermissionResponse, SessionConfigOptionValue, SessionId, SessionInfo, SetSessionConfigOptionRequest,
 };
+use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
 use agent_client_protocol::{
-    AcpAgent, Agent, ConnectionTo, Dispatch, DynamicHandlerGuard, HandleDispatchFrom, Handled, SessionMessage,
-    UntypedMessage,
+    AcpAgent, Agent, ConnectionTo as RawConnectionTo, Dispatch, DynamicHandlerGuard, HandleDispatchFrom, Handled,
+    UntypedMessage, V1,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Deserialize;
@@ -96,7 +97,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) launch_config: Option<SessionLaunchConfig>,
     pub(super) stream_tx: mpsc::Sender<DiscussStreamEvent>,
     pub(super) discuss_session_id: DiscussSessionId,
-    pub(super) auth_launch_server: agent_client_protocol::schema::v1::McpServer,
+    pub(super) auth_launch_server: McpServer,
     pub(super) session_name: String,
     pub(super) agent_name: String,
     pub(super) assigned_agent_name: Option<String>,
@@ -316,7 +317,7 @@ impl SessionCallbackRouter {
         &self,
         request: RequestPermissionRequest,
         target: CallbackRouteTarget,
-        responder: agent_client_protocol::Responder<agent_client_protocol::schema::v1::RequestPermissionResponse>,
+        responder: agent_client_protocol::Responder<RequestPermissionResponse>,
     ) -> Result<(), agent_client_protocol::Error> {
         let event = CallbackEvent::Permission {
             request,
@@ -421,7 +422,7 @@ impl HandleDispatchFrom<Agent> for SessionCallbackRouter {
     async fn handle_dispatch_from(
         &mut self,
         message: Dispatch,
-        _cx: ConnectionTo<Agent>,
+        _cx: RawConnectionTo<Agent>,
     ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
         match message {
             Dispatch::Request(request, responder) => {
@@ -429,12 +430,8 @@ impl HandleDispatchFrom<Agent> for SessionCallbackRouter {
                 if let Ok(permission) = serde_json::from_value::<RequestPermissionRequest>(request.params().clone())
                     && let Some(target) = self.target_for_session(&permission.session_id).await
                 {
-                    self.route_permission(
-                        permission,
-                        target,
-                        responder.cast::<agent_client_protocol::schema::v1::RequestPermissionResponse>(),
-                    )
-                    .await?;
+                    self.route_permission(permission, target, responder.cast::<RequestPermissionResponse>())
+                        .await?;
                     return Ok(Handled::Yes);
                 }
                 if let Ok(elicitation) = serde_json::from_value::<CreateElicitationRequest>(request.params().clone())
@@ -594,7 +591,7 @@ pub(super) struct SessionCapabilitiesCache {
 impl SessionCapabilitiesCache {
     pub(super) fn from_agent_capabilities(
         plugin: &dyn plugins::DiscussAgentPlugin,
-        caps: &agent_client_protocol::schema::v1::AgentCapabilities,
+        caps: &agent_client_protocol::v1::schema::AgentCapabilities,
     ) -> Self {
         Self {
             list: plugin.supports_session_list(caps.session_capabilities.list.is_some()),
@@ -717,7 +714,7 @@ impl HandleDispatchFrom<Agent> for SessionMessageRouter {
     async fn handle_dispatch_from(
         &mut self,
         message: Dispatch,
-        _cx: ConnectionTo<Agent>,
+        _cx: RawConnectionTo<Agent>,
     ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
         let session_id: Option<SessionId> = match &message {
             Dispatch::Request(request, _) if request.method() == "elicitation/create" => None,
@@ -740,7 +737,7 @@ impl HandleDispatchFrom<Agent> for SessionMessageRouter {
         });
         if route_matches {
             self.update_tx
-                .send(SessionMessage::SessionMessage(message))
+                .send(SessionMessage::Message(message.into_protocol::<V1>()?))
                 .map_err(|_| agent_client_protocol::Error::internal_error())?;
             return Ok(Handled::Yes);
         }
@@ -820,7 +817,7 @@ impl WorkerSession {
         self.connection
             .send_request_to(
                 Agent,
-                agent_client_protocol::schema::v1::PromptRequest::new(
+                agent_client_protocol::v1::schema::PromptRequest::new(
                     self.session_id.clone(),
                     vec![prompt.to_string().into()],
                 ),
@@ -830,7 +827,7 @@ impl WorkerSession {
                 async move |result| {
                     let response = result?;
                     update_tx
-                        .send(SessionMessage::StopReason(response.stop_reason))
+                        .send(SessionMessage::PromptResponse(Ok(response)))
                         .map_err(|_| agent_client_protocol::Error::internal_error())?;
                     Ok(())
                 }

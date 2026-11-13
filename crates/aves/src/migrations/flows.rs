@@ -41,4 +41,9 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "flow_mobility",
         sql: include_str!("./flow_migrations/0009_flow_mobility.sql"),
     },
+    Migration {
+        version: 10,
+        name: "flow_workspace_provenance",
+        sql: include_str!("./flow_migrations/0010_flow_workspace_provenance.sql"),
+    },
 ];

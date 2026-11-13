@@ -28,13 +28,13 @@ use crate::tasks::{
 use crate::utils::database::{MigrationRunner, connect_database};
 
 use super::super::database::FlowStore;
-use super::super::files::{checked_relative, seed_workspace_seeds};
+use super::super::default_workspace::{DefaultWorkspace, seed_workspace_seeds};
 use super::super::fixtures::NativeDocsFixture;
 use super::super::hook::{
-    FlowAppCheckpoint, FlowAppCheckpointFuture, FlowAppHookContext, FlowAppHookError, FlowAppHookFuture,
-    FlowAppLandingContext, FlowAppWorkspaceHook,
+    FlowAppCheckpointContext, FlowAppCheckpointFuture, FlowAppCheckpointResult, FlowAppHookContext, FlowAppHookError,
+    FlowAppHookFuture, FlowAppLandingContext, FlowAppRestoreContext, FlowAppRestoreFuture, FlowAppTakeoffContext,
+    FlowAppTakeoffFuture, FlowAppTakeoffResult, FlowAppWorkspaceHook,
 };
-use super::super::registration::NodeRegistrationSupply;
 use super::super::types::FlowMobilityReadiness;
 use super::super::{
     BoundOutputs, CancellationDisposition, FlowAuthorityState, FlowBootOptions, FlowExecutionSnapshot,
@@ -299,17 +299,8 @@ fn script_registration(tasks: Arc<dyn TasksLifecycleSudoService>) -> NodeKindReg
             let (source, filename) = match inputs.get("source").and_then(serde_json::Value::as_str) {
                 Some(source) => (source.to_owned(), configuration.entry_point.clone()),
                 None => {
-                    let (relative, rooted) = if configuration.source_root.is_some() {
-                        (configuration.entry_point.clone(), true)
-                    } else {
-                        (
-                            checked_relative(std::path::Path::new(&configuration.entry_point))
-                                .map_err(|error| NodeLifecycleDispatchError::Owner(Box::new(error)))?
-                                .to_string_lossy()
-                                .into_owned(),
-                            false,
-                        )
-                    };
+                    let relative = configuration.entry_point.clone();
+                    let rooted = configuration.source_root.is_some();
                     let path = if rooted {
                         context.execution_root.join("code").join(&relative)
                     } else {
@@ -521,22 +512,39 @@ struct TestWorkspaceSource;
 
 #[derive(Clone)]
 enum HookCall {
-    Checkpoint(FlowAppHookContext),
-    Restore(FlowAppHookContext),
-    Takeoff(FlowAppHookContext),
+    Checkpoint(FlowAppCheckpointContext),
+    Restore(FlowAppRestoreContext),
+    Takeoff(FlowAppTakeoffContext),
     Landing(FlowAppLandingContext),
     Release(FlowAppHookContext),
 }
 
-#[derive(Default)]
 struct RecordingWorkspaceHook {
     calls: Mutex<Vec<HookCall>>,
     fail_checkpoint: bool,
-    checkpoint_owner: FlowAppCheckpoint,
+    checkpoint: FlowAppCheckpointResult,
     symlink_on_takeoff: bool,
     fail_takeoff: bool,
     fail_landing: bool,
     fail_release: bool,
+    takeoff_root: Option<std::path::PathBuf>,
+    fallback_root: Mutex<PathBuf>,
+}
+
+impl Default for RecordingWorkspaceHook {
+    fn default() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            fail_checkpoint: false,
+            checkpoint: FlowAppCheckpointResult::default(),
+            symlink_on_takeoff: false,
+            fail_takeoff: false,
+            fail_landing: false,
+            fail_release: false,
+            takeoff_root: None,
+            fallback_root: Mutex::new(PathBuf::new()),
+        }
+    }
 }
 
 impl RecordingWorkspaceHook {
@@ -546,7 +554,18 @@ impl RecordingWorkspaceHook {
 }
 
 impl FlowAppWorkspaceHook for RecordingWorkspaceHook {
-    fn checkpoint(&self, context: FlowAppHookContext) -> FlowAppCheckpointFuture<'_> {
+    fn execution_root(&self, context: FlowAppHookContext) -> super::super::hook::FlowWorkspaceFuture<'_, PathBuf> {
+        Box::pin(async move {
+            Ok(self.takeoff_root.clone().unwrap_or_else(|| {
+                self.fallback_root
+                    .lock()
+                    .unwrap()
+                    .join("executions")
+                    .join(context.execution_id.to_string())
+            }))
+        })
+    }
+    fn checkpoint(&self, context: FlowAppCheckpointContext) -> FlowAppCheckpointFuture<'_> {
         self.calls
             .lock()
             .unwrap()
@@ -555,17 +574,25 @@ impl FlowAppWorkspaceHook for RecordingWorkspaceHook {
             if self.fail_checkpoint {
                 Err(Box::new(std::io::Error::other("checkpoint failed")) as FlowAppHookError)
             } else {
-                Ok(self.checkpoint_owner)
+                Ok(self.checkpoint.clone())
             }
         })
     }
 
-    fn restore(&self, context: FlowAppHookContext) -> FlowAppHookFuture<'_> {
-        self.calls.lock().unwrap().push(HookCall::Restore(context));
-        Box::pin(async { Ok(()) })
+    fn restore(&self, context: FlowAppRestoreContext) -> FlowAppRestoreFuture<'_> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HookCall::Restore(context.clone()));
+        Box::pin(async move {
+            Ok(self
+                .takeoff_root
+                .clone()
+                .unwrap_or(context.execution.execution_root))
+        })
     }
 
-    fn takeoff(&self, context: FlowAppHookContext) -> FlowAppHookFuture<'_> {
+    fn takeoff(&self, context: FlowAppTakeoffContext) -> FlowAppTakeoffFuture<'_> {
         self.calls
             .lock()
             .unwrap()
@@ -574,11 +601,19 @@ impl FlowAppWorkspaceHook for RecordingWorkspaceHook {
             if self.fail_takeoff {
                 Err(Box::new(std::io::Error::other("takeoff failed")) as FlowAppHookError)
             } else {
+                let execution_root = self
+                    .takeoff_root
+                    .clone()
+                    .unwrap_or(context.execution.execution_root);
+                std::fs::create_dir_all(&execution_root)?;
                 #[cfg(unix)]
                 if self.symlink_on_takeoff {
-                    std::os::unix::fs::symlink("missing-target", context.execution_root.join("workspace-link"))?;
+                    std::os::unix::fs::symlink("missing-target", execution_root.join("workspace-link"))?;
                 }
-                Ok(())
+                Ok(FlowAppTakeoffResult {
+                    execution_root,
+                    imported_workspace_root: None,
+                })
             }
         })
     }
@@ -604,6 +639,116 @@ impl FlowAppWorkspaceHook for RecordingWorkspaceHook {
             }
         })
     }
+}
+
+#[tokio::test]
+async fn application_takeoff_uses_its_root_without_native_preparation_or_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("application-workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("script.ts"), "application workspace source").unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks.clone()).await;
+    let hook = Arc::new(RecordingWorkspaceHook {
+        takeoff_root: Some(root.clone()),
+        ..Default::default()
+    });
+    actor.install_workspace(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    let mut flow = definition(flow_id, 1);
+    flow.blackboard_defaults = serde_json::json!({"source": null});
+    actor.create_flow(flow).await.unwrap();
+
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    assert_eq!(
+        tasks.last_source.lock().unwrap().as_deref(),
+        Some("application workspace source")
+    );
+    let native_root = actor
+        .database_path
+        .with_extension("")
+        .join("executions")
+        .join(execution_id.to_string());
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!native_root.exists());
+    assert!(!root.join("workflow/trigger.json").exists());
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        hook.calls()
+            .iter()
+            .any(|call| matches!(call, HookCall::Checkpoint(context) if context.execution.execution_root == root))
+    );
+    std::fs::create_dir_all(&native_root).unwrap();
+    std::fs::write(native_root.join("unrelated-sentinel"), "unrelated").unwrap();
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    actor
+        .cleanup_terminal_execution(execution_id)
+        .await
+        .unwrap();
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(root.join("script.ts").is_file());
+    assert_eq!(
+        std::fs::read(native_root.join("unrelated-sentinel")).unwrap(),
+        b"unrelated"
+    );
+    assert!(
+        hook.calls()
+            .iter()
+            .any(|call| matches!(call, HookCall::Release(context) if context.execution_root == root))
+    );
+    assert!(
+        actor
+            .snapshot_store
+            .load_all()
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.execution.execution_id != execution_id)
+    );
+    actor.shutdown().await.unwrap();
 }
 
 struct RejectingMobilityService;
@@ -657,6 +802,23 @@ impl super::super::types::FlowWorkspaceSourceService for TestWorkspaceSource {
 }
 
 impl Actor {
+    fn install_workspace(&mut self, hook: Arc<RecordingWorkspaceHook>) {
+        *hook.fallback_root.lock().unwrap() = self.database_path.with_extension("");
+        self.workspace_hook = hook;
+        self.application_workspace = true;
+    }
+
+    async fn execution_root(&self, execution_id: FlowExecutionId) -> PathBuf {
+        self.snapshot_store
+            .load_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.execution.execution_id == execution_id)
+            .unwrap()
+            .workspace
+            .root()
+    }
     async fn shutdown(&mut self) -> Result<FlowResponse, FlowError> {
         self.shutdown_runtime().await
     }
@@ -890,10 +1052,23 @@ async fn echo_actor(
     recorder: Arc<std::sync::Mutex<Vec<String>>>,
     include_script: bool,
 ) -> Actor {
+    let fixture = NativeDocsFixture::open(path).await;
+    let reader =
+        ServiceReader::<dyn MachinePeerService>::from_published_test_service(Arc::new(fixture.sync_services()));
+    echo_actor_with_sync(path, recorder, include_script, fixture, reader).await
+}
+
+async fn echo_actor_with_sync(
+    path: &std::path::Path,
+    recorder: Arc<std::sync::Mutex<Vec<String>>>,
+    include_script: bool,
+    native_fixture: NativeDocsFixture,
+    sync_reader: ServiceReader<dyn MachinePeerService>,
+) -> Actor {
     let options = FlowBootOptions::open(path.to_path_buf()).await.unwrap();
     let (_, rx) = mpsc::channel(16);
     let (broadcast_tx, _) = mpsc::channel(16);
-    let native_fixture = NativeDocsFixture::open(path).await;
+    let local_services = native_fixture.sync_services();
     let mut node_registrations = options.node_registrations;
     node_registrations.push(echo_registration(recorder));
     if include_script {
@@ -904,6 +1079,24 @@ async fn echo_actor(
         });
         node_registrations.push(script_registration(tasks));
     }
+    let mut registry = FlowNodeRegistry::new();
+    for registration in node_registrations {
+        registry.register(registration).unwrap();
+    }
+    let node_registry = Arc::new(registry);
+    let workspace_hook = Arc::new(
+        DefaultWorkspace::new(
+            options.data_root.clone(),
+            &local_services,
+            node_registry.clone(),
+            ServiceReader::from_published_test_service(Arc::new(TestWorkspaceSource)),
+            FlowStore::new(options.database.clone()),
+            ExecutionSnapshotStore::new(options.database.clone()),
+        )
+        .await
+        .unwrap()
+        .with_native_fixture(native_fixture),
+    );
     Actor::new(
         rx,
         ActorDependencies {
@@ -911,17 +1104,15 @@ async fn echo_actor(
             broadcast_tx,
             auth_service: ServiceReader::from_published_test_service(Arc::new(TestAuth)),
             mcp_bus_service: None,
-            data_root: options.data_root,
+            database_path: options.data_root.with_extension("db"),
             database: options.database,
-            node_registrations,
-            node_registration_supply: NodeRegistrationSupply::default(),
+            node_registry,
             bus_context: BusRpcContext::unavailable(),
-            workspace_source_service: ServiceReader::from_published_test_service(Arc::new(TestWorkspaceSource)),
-            app_workspace_hook: None,
-            sync_services: native_fixture.sync_services(),
+            workspace_hook,
+            application_workspace: false,
+            sync_services: sync_reader,
             mobility_service: Arc::new(RejectingMobilityService),
             retention_completed_runs: 10,
-            native_fixture: Some(native_fixture),
         },
     )
     .await
@@ -1157,6 +1348,32 @@ async fn actor_for_with_broadcasts(
     let native_fixture = NativeDocsFixture::open(path).await;
     let sync_services = native_fixture.sync_services();
     let mobility_service: Arc<dyn super::super::mobility::FlowMobilityService> = Arc::new(RejectingMobilityService);
+    let mut registrations = options.node_registrations;
+    registrations.push(script_registration(tasks));
+    registrations.push(
+        agent
+            .map(|agent| agent_registration(agent, agent_copy_sources))
+            .unwrap_or_else(unused_agent_registration),
+    );
+    registrations.push(unused_order_registration());
+    let mut registry = FlowNodeRegistry::new();
+    for registration in registrations {
+        registry.register(registration).unwrap();
+    }
+    let node_registry = Arc::new(registry);
+    let workspace_hook = Arc::new(
+        DefaultWorkspace::new(
+            options.data_root.clone(),
+            &sync_services,
+            node_registry.clone(),
+            ServiceReader::from_published_test_service(Arc::new(TestWorkspaceSource)),
+            FlowStore::new(options.database.clone()),
+            ExecutionSnapshotStore::new(options.database.clone()),
+        )
+        .await
+        .unwrap()
+        .with_native_fixture(native_fixture),
+    );
     let actor = Actor::new(
         rx,
         ActorDependencies {
@@ -1164,27 +1381,15 @@ async fn actor_for_with_broadcasts(
             broadcast_tx,
             auth_service: ServiceReader::from_published_test_service(Arc::new(TestAuth)),
             mcp_bus_service: None,
-            data_root: options.data_root,
+            database_path: options.data_root.with_extension("db"),
             database: options.database,
-            node_registrations: {
-                let mut registrations = options.node_registrations;
-                registrations.push(script_registration(tasks));
-                registrations.push(
-                    agent
-                        .map(|agent| agent_registration(agent, agent_copy_sources))
-                        .unwrap_or_else(unused_agent_registration),
-                );
-                registrations.push(unused_order_registration());
-                registrations
-            },
-            node_registration_supply: NodeRegistrationSupply::default(),
+            node_registry,
             bus_context: BusRpcContext::unavailable(),
-            workspace_source_service: ServiceReader::from_published_test_service(Arc::new(TestWorkspaceSource)),
-            app_workspace_hook: None,
-            sync_services,
+            workspace_hook,
+            application_workspace: false,
+            sync_services: ServiceReader::from_published_test_service(Arc::new(sync_services)),
             mobility_service,
             retention_completed_runs,
-            native_fixture: Some(native_fixture),
         },
     )
     .await
@@ -1205,17 +1410,19 @@ async fn retention_update_is_applied_while_idle() {
     )
     .await;
 
-    let execution_id = FlowExecutionId(Uuid::new_v4());
-    actor.terminal_executions.push(FlowExecutionSnapshot {
-        execution_id,
-        flow_id: FlowId(Uuid::new_v4()),
-        revision: 1,
-        invocation_kind: super::super::types::FlowInvocationKind::Manual,
-        status: FlowExecutionStatus::Succeeded,
-        started_at: FlowTimestamp::now(),
-        completed_at: Some(FlowTimestamp::now()),
-        error: None,
-    });
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    actor.running = false;
+    assert!(
+        actor
+            .terminal_executions
+            .iter()
+            .any(|run| run.execution_id == execution_id)
+    );
     let (reply_to, reply_rx) = oneshot::channel();
 
     actor
@@ -1301,7 +1508,7 @@ async fn start_request_returns_takeoff_error_and_create_then_start_succeeds() {
         last_source: Mutex::new(None),
     });
     let (mut failed_actor, _) = actor_for(failed_dir.path(), tasks.clone()).await;
-    failed_actor.app_workspace_hook = Some(Arc::new(RecordingWorkspaceHook {
+    failed_actor.install_workspace(Arc::new(RecordingWorkspaceHook {
         fail_takeoff: true,
         ..Default::default()
     }));
@@ -1474,7 +1681,7 @@ async fn app_workspace_takeoff_precedes_first_node_tick_and_carries_context() {
     });
     let (mut actor, _) = actor_for(dir.path(), tasks.clone()).await;
     let hook = Arc::new(RecordingWorkspaceHook::default());
-    actor.app_workspace_hook = Some(hook.clone());
+    actor.install_workspace(hook.clone());
     actor.running = true;
     let flow_id = FlowId(Uuid::new_v4());
     actor.create_flow(definition(flow_id, 7)).await.unwrap();
@@ -1497,16 +1704,19 @@ async fn app_workspace_takeoff_precedes_first_node_tick_and_carries_context() {
             _ => None,
         })
         .expect("takeoff call");
-    assert_eq!(context.execution_id, execution_id);
-    assert_eq!(context.flow_id, flow_id);
-    assert_eq!(context.definition_revision, 7);
+    assert_eq!(context.execution.execution_id, execution_id);
+    assert_eq!(context.execution.flow_id, flow_id);
+    assert_eq!(context.execution.definition_revision, 7);
+    assert_eq!(context.definition.flow_id, flow_id);
+    assert_eq!(context.definition.revision, 7);
+    assert_eq!(context.pulse, serde_json::Value::Null);
     assert_eq!(
-        context.execution_root,
+        context.execution.execution_root,
         dir.path()
             .join("flows/executions")
             .join(execution_id.to_string())
     );
-    assert_eq!(context.invocation_kind, FlowInvocationKind::Manual);
+    assert_eq!(context.execution.invocation_kind, FlowInvocationKind::Manual);
     assert_eq!(tasks.starts.load(Ordering::SeqCst), 1);
     actor.shutdown().await.unwrap();
 }
@@ -1524,7 +1734,7 @@ async fn app_workspace_takeoff_failure_discards_unlinked_execution_without_tick(
         fail_takeoff: true,
         ..Default::default()
     });
-    actor.app_workspace_hook = Some(hook.clone());
+    actor.install_workspace(hook.clone());
     actor.running = true;
     let flow_id = FlowId(Uuid::new_v4());
     actor.create_flow(definition(flow_id, 1)).await.unwrap();
@@ -1550,7 +1760,7 @@ async fn app_workspace_takeoff_failure_discards_unlinked_execution_without_tick(
             _ => None,
         })
         .expect("takeoff call");
-    assert!(!context.execution_root.exists());
+    assert!(!context.execution.execution_root.exists());
     actor.shutdown().await.unwrap();
 }
 
@@ -1567,7 +1777,7 @@ async fn app_workspace_landing_failure_does_not_block_terminalization() {
         fail_landing: true,
         ..Default::default()
     });
-    actor.app_workspace_hook = Some(hook.clone());
+    actor.install_workspace(hook.clone());
     actor.running = true;
     let flow_id = FlowId(Uuid::new_v4());
     actor.create_flow(definition(flow_id, 1)).await.unwrap();
@@ -1604,7 +1814,7 @@ async fn app_workspace_landing_reports_success_failure_and_abort_statuses() {
         });
         let (mut actor, _) = actor_for(dir.path(), tasks).await;
         let hook = Arc::new(RecordingWorkspaceHook::default());
-        actor.app_workspace_hook = Some(hook.clone());
+        actor.install_workspace(hook.clone());
         actor.running = true;
         let flow_id = FlowId(Uuid::new_v4());
         actor.create_flow(definition(flow_id, 1)).await.unwrap();
@@ -1646,16 +1856,27 @@ async fn app_checkpoint_skips_flow_capture_and_allows_symlinks_through_landing()
     )
     .await;
     let hook = Arc::new(RecordingWorkspaceHook {
-        checkpoint_owner: FlowAppCheckpoint::App,
         symlink_on_takeoff: true,
         ..Default::default()
     });
-    actor.app_workspace_hook = Some(hook.clone());
+    actor.install_workspace(hook.clone());
     actor.running = true;
     let flow_id = FlowId(Uuid::new_v4());
     actor.create_flow(definition(flow_id, 1)).await.unwrap();
     let execution_id = start_flow(&mut actor, flow_id).await;
-    let root = actor.workspace.execution_root(execution_id);
+    let root = actor
+        .database_path
+        .with_extension("")
+        .join("executions")
+        .join(execution_id.to_string());
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         root.join("workspace-link")
             .symlink_metadata()
@@ -1693,9 +1914,9 @@ async fn app_checkpoint_skips_flow_capture_and_allows_symlinks_through_landing()
         HookCall::Checkpoint(context) => Some(context),
         _ => None,
     }) {
-        assert_eq!(context.execution_id, execution_id);
-        assert_eq!(context.flow_id, flow_id);
-        assert_eq!(context.execution_root, root);
+        assert_eq!(context.execution.execution_id, execution_id);
+        assert_eq!(context.execution.flow_id, flow_id);
+        assert_eq!(context.execution.execution_root, root);
     }
     assert!(
         calls
@@ -1713,6 +1934,43 @@ async fn app_checkpoint_skips_flow_capture_and_allows_symlinks_through_landing()
 }
 
 #[tokio::test]
+async fn app_checkpoint_transition_does_not_require_a_flow_document_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _) = actor_for(
+        dir.path(),
+        Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick: false,
+            last_source: Mutex::new(None),
+        }),
+    )
+    .await;
+    actor.install_workspace(Arc::new(RecordingWorkspaceHook { ..Default::default() }));
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    assert!(
+        actor
+            .terminal_executions
+            .iter()
+            .any(|item| item.execution_id == execution_id)
+    );
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn app_checkpoint_error_fails_start() {
     let dir = tempfile::tempdir().unwrap();
     let (mut actor, _) = actor_for(
@@ -1724,7 +1982,7 @@ async fn app_checkpoint_error_fails_start() {
         }),
     )
     .await;
-    actor.app_workspace_hook = Some(Arc::new(RecordingWorkspaceHook {
+    actor.install_workspace(Arc::new(RecordingWorkspaceHook {
         fail_checkpoint: true,
         ..Default::default()
     }));
@@ -1747,6 +2005,32 @@ async fn app_checkpoint_error_fails_start() {
 }
 
 #[tokio::test]
+async fn selected_workspace_is_reused_for_independent_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = Arc::new(TestTasks {
+        starts: AtomicUsize::new(0),
+        fail_tick: false,
+        last_source: Mutex::new(None),
+    });
+    let (mut actor, _) = actor_for(dir.path(), tasks).await;
+    assert!(!dir.path().join("flows/executions").exists());
+    let source = dir.path().join("input.txt");
+    std::fs::write(&source, "input").unwrap();
+    actor
+        .import_workspace(source.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let selected = actor.workspace_hook.clone();
+    let source = dir.path().join("input.txt");
+    actor
+        .import_workspace(source.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&selected, &actor.workspace_hook));
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn flow_without_app_workspace_hook_keeps_normal_start_and_terminal_behavior() {
     let dir = tempfile::tempdir().unwrap();
     let tasks = Arc::new(TestTasks {
@@ -1761,6 +2045,21 @@ async fn flow_without_app_workspace_hook_keeps_normal_start_and_terminal_behavio
     let execution_id = start_flow(&mut actor, flow_id).await;
     assert_eq!(tasks.starts.load(Ordering::SeqCst), 1); // The ScriptNode start is dispatched through Tasks.
     assert!(actor.execution.contains_key(&execution_id));
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        actor
+            .execution_root(execution_id)
+            .await
+            .join("workflow/trigger.json")
+            .is_file()
+    );
     let durable = actor
         .snapshot_store
         .load_all()
@@ -1771,6 +2070,9 @@ async fn flow_without_app_workspace_hook_keeps_normal_start_and_terminal_behavio
         .unwrap();
     assert!(durable.workspace_checkpoint.is_some());
     assert!(!durable.workspace_entries.is_empty());
+    let root = actor.execution_root(execution_id).await;
+    std::fs::write(root.join("empty.txt"), b"").unwrap();
+    std::fs::remove_file(root.join("workflow/trigger.json")).unwrap();
     let completion = actor.completion_rx.recv().await.unwrap();
     actor.handle_dispatch_result(completion).await.unwrap();
     assert!(
@@ -1779,28 +2081,7 @@ async fn flow_without_app_workspace_hook_keeps_normal_start_and_terminal_behavio
             .iter()
             .any(|run| run.execution_id == execution_id && run.status == FlowExecutionStatus::Succeeded)
     );
-    actor.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn default_app_checkpoint_keeps_flow_checkpoint_capture() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut actor, _) = actor_for(
-        dir.path(),
-        Arc::new(TestTasks {
-            starts: AtomicUsize::new(0),
-            fail_tick: false,
-            last_source: Mutex::new(None),
-        }),
-    )
-    .await;
-    let hook = Arc::new(RecordingWorkspaceHook::default());
-    actor.app_workspace_hook = Some(hook.clone());
-    actor.running = true;
-    let flow_id = FlowId(Uuid::new_v4());
-    actor.create_flow(definition(flow_id, 4)).await.unwrap();
-    let execution_id = start_flow(&mut actor, flow_id).await;
-    let durable = actor
+    let terminal = actor
         .snapshot_store
         .load_all()
         .await
@@ -1808,20 +2089,42 @@ async fn default_app_checkpoint_keeps_flow_checkpoint_capture() {
         .into_iter()
         .find(|item| item.execution.execution_id == execution_id)
         .unwrap();
-    assert!(durable.workspace_checkpoint.is_some());
-    assert!(!durable.workspace_entries.is_empty());
-    assert_eq!(
-        hook.calls()
+    assert!(terminal.workspace_checkpoint.is_some());
+    assert!(!terminal.workspace_entries.is_empty());
+    let empty_hash = super::super::ast::ContentHash::try_from(iroh_blobs::Hash::EMPTY.to_string()).unwrap();
+    assert_eq!(terminal.workspace_entries.get("empty.txt"), Some(&empty_hash));
+    assert!(
+        !terminal
+            .workspace_entries
+            .contains_key("workflow/trigger.json")
+    );
+    actor
+        .cleanup_terminal_execution(execution_id)
+        .await
+        .unwrap();
+    assert!(!root.exists());
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        actor
+            .snapshot_store
+            .load_all()
+            .await
+            .unwrap()
             .iter()
-            .filter(|call| matches!(call, HookCall::Checkpoint(_)))
-            .count(),
-        1
+            .all(|item| item.execution.execution_id != execution_id)
     );
     actor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn app_owned_restart_restores_hook_context_and_trigger_file() {
+async fn app_checkpoint_result_is_persisted_at_start_and_transition() {
     let dir = tempfile::tempdir().unwrap();
     let (mut actor, _) = actor_for(
         dir.path(),
@@ -1832,11 +2135,81 @@ async fn app_owned_restart_restores_hook_context_and_trigger_file() {
         }),
     )
     .await;
+    let hash = super::super::ast::ContentHash::try_from(iroh_blobs::Hash::EMPTY.to_string()).unwrap();
+    let checkpoint = FlowAppCheckpointResult {
+        workspace_checkpoint: Some(ContentAddressedRoot { digest: hash.clone() }),
+        workspace_entries: BTreeMap::from([("example.txt".to_owned(), hash)]),
+    };
     let hook = Arc::new(RecordingWorkspaceHook {
-        checkpoint_owner: FlowAppCheckpoint::App,
+        checkpoint: checkpoint.clone(),
         ..Default::default()
     });
-    actor.app_workspace_hook = Some(hook.clone());
+    actor.install_workspace(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 4)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let initial = actor
+        .snapshot_store
+        .load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.execution.execution_id == execution_id)
+        .unwrap();
+    assert_eq!(initial.workspace_checkpoint, checkpoint.workspace_checkpoint);
+    assert_eq!(initial.workspace_entries, checkpoint.workspace_entries);
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    let terminal = actor
+        .snapshot_store
+        .load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.execution.execution_id == execution_id)
+        .unwrap();
+    assert_eq!(terminal.workspace_checkpoint, checkpoint.workspace_checkpoint);
+    assert_eq!(terminal.workspace_entries, checkpoint.workspace_entries);
+    let calls = hook.calls();
+    let contexts: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            HookCall::Checkpoint(context) => Some(context),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0].sequence, 0);
+    assert!(contexts[0].previous_entries.is_empty());
+    assert_eq!(contexts[1].sequence, 1);
+    assert_eq!(contexts[1].previous_entries, checkpoint.workspace_entries);
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_owned_restart_restores_selected_root_without_native_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _) = actor_for(
+        dir.path(),
+        Arc::new(TestTasks {
+            starts: AtomicUsize::new(0),
+            fail_tick: false,
+            last_source: Mutex::new(None),
+        }),
+    )
+    .await;
+    let hash = super::super::ast::ContentHash::try_from(iroh_blobs::Hash::EMPTY.to_string()).unwrap();
+    let checkpoint = FlowAppCheckpointResult {
+        workspace_checkpoint: Some(ContentAddressedRoot { digest: hash.clone() }),
+        workspace_entries: BTreeMap::from([("restored.txt".to_owned(), hash)]),
+    };
+    let hook = Arc::new(RecordingWorkspaceHook {
+        takeoff_root: Some(dir.path().join("custom-root")),
+        checkpoint: checkpoint.clone(),
+        ..Default::default()
+    });
+    actor.install_workspace(hook.clone());
     actor.running = true;
     let flow_id = FlowId(Uuid::new_v4());
     actor.create_flow(definition(flow_id, 9)).await.unwrap();
@@ -1849,20 +2222,43 @@ async fn app_owned_restart_restores_hook_context_and_trigger_file() {
         .into_iter()
         .find(|item| item.execution.execution_id == execution_id)
         .unwrap();
-    assert!(snapshot.workspace_checkpoint.is_none());
-    assert!(snapshot.workspace_entries.is_empty());
-    let (restored_id, _) = Actor::restore_execution(
-        &snapshot,
-        &actor.store,
-        &actor.workspace,
-        &actor.node_registry,
-        actor.app_workspace_hook.as_ref(),
-    )
-    .await
-    .unwrap();
+    assert_eq!(snapshot.workspace_checkpoint, checkpoint.workspace_checkpoint);
+    assert_eq!(snapshot.workspace_entries, checkpoint.workspace_entries);
+    actor.application_workspace = false;
+    assert!(matches!(
+        actor.restore_execution(&snapshot).await,
+        Err(FlowError::AppWorkspaceUnavailable { execution_id: id }) if id == execution_id
+    ));
+    actor.application_workspace = true;
+    let (restored_id, restored) = actor.restore_execution(&snapshot).await.unwrap();
     assert_eq!(restored_id, execution_id);
-    let root = actor.workspace.execution_root(execution_id);
-    assert!(root.join("workflow/trigger.json").is_file());
+    let root = dir.path().join("custom-root");
+    assert_eq!(restored.workspace.root(), root);
+    assert!(!root.join("workflow/trigger.json").exists());
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !actor
+            .database_path
+            .with_extension("")
+            .join("executions")
+            .join(execution_id.to_string())
+            .exists()
+    );
+    assert!(
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let calls = hook.calls();
     let restores = calls
         .iter()
@@ -1874,15 +2270,20 @@ async fn app_owned_restart_restores_hook_context_and_trigger_file() {
     let [context] = restores.as_slice() else {
         panic!("restart calls restore once")
     };
-    assert_eq!(context.execution_id, execution_id);
-    assert_eq!(context.flow_id, flow_id);
-    assert_eq!(context.definition_revision, 9);
-    assert_eq!(context.execution_root, root);
+    assert_eq!(context.execution.execution_id, execution_id);
+    assert_eq!(context.execution.flow_id, flow_id);
+    assert_eq!(context.execution.definition_revision, 9);
+    assert_eq!(context.execution.execution_root, root);
+    assert_eq!(context.definition.flow_id, flow_id);
+    assert_eq!(context.definition.revision, 9);
+    assert_eq!(context.workspace_checkpoint, snapshot.workspace_checkpoint);
+    assert_eq!(context.workspace_entries, snapshot.workspace_entries);
+    assert_eq!(context.imported_workspace_root, snapshot.imported_workspace_root);
     actor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn retention_cleanup_lands_then_releases_before_removing_execution_root() {
+async fn retention_cleanup_replays_landing_then_releases_application_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let tasks = Arc::new(TestTasks {
         starts: AtomicUsize::new(0),
@@ -1891,35 +2292,42 @@ async fn retention_cleanup_lands_then_releases_before_removing_execution_root() 
     });
     let (mut actor, _) = actor_for(dir.path(), tasks).await;
     let hook = Arc::new(RecordingWorkspaceHook::default());
-    actor.app_workspace_hook = Some(hook.clone());
-    let execution_id = FlowExecutionId(Uuid::new_v4());
+    actor.install_workspace(hook.clone());
+    actor.running = true;
     let flow_id = FlowId(Uuid::new_v4());
-    let root = actor.workspace.execution_root(execution_id);
-    std::fs::create_dir_all(&root).unwrap();
-    actor.terminal_executions.push(FlowExecutionSnapshot {
-        execution_id,
-        flow_id,
-        revision: 3,
-        invocation_kind: FlowInvocationKind::Event,
-        status: FlowExecutionStatus::Failed,
-        started_at: FlowTimestamp::now(),
-        completed_at: Some(FlowTimestamp::now()),
-        error: None,
-    });
+    actor.create_flow(definition(flow_id, 3)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let root = actor
+        .database_path
+        .with_extension("")
+        .join("executions")
+        .join(execution_id.to_string());
+    std::fs::write(root.join("app-owned"), "keep").unwrap();
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    let preceding_calls = hook.calls().len();
 
     actor
         .cleanup_terminal_execution(execution_id)
         .await
         .unwrap();
     let calls = hook.calls();
-    let [HookCall::Landing(landing), HookCall::Release(release)] = calls.as_slice() else {
+    let [HookCall::Landing(landing), HookCall::Release(release)] = &calls[preceding_calls..] else {
         panic!("cleanup must land before releasing artifacts")
     };
     assert_eq!(landing.execution.execution_id, execution_id);
     assert_eq!(release.execution_id, execution_id);
+    assert!(landing.correlations.is_empty());
+    assert!(landing.workspace_mappings.is_empty());
+    assert!(landing.imported_workspace_root.is_none());
+    assert!(root.join("app-owned").is_file());
     assert!(
-        !root.exists(),
-        "Flow removes the execution directory after both hook steps"
+        actor
+            .store
+            .load_execution_document_optional(execution_id)
+            .await
+            .unwrap()
+            .is_none()
     );
     actor.shutdown().await.unwrap();
 }
@@ -1937,27 +2345,26 @@ async fn failed_cleanup_hook_preserves_execution_directory_anchor() {
         fail_landing: true,
         ..Default::default()
     });
-    actor.app_workspace_hook = Some(hook.clone());
-    let execution_id = FlowExecutionId(Uuid::new_v4());
-    let root = actor.workspace.execution_root(execution_id);
-    std::fs::create_dir_all(&root).unwrap();
-    actor.terminal_executions.push(FlowExecutionSnapshot {
-        execution_id,
-        flow_id: FlowId(Uuid::new_v4()),
-        revision: 1,
-        invocation_kind: FlowInvocationKind::Manual,
-        status: FlowExecutionStatus::Succeeded,
-        started_at: FlowTimestamp::now(),
-        completed_at: Some(FlowTimestamp::now()),
-        error: None,
-    });
+    actor.install_workspace(hook.clone());
+    actor.running = true;
+    let flow_id = FlowId(Uuid::new_v4());
+    actor.create_flow(definition(flow_id, 1)).await.unwrap();
+    let execution_id = start_flow(&mut actor, flow_id).await;
+    let root = actor
+        .database_path
+        .with_extension("")
+        .join("executions")
+        .join(execution_id.to_string());
+    let completion = actor.completion_rx.recv().await.unwrap();
+    actor.handle_dispatch_result(completion).await.unwrap();
+    let preceding_calls = hook.calls().len();
 
     assert!(matches!(
         actor.cleanup_terminal_execution(execution_id).await,
         Err(FlowError::AppWorkspaceCleanup { .. })
     ));
     assert!(root.exists(), "cleanup anchor remains until hook landing succeeds");
-    assert!(matches!(hook.calls().as_slice(), [HookCall::Landing(_)]));
+    assert!(matches!(&hook.calls()[preceding_calls..], [HookCall::Landing(_)]));
     actor.shutdown().await.unwrap();
 }
 
@@ -1977,7 +2384,7 @@ async fn cleanup_hook_failure_keeps_anchor_and_does_not_suppress_terminal_broadc
         fail_landing: true,
         ..Default::default()
     });
-    actor.app_workspace_hook = Some(hook.clone());
+    actor.install_workspace(hook.clone());
     actor.running = true;
     let flow_id = FlowId(Uuid::new_v4());
     actor.create_flow(definition(flow_id, 1)).await.unwrap();
@@ -1985,7 +2392,11 @@ async fn cleanup_hook_failure_keeps_anchor_and_does_not_suppress_terminal_broadc
     let completion = actor.completion_rx.recv().await.unwrap();
     actor.handle_dispatch_result(completion).await.unwrap();
 
-    let execution_root = actor.workspace.execution_root(execution_id);
+    let execution_root = actor
+        .database_path
+        .with_extension("")
+        .join("executions")
+        .join(execution_id.to_string());
     assert!(execution_root.exists(), "failed cleanup retains the execution anchor");
     assert!(
         actor
@@ -2232,8 +2643,8 @@ async fn imported_workspace_materializes_agent_owner_cwd_with_known_file() {
     assert_eq!(
         std::fs::read_to_string(
             actor
-                .workspace
                 .execution_root(execution_id)
+                .await
                 .join(".agents/persona.md")
         )
         .unwrap(),
@@ -2243,24 +2654,16 @@ async fn imported_workspace_materializes_agent_owner_cwd_with_known_file() {
     let completion = actor.completion_rx.recv().await.unwrap();
     actor.handle_dispatch_result(completion).await.unwrap();
     std::fs::write(agents.join(".agents/persona.md"), "changed after checkpoint").unwrap();
-    let checkpoint = snapshot
+    snapshot
         .workspace_checkpoint
         .as_ref()
         .expect("initial workspace checkpoint");
-    actor
-        .workspace
-        .materialize_clean(
-            checkpoint,
-            &actor.workspace.execution_root(execution_id),
-            "test/recovery",
-        )
-        .await
-        .unwrap();
+    actor.restore_execution(&snapshot).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(
             actor
-                .workspace
                 .execution_root(execution_id)
+                .await
                 .join(".agents/persona.md")
         )
         .unwrap(),
@@ -3051,6 +3454,85 @@ async fn start_rejects_unregistered_kind_before_dispatch() {
     ));
     assert_eq!(tasks.starts.load(Ordering::SeqCst), 0);
     actor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn flow_runs_locally_and_resolves_machine_peer_services_in_either_order() {
+    // No Machine, Machine after Flow, and Machine before Flow.
+    for publication in [None, Some(false), Some(true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = NativeDocsFixture::open(directory.path()).await;
+        let services = fixture.sync_services();
+        let (reader, publisher) = ServiceReader::<dyn MachinePeerService>::test_slot();
+        if publication == Some(true) {
+            assert!(publisher.publish(Arc::new(services.clone())).is_ok());
+        }
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = echo_actor_with_sync(directory.path(), recorder.clone(), false, fixture, reader).await;
+        assert!(!actor.peer_sync_available);
+        if publication == Some(false) {
+            assert!(publisher.publish(Arc::new(services.clone())).is_ok());
+        }
+        actor.start_runtime().await.unwrap();
+        assert_eq!(actor.peer_sync_available, publication.is_some());
+        let flow_id = FlowId(Uuid::new_v4());
+        actor.create_flow(echo_definition(flow_id)).await.unwrap();
+        let input = directory.path().join("input.txt");
+        std::fs::write(&input, "local workspace").unwrap();
+        let root = actor.workspace_hook.import_path(input).await.unwrap();
+        let contents = actor
+            .workspace_hook
+            .read_script_source(ScriptSourceLocation::Stored { root }, "input.txt".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(contents, "local workspace");
+
+        if publication.is_none() {
+            assert!(matches!(
+                actor.synchronize_flow(flow_id).await,
+                Err(FlowError::Workspace(WorkspaceError::ProviderUnavailable))
+            ));
+        }
+        let execution_id = start_flow(&mut actor, flow_id).await;
+        let completion = actor.completion_rx.recv().await.unwrap();
+        actor.handle_dispatch_result(completion).await.unwrap();
+        assert_eq!(*recorder.lock().unwrap(), ["start", "tick"]);
+        assert!(
+            actor
+                .snapshot_store
+                .load_all()
+                .await
+                .unwrap()
+                .iter()
+                .any(|snapshot| {
+                    snapshot.execution.execution_id == execution_id && snapshot.workspace_checkpoint.is_some()
+                })
+        );
+
+        if publication.is_some() {
+            assert!(actor.require_peer_service().is_ok());
+            actor
+                .select_mobility_destination(
+                    flow_id,
+                    vec![super::super::types::FlowMobilityDestination {
+                        peer_key: iroh::SecretKey::from_bytes(&[42; 32]).public().into(),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                actor.synchronize_flow(flow_id).await,
+                Err(FlowError::MobilityPeer { .. })
+            ));
+        } else {
+            assert!(publisher.publish(Arc::new(services)).is_ok());
+            assert!(matches!(
+                actor.synchronize_flow(flow_id).await,
+                Err(FlowError::Workspace(WorkspaceError::ProviderUnavailable))
+            ));
+        }
+        actor.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

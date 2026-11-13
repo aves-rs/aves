@@ -1,9 +1,9 @@
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::auth::Jwt;
+use crate::machine::PeerConnectivity;
 use crate::runtime::ServicePublisher;
 
-use super::PeerConnectivity;
 use super::control::{BusControlError, BusSudoService, TransportBindings, start_control};
 use super::event_bus::{EventBus, OpaqueRequestEnvelope};
 use super::messages::BusRpcContext;

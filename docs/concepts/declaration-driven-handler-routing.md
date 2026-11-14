@@ -8,7 +8,7 @@ references:
   - crates/aves/macros/src/routing.rs
   - crates/aves/macros/src/tests.rs
   - crates/aves/src/config/domain.rs
-  - crates/corv/src/domain.rs
+  - crates/corv/src/discuss/domain.rs
   - crates/tyto/src/domain.rs
   - crates/aves/src/flow/domain.rs
   - crates/kea/src/domain.rs
@@ -32,7 +32,7 @@ Kea Knowledge uses generated request and outbound handling. Its `handle.rs` also
 
 ## How it works
 
-A domain declaration includes optional response-timeout, inbound, and outbound blocks. See `crates/aves/src/config/domain.rs` and `crates/corv/src/domain.rs` for real declarations.
+A domain declaration includes optional response-timeout, inbound, and outbound blocks. See `crates/aves/src/config/domain.rs` and `crates/corv/src/discuss/domain.rs` for real declarations.
 
 The macro generates:
 

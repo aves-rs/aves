@@ -36,6 +36,7 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 | [Iroh Peer Runtime](architecture/aves/iroh-peer-runtime.md) | Native transport and trust |
 | [Pluggable Flow Nodes](architecture/aves/pluggable-flow-nodes.md) | Node registration and dispatch |
 | [Discuss Domain](architecture/corv/discuss-domain.md) | ACP sessions, providers and MCP |
+| [Decide Domain](architecture/corv/decide-domain.md) | Bounded bool/choice/score model questions and Decide nodes |
 | [Knowledge Domain](architecture/kea/knowledge-domain.md) | Notes, Data and Canvas |
 | [Tyto Credentials](architecture/tyto/credentials.md) | Credential supply boundary |
 | [Tyto Connection](architecture/tyto/connection.md) | Provider connections and inflows |
@@ -67,6 +68,7 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 |---|---|
 | [Adding a Flow Node Kind](guides/adding-a-flow-node-kind.md) | Implementing a node registration |
 | [Aves Domain RPC](guides/aves-domain-rpc.md) | Publishing generated RPC operations |
+| [Using the Decide Domain](guides/using-the-decide-domain.md) | Installing Decide, supplying credentials, asking questions, Decide nodes |
 | [Stale Named References](guides/stale-named-references.md) | Diagnosing missing Tyto connections |
 
 ## External Documentation Cache

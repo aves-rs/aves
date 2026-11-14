@@ -10,7 +10,7 @@ references:
   - crates/aves/src/flow/actor.rs
   - crates/aves/src/tasks/handle.rs
   - crates/aves/src/tasks/adapter.rs
-  - crates/corv/src/agent_nodes.rs
+  - crates/corv/src/discuss/agent_nodes.rs
 ---
 
 # Adding a Flow Node Kind
@@ -62,7 +62,7 @@ The full registration function at `crates/aves/src/tasks/adapter.rs:22-120` invo
 
 If the cancel path needs owner-local state (e.g. a session map plus a streaming service reader), wrap it in an `Arc<dyn Any + Send + Sync>` and pass it as the `owner_state` argument. Downcast it inside each callback via `context.owner_state.as_ref().and_then(|s| s.downcast_ref::<ScriptNodeOwnerState>())`.
 
-The existing `AgentNode` registration (`crates/corv/src/agent_nodes.rs`) demonstrates this pattern: the `AgentNodeOwnerState` holds the lifecycle service, the streaming reader, the copy-source port, and the session map, all constructed during Discuss-domain construction.
+The existing `AgentNode` registration (`crates/corv/src/discuss/agent_nodes.rs`) demonstrates this pattern: the `AgentNodeOwnerState` holds the lifecycle service, the streaming reader, the copy-source port, and the session map, all constructed during Discuss-domain construction.
 
 ### 4. Push the registration into the shared supply
 

@@ -18,9 +18,9 @@ references:
   - crates/aves/src/migrations/flows.rs
   - crates/aves/src/tasks/adapter.rs
   - crates/aves/src/tasks/sandbox.rs
-  - crates/corv/src/actor.rs
-  - crates/corv/src/agent_nodes.rs
-  - crates/corv/src/plugins/mod.rs
+  - crates/corv/src/discuss/actor.rs
+  - crates/corv/src/discuss/agent_nodes.rs
+  - crates/corv/src/discuss/plugins/mod.rs
 ---
 
 # Flow Dataflow

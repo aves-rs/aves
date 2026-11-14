@@ -1,6 +1,6 @@
 [package]
 name = "aves-corv"
-version = "0.9.0"
+version = "0.10.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Specialized discussion domain for the Aves async application runtime"
 authors = { workspace = true }
@@ -24,15 +24,16 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # internal
-aves = { path = "../aves", version = "=0.9.0", features = ["test-support"] }
+aves = { path = "../aves", version = "=0.10.0", features = ["test-support"] }
 
 # external
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves = { path = "../aves", version = "=0.9.0" }
+aves = { path = "../aves", version = "=0.10.0" }
 
 # external
 agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp"] }
@@ -56,3 +57,4 @@ tracing = { workspace = true }
 turso = { workspace = true }
 uuid = { workspace = true }
 yaml_serde = { workspace = true }
+zeroize = { workspace = true }

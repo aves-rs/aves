@@ -6,7 +6,7 @@ This repository contains the reusable Aves runtime and three optional domain cra
 |---|---|---|
 | `crates/aves/` | Runtime, bus, Auth, Config, Flow, Tasks, shared utilities | [Aves](crates/aves/AGENTS.md) |
 | `crates/aves/macros/` | Compile-time bus and RPC generation | [Macros](crates/aves/macros/AGENTS.md) |
-| `crates/corv/` | Discuss, ACP sessions, Teams, MCP | [Corv](crates/corv/AGENTS.md) |
+| `crates/corv/` | Discuss (ACP sessions, Teams, MCP) and Decide (bounded model questions) | [Corv](crates/corv/AGENTS.md) |
 | `crates/kea/` | Knowledge notes, Data, Canvas | [Kea](crates/kea/AGENTS.md) |
 | `crates/tyto/` | Messaging subscriptions, Send, Flow nodes | [Tyto](crates/tyto/AGENTS.md) |
 

@@ -1,6 +1,6 @@
 //! Translation of resolved, harness-neutral operation rules to OpenCode V2.
 
-use crate::types::{Effect, Operation, RuleSet};
+use crate::discuss::types::{Effect, Operation, RuleSet};
 use serde::Serialize;
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -101,7 +101,7 @@ pub(crate) fn translate(sources: &[RuleSet]) -> Translation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Rule;
+    use crate::discuss::types::Rule;
 
     #[test]
     fn empty_and_intersected_sets_fail_closed() {

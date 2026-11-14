@@ -17,8 +17,8 @@ references:
   - crates/aves/src/flow/graph.rs
   - crates/aves/src/flow/catalog.rs
   - crates/aves/src/tasks/adapter.rs
-  - crates/corv/src/agent_nodes.rs
-  - crates/corv/src/handle.rs
+  - crates/corv/src/discuss/agent_nodes.rs
+  - crates/corv/src/discuss/handle.rs
   - crates/aves/src/tasks/handle.rs
 ---
 
@@ -34,7 +34,7 @@ Aves Flow owns an open, validated `NodeKind` identifier and a common node envelo
 
 ## Data flow
 
-1. **Boot supply.** The embedding application constructs one `NodeRegistrationSupply::default()` and threads it through `ConstructionInputs`. Tasks' `Handle::new` (`crates/aves/src/tasks/handle.rs`) pushes `script_node_registration`; Discuss's constructor (`crates/corv/src/handle.rs`) pushes `agent_node_registration`. Flow's handle drains the supply into `FlowNodeRegistry` before actor construction. Owners MUST be constructed before FlowDomain because pushes after the drain are not registered.
+1. **Boot supply.** The embedding application constructs one `NodeRegistrationSupply::default()` and threads it through `ConstructionInputs`. Tasks' `Handle::new` (`crates/aves/src/tasks/handle.rs`) pushes `script_node_registration`; Discuss's constructor (`crates/corv/src/discuss/handle.rs`) pushes `agent_node_registration`. Flow's handle drains the supply into `FlowNodeRegistry` before actor construction. Owners MUST be constructed before FlowDomain because pushes after the drain are not registered.
 2. **Dispatch.** `HostLifecycleAdapter::start/tick/cancel` (`crates/aves/src/flow/adapter.rs`) resolves the registration via `registry.get(kind)`, decodes the owner configuration, and invokes the registration's typed callback. The envelope's transport JWT is the Flow domain's authenticated `BusRpcContext` for all three operations; the node-scoped token carries `AuthCapability::AllBus` and is issued only at Start (tick/cancel carry `node_token: None`).
 3. **Typed error propagation.** `NodeLifecycleDispatchError` distinguishes `ConfigurationTypeMismatch`, `Send`, `ReplyDropped`, and `Owner` — replacing the prior lossy `Option` shape. `map_dispatch_error` converts these to stable `FlowAdapterError` variants.
 4. **Workspace.** The selected workspace handles takeoff. `DefaultWorkspace` resolves graph seeds before preparing the execution workspace; an application workspace replaces the default rather than running alongside it. `WorkspacePreparationError` retains typed `ServiceUnavailable` / `Configuration` / `Resolution { source }` identity.

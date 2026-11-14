@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn configured_launch_denies_omitted_operations_from_partial_rules() {
-        use crate::types::{Effect, Operation, Rule, RuleSet};
+        use crate::discuss::types::{Effect, Operation, Rule, RuleSet};
 
         let workspace = tempdir().unwrap();
         let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));

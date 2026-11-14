@@ -3,14 +3,14 @@ title: MCP-over-ACP Tooling
 type: concept
 updated: 2026-10-23
 references:
-  - crates/corv/src/mcp.rs
-  - crates/corv/src/mcp_http.rs
+  - crates/corv/src/discuss/mcp.rs
+  - crates/corv/src/discuss/mcp_http.rs
   - crates/aves/src/utils/transport.rs
-  - crates/corv/src/mcp_direct.rs
-  - crates/corv/src/mcp_relay.rs
-  - crates/corv/src/actor.rs
-  - crates/corv/src/session.rs
-  - crates/corv/src/messages.rs
+  - crates/corv/src/discuss/mcp_direct.rs
+  - crates/corv/src/discuss/mcp_relay.rs
+  - crates/corv/src/discuss/actor.rs
+  - crates/corv/src/discuss/session.rs
+  - crates/corv/src/discuss/messages.rs
   - crates/aves/src/config/types.rs
   - crates/aves/src/bus/control.rs
   - crates/aves/src/bus/messages.rs
@@ -34,7 +34,7 @@ not permitted.
 
 ## Transport selection
 
-`select_mcp_transport` in `crates/corv/src/actor.rs` runs on new and loaded/reconnected sessions:
+`select_mcp_transport` in `crates/corv/src/discuss/actor.rs` runs on new and loaded/reconnected sessions:
 
 ```text
 application_mcp_enabled=false  → None (no MCP server)
@@ -45,19 +45,19 @@ no supported transport    → None + SessionWarning broadcast
 
 ### Native ACP (preferred)
 
-`McpAcpShim` in `crates/corv/src/mcp_direct.rs` is chat-worker-local
+`McpAcpShim` in `crates/corv/src/discuss/mcp_direct.rs` is chat-worker-local
 even on a shared ACP transport (`_owner` is the session id). It
 installs dynamic handlers (`mcp/connect`, `mcp/message`, `mcp/disconnect`),
 supplies an `McpServer::Acp` descriptor, and is never persisted.
 ### Loopback HTTP lease (fallback)
 
-`McpHttpLease` in `crates/corv/src/mcp_relay.rs` opens a bus-owned
+`McpHttpLease` in `crates/corv/src/discuss/mcp_relay.rs` opens a bus-owned
 loopback listener (`127.0.0.1:0`, `BusSudoService::open_mcp`). The Discuss
 worker obtains a non-root delegated JWT (`sub = "agent"`, 30-day expiry)
-through `AuthSudoService` (`issue_worker_jwt`, `crates/corv/src/session.rs`)
+through `AuthSudoService` (`issue_worker_jwt`, `crates/corv/src/discuss/session.rs`)
 and adds it to each bus-provided `McpServer::Http` descriptor as an
 `Authorization: Bearer <JWT>` header.
-`run_mcp` in `crates/corv/src/mcp_http.rs` serves `/mcp/{domain}` via `require_http_mcp_bearer` middleware, validates exactly one well-formed compact JWT bearer header, and forwards the extracted token as `HttpMcpBearer` in request extensions; missing, malformed, duplicated, empty, or non-compact-JWT headers are rejected with UNAUTHORIZED before bus ingress.
+`run_mcp` in `crates/corv/src/discuss/mcp_http.rs` serves `/mcp/{domain}` via `require_http_mcp_bearer` middleware, validates exactly one well-formed compact JWT bearer header, and forwards the extracted token as `HttpMcpBearer` in request extensions; missing, malformed, duplicated, empty, or non-compact-JWT headers are rejected with UNAUTHORIZED before bus ingress.
 
 - Loopback only; reconnect opens a fresh lease; close is bus `close_mcp`. Lease open failure keeps the ACP session alive without Discuss tools and emits a `SessionWarning`.
 - The worker JWT is never logged, persisted, or broadcast. Its JTI is revoked through `AuthSudoService` on every terminal path; 30-day expiry is the fallback.
@@ -70,7 +70,7 @@ nor HTTP MCP capability, the session continues without Corv tools and a
 
 ## Shared MCP core
 
-Corv owns the shared MCP core in `src/mcp.rs` and HTTP serving in `src/mcp_http.rs`. RPC serving remains in Aves `utils/transport.rs`, with no MCP implementation or Corv import. The embedding application composes both factories through `TransportBindings::new`; the bus retains generic listener lifecycle ownership.
+Corv owns the shared MCP core in `crates/corv/src/discuss/mcp.rs` and HTTP serving in `crates/corv/src/discuss/mcp_http.rs`. RPC serving remains in Aves `utils/transport.rs`, with no MCP implementation or Corv import. The embedding application composes both factories through `TransportBindings::new`; the bus retains generic listener lifecycle ownership.
 
 ```text
   Aves descriptors (mcp_eligible + schemas)

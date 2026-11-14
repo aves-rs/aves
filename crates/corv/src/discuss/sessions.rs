@@ -1608,7 +1608,7 @@ pub(super) fn dedupe_session_list(sessions: Vec<DiscussSessionInfo>) -> Vec<Disc
 #[cfg(test)]
 mod team_at_root_setup_tests {
     use super::*;
-    use crate::storage::DiscussSessionRow;
+    use crate::discuss::storage::DiscussSessionRow;
 
     fn row(team_leader_id: Option<&str>, setup_kind: Option<&str>) -> DiscussSessionRow {
         DiscussSessionRow {

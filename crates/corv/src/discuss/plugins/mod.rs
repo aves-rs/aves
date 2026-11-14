@@ -949,7 +949,7 @@ mod install_team_at_root_tests {
 
     #[test]
     fn install_team_at_root_materializes_leader_and_followers_under_the_given_root_only() {
-        let library = crate::test_library::library();
+        let library = crate::discuss::test_library::library();
         let team = library
             .teams_for()
             .find(|team| !team.followers.is_empty())
@@ -988,6 +988,14 @@ mod install_team_at_root_tests {
     fn install_team_at_root_rejects_an_unregistered_leader() {
         let root = tempdir().expect("execution root");
         let missing = AgentId::new("no-such-leader").expect("canonical id");
-        assert!(install_team_at_root("opencode", crate::test_library::library(), root.path(), &missing).is_err());
+        assert!(
+            install_team_at_root(
+                "opencode",
+                crate::discuss::test_library::library(),
+                root.path(),
+                &missing
+            )
+            .is_err()
+        );
     }
 }

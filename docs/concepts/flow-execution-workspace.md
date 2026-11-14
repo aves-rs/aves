@@ -19,10 +19,10 @@ references:
   - crates/aves/src/flow/types.rs
   - crates/aves/src/tasks/sandbox.rs
   - crates/aves/src/tasks/messages.rs
-  - crates/corv/src/handle.rs
-  - crates/corv/src/actor.rs
-  - crates/corv/src/provider.rs
-  - crates/corv/src/agent_nodes.rs
+  - crates/corv/src/discuss/handle.rs
+  - crates/corv/src/discuss/actor.rs
+  - crates/corv/src/discuss/provider.rs
+  - crates/corv/src/discuss/agent_nodes.rs
   - crates/aves/src/config/types.rs
   - crates/aves/src/auth/types.rs
 ---

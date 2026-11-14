@@ -10,7 +10,7 @@ references:
   - crates/aves/src/bus/control.rs
   - crates/aves/src/runtime/mod.rs
   - crates/aves/src/utils/transport.rs
-  - crates/corv/src/mcp_http.rs
+  - crates/corv/src/discuss/mcp_http.rs
 ---
 
 # Aves Domain RPC Wiring

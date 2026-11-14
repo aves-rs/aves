@@ -1,35 +1,34 @@
 ---
 title: Discuss Domain Architecture
 type: architecture
-updated: 2026-10-29
+updated: 2026-11-14
 references:
   - crates/corv/AGENTS.md
   - crates/corv/src/lib.rs
-  - crates/corv/src/actor.rs
-  - crates/corv/src/agent_nodes.rs
-  - crates/corv/src/session.rs
-  - crates/corv/src/worker.rs
-  - crates/corv/src/supervisor.rs
-  - crates/corv/src/messages.rs
-  - crates/corv/src/domain.rs
-  - crates/corv/src/provider.rs
-  - crates/corv/src/types.rs
-  - crates/corv/src/handle.rs
-  - crates/corv/src/teams.rs
-  - crates/corv/src/sessions.rs
-  - crates/corv/src/database.rs
-  - crates/corv/src/storage.rs
-  - crates/corv/src/elicitation.rs
-  - crates/corv/src/agents.rs
-  - crates/corv/src/plugins/mod.rs
-  - crates/corv/src/mcp_direct.rs
-  - crates/corv/src/mcp_relay.rs
-  - crates/corv/src/mcp.rs
-  - crates/corv/src/mcp_http.rs
-  - crates/corv/src/migration.rs
+  - crates/corv/src/discuss/actor.rs
+  - crates/corv/src/discuss/agent_nodes.rs
+  - crates/corv/src/discuss/session.rs
+  - crates/corv/src/discuss/worker.rs
+  - crates/corv/src/discuss/supervisor.rs
+  - crates/corv/src/discuss/messages.rs
+  - crates/corv/src/discuss/domain.rs
+  - crates/corv/src/discuss/provider.rs
+  - crates/corv/src/discuss/types.rs
+  - crates/corv/src/discuss/handle.rs
+  - crates/corv/src/discuss/teams.rs
+  - crates/corv/src/discuss/sessions.rs
+  - crates/corv/src/discuss/database.rs
+  - crates/corv/src/discuss/storage.rs
+  - crates/corv/src/discuss/elicitation.rs
+  - crates/corv/src/discuss/agents.rs
+  - crates/corv/src/discuss/plugins/mod.rs
+  - crates/corv/src/discuss/mcp_direct.rs
+  - crates/corv/src/discuss/mcp_relay.rs
+  - crates/corv/src/discuss/mcp.rs
+  - crates/corv/src/discuss/mcp_http.rs
+  - crates/corv/src/discuss/migration.rs
   - crates/aves/src/runtime/supervisor.rs
   - crates/aves/src/flow/actor.rs
-  - crates/corv/AGENTS.md
 ---
 
 # Discuss Domain Architecture
@@ -40,14 +39,14 @@ Corv owns Discuss: Provider config, Team install linkage, chat session lifecycle
 
 ## Ownership
 
-- **Corv Discuss** (`crates/corv/src/`): actor, workers, `discuss.agents_workspace`, `discuss_sessions` / `discuss_chat_turns`, typed `DiscussError`, stream sender, Provider/Team/session lifecycle, MCP transport, plugin materialization. See [crates/corv/AGENTS.md](../../../crates/corv/AGENTS.md) for the file owner map.
+- **Corv Discuss** (`crates/corv/src/discuss/`): actor, workers, `discuss.agents_workspace`, `discuss_sessions` / `discuss_chat_turns`, typed `DiscussError`, stream sender, Provider/Team/session lifecycle, MCP transport, plugin materialization. See [crates/corv/AGENTS.md](../../../crates/corv/AGENTS.md) for the file owner map.
 - **Embedding application:** supplies the required stream sender and application-neutral asset library during composition.
 
 ## Startup
 
 ### Asset library
 
-`crates/corv/src/library.rs` owns neutral asset definitions, ID/path validation, and `AssetLibrary`. The required `DiscussBootOptions.library` supplies immutable host definitions; Corv contains no built-in application catalog. The actor uses the same supplied catalog for listing, upgrades, retention, and provider materialization. Provider plugins receive the catalog explicitly rather than querying ambient globals.
+`crates/corv/src/discuss/library.rs` owns neutral asset definitions, ID/path validation, and `AssetLibrary`. The required `DiscussBootOptions.library` supplies immutable host definitions; Corv contains no built-in application catalog. The actor uses the same supplied catalog for listing, upgrades, retention, and provider materialization. Provider plugins receive the catalog explicitly rather than querying ambient globals.
 
 `Runtime::start` runs every domain start callback concurrently (`JoinSet`). Discuss's callback dispatches `StartServer` (auto-start Providers, reconnect persisted sessions). There is no History-before-Discuss order.
 
@@ -83,7 +82,7 @@ Actor-owned `provider_supervisors` (memory only). Shared: `opencode`, `codex-acp
 
 ## Persistence
 
-SQL lives in `crates/corv/migrations/`, a peer of `src/`; `src/migration.rs` registers it through plain `mod migration;`. Existing `discuss.db`, `__discuss_migrations`, migration versions, and SQL remain unchanged.
+SQL lives in `crates/corv/migrations/`, a peer of `src/`; `crates/corv/src/discuss/migration.rs` registers it through `../../migrations`, through plain `mod migration;`. Existing `discuss.db`, `__discuss_migrations`, migration versions, and SQL remain unchanged.
 
 `database.rs` owns the ordered persistence queue; `storage.rs` owns typed SQL storage (include constants, connection helpers, row types, CRUD, decoders). **Subagent upsert + retention prune MUST execute inside one Turso transaction** (`upsert_and_prune_discuss_subagent` takes `&mut Connection`, begins transaction, executes upsert, executes prune, commits only after both succeed).
 

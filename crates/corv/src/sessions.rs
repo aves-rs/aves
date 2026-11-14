@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{McpServer, PermissionOptionId, SessionId};
-use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{McpServer, PermissionOptionId, SessionId};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::types::TaskSessionStart;
@@ -1542,7 +1543,7 @@ async fn load_provider_session_short_lived(
     let agent = AcpAgent::from_str(&agent_key)?;
 
     Client
-        .builder()
+        .v1()
         .name("acp-session-load")
         .connect_with(agent, move |cx: ConnectionTo<Agent>| async move {
             let init_response = cx.send_request(initialize_request()).block_task().await?;

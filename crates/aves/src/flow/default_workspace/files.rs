@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use super::registration::WorkspaceSeed;
-use super::types::{FlowWorkspaceMapping, WorkspaceError};
-use super::workspace::WorkspaceStore;
+use super::super::registration::WorkspaceSeed;
+use super::super::types::WorkspaceError;
+use super::native::WorkspaceStore;
 
 impl WorkspaceStore {
     pub(super) fn project_directory(
@@ -135,7 +135,7 @@ pub(super) fn collect_artifact_paths(
     Ok(())
 }
 
-pub(crate) fn checked_relative(path: &Path) -> Result<PathBuf, WorkspaceError> {
+pub(super) fn checked_relative(path: &Path) -> Result<PathBuf, WorkspaceError> {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
@@ -169,23 +169,6 @@ pub(super) fn mapping_destination(destination: &str) -> Result<PathBuf, Workspac
         });
     }
     checked_relative(Path::new(destination))
-}
-
-pub(super) fn validate_mappings(mappings: &[FlowWorkspaceMapping]) -> Result<(), WorkspaceError> {
-    let mut destinations: Vec<PathBuf> = Vec::new();
-    for mapping in mappings {
-        let destination = mapping_destination(&mapping.destination)?;
-        for previous in &destinations {
-            if destination.starts_with(previous) || previous.starts_with(&destination) {
-                return Err(WorkspaceError::OverlappingMappings {
-                    first: previous.display().to_string(),
-                    second: destination.display().to_string(),
-                });
-            }
-        }
-        destinations.push(destination);
-    }
-    Ok(())
 }
 
 pub(super) fn path_name(path: &Path) -> Result<String, WorkspaceError> {
@@ -340,8 +323,9 @@ fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), Workspa
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::FlowWorkspaceMappingMode;
     use super::*;
+    use crate::flow::default_workspace::validate_mappings;
+    use crate::flow::types::{FlowWorkspaceMapping, FlowWorkspaceMappingMode};
 
     #[test]
     fn mapping_destinations_reject_overlap_and_traversal() {

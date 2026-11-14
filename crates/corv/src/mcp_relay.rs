@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
+use agent_client_protocol::v1::schema::{HttpHeader, McpServer, McpServerHttp};
 
 use aves::auth::Jwt;
 use aves::bus::{BusControlError, BusMcpEndpoint, BusSudoService, CloseMcpInput, OpenMcpInput};

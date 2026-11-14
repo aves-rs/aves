@@ -10,7 +10,6 @@ use crate::flow::{
     BlackboardBinding, BoundOutputs, CancellationDisposition, ContentAddressedPath, ContentAddressedRoot,
     FlowAdapterError, FlowRegistrationError, NodeKind, NodeKindDescriptor, NodeKindRegistration, NodeLifecycleContext,
     NodeLifecycleDispatchError, NodeLifecycleResult, ScriptNodeConfig, SideEffectDisposition, WorkspacePreparation,
-    checked_relative,
 };
 
 use super::domain::TasksLifecycleSudoService;
@@ -170,13 +169,7 @@ fn source_from_workspace(
             .unwrap_or(&selected.path)
             .to_owned()
     } else {
-        checked_relative(Path::new(entry_point))
-            .map_err(|source| FlowAdapterError::Owner {
-                kind: script_node_kind(),
-                source: Box::new(source),
-            })?
-            .to_string_lossy()
-            .into_owned()
+        entry_point.to_owned()
     };
     let source = fs::read_to_string(if root.is_some() {
         workspace.join("code").join(&source_path)

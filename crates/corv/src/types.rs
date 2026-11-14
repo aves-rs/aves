@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, McpServer, PermissionOptionId, RequestPermissionRequest, SessionId, StopReason,
 };
 use serde::{Deserialize, Serialize};
@@ -1146,7 +1146,7 @@ pub enum AcpAgentMessagePayload {
         session_id: String,
         dispatch: AcpDispatchPayload,
     },
-    /// Per-turn stop reason forwarded from `SessionMessage::StopReason`.
+    /// Per-turn stop reason forwarded from a successful prompt response.
     ///
     /// This is a turn boundary, not a session shutdown. The session remains
     /// open and waits for the next user turn.
@@ -1693,7 +1693,7 @@ impl From<AvesAuthError> for DiscussError {
 
 impl From<agent_client_protocol::Error> for DiscussError {
     fn from(err: agent_client_protocol::Error) -> Self {
-        if err.code == agent_client_protocol::ErrorCode::AuthRequired {
+        if err.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED {
             DiscussError::AuthenticationRequired
         } else {
             DiscussError::ProtocolError { message: err.message }

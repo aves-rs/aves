@@ -1,31 +1,21 @@
 use std::any::Any;
 use std::fmt;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use iroh::Endpoint;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
-use crate::auth::{
-    AuthAdmissionRegistry, AuthBootOptions, AuthCapability, AuthDomain, AuthSudoService, AvesAuthError,
-    MachineIssuerId, PairingCoordinator, PairingOwner, messages::IssuePeerJwtInput,
-};
+use crate::auth::{AuthAdmissionRegistry, AuthBootOptions, AuthDomain, AvesAuthError};
 use crate::bus::{
-    AuthAdmissionConfiguration, BusControlError, BusHandle, BusRpcContext, BusSudoService, EventBus, IrohSubstrate,
-    OpaqueRequestEnvelope, PeerConnectivity, RemoteOperationError, RemoteOperationInstaller, RemoteOperationReply,
-    RemoteOperationRequest, RunningIrohSubstrate, TransportBindings, call,
+    AuthAdmissionConfiguration, BusControlError, BusHandle, BusRpcContext, BusSudoService, EventBus,
+    OpaqueRequestEnvelope, RemoteOperationInstaller, TransportBindings,
 };
 use crate::config::{ConfigError, ConfigRegistrationSudoService, SealRegistrationInput};
-use crate::flow::{
-    FlowActivationAcknowledgement, FlowDomain, FlowError, FlowMobilityCommitAcknowledgement, FlowMobilityDestination,
-    FlowMobilityService, FlowMobilitySnapshot, FlowSyncServices, FlowYieldAcknowledgement, WorkspaceError,
-};
+use crate::flow::FlowDomain;
+use crate::machine::{IrohSubstrate, PeerConnectivity, RunningIrohSubstrate};
 
 use super::context::{ConstructionFacade, ConstructionInputs, ServiceReader, ServiceSlotRegistry};
 use super::domains::DomainDescriptor;
@@ -69,17 +59,11 @@ where
     /// Handle to the runtime's bus.
     bus: BusHandle<RootBroadcast>,
 
-    /// Handle to the auth service.
-    auth_service: Arc<dyn AuthSudoService>,
-
     /// Task that handles auth admission.
     auth_task: JoinHandle<()>,
 
     /// Registry for auth admission.
     auth_admission_registry: AuthAdmissionRegistry,
-
-    /// Handle to the pairing coordinator.
-    pairing_owner: PairingOwner,
 
     /// Handle to the running Iroh substrate.
     iroh: RunningIrohSubstrate,
@@ -132,13 +116,24 @@ where
             auth_domain.construct(&mut facade).await;
         }
 
-        // The Auth actor supplies the machine key only; public admission is installed
-        // after the native substrate and bilateral pairing coordinator exist.
+        // The Auth actor supplies the machine key only.
         let auth_construction = auth_construction
             .expect("built-in Auth construction must provide its handoff")
             .map_err(BusControlError::from)?;
         let auth_task = auth_construction.actor_task;
         let registry = auth_construction.admission_registry.clone();
+        let auth_verifier = auth_construction.service.clone();
+
+        // Once we have auth configured, add it to the buss
+        bus.install_auth(AuthAdmissionConfiguration {
+            registry: registry.clone(),
+            verifier: auth_verifier,
+            audience: auth_options.audience,
+        });
+        let root_jwt = auth_construction.root_jwt;
+        let root_context = BusRpcContext::authenticated(bus.input_sender(), root_jwt.clone());
+
+        // Next the remote+peering systems
         let peer_connectivity = PeerConnectivity::new(false);
         let substrate = IrohSubstrate::prepare(
             &data_root.join("flows"),
@@ -151,41 +146,22 @@ where
             source: Box::new(error),
         })?;
 
-        let mobility_service: Arc<dyn FlowMobilityService> = Arc::new(RuntimeFlowMobilityService {
-            services: substrate.flow_services(),
-            pairing_owner: auth_construction.pairing_owner.clone(),
-            auth_service: auth_construction.service.clone(),
-            source_issuer: auth_construction.machine_secret_key.public().into(),
-        });
-
+        // Set up the inputs for all domains. auth + peers
         if let Some(construction_inputs) = construction_inputs.downcast_mut::<ConstructionInputs>() {
-            construction_inputs.insert(substrate.flow_services());
-            construction_inputs.insert(mobility_service);
-            construction_inputs.insert(peer_connectivity.clone());
+            // hard wire auth
+            construction_inputs.insert(auth_construction.pairing_owner.clone());
+
+            // hard wire peer services
+            construction_inputs.insert(substrate.peer_services());
         }
-        let auth_verifier = auth_construction.service.clone();
-        let auth_service = auth_construction.service.clone();
 
-        // once we have auth configured, add it to the buss
-        bus.install_auth(AuthAdmissionConfiguration {
-            registry: registry.clone(),
-            verifier: auth_verifier,
-            audience: auth_options.audience,
-        });
-
-        // now install the root jwt and context
-        let root_jwt = auth_construction.root_jwt;
-        let root_context = BusRpcContext::authenticated(bus.input_sender(), root_jwt.clone());
-
-        // once we have the bus and it's auth then we install the normal domains
+        // Once we have the bus and it's auth then we install the normal domains
         let mut installed_domains = Vec::with_capacity(domains.len() + 1);
         installed_domains.push(auth_domain);
         installed_domains.extend(domains);
 
-        // Construction is intentionally sequential: every callback receives
-        // the same mutable registration borrow, and a construction panic is
-        // fatal without Aves rollback or compensation. The facade contains
-        // only the marker-declared typed slots; reads remain late-bound.
+        // Construction is intentionally sequential: every callback receives the same mutable registration
+        // borrow, and a construction panic is fatal without Aves rollback or compensation.
         for domain in installed_domains.iter().skip(1) {
             let mut facade = ConstructionFacade::new_with_root_context(
                 &mut bus,
@@ -196,17 +172,16 @@ where
             domain.construct(&mut facade).await;
         }
 
-        // The sole remote dispatcher is installed only after all generated-operation
-        // receivers are registered. This keeps startup from admitting a request into
-        // a partially composed Poseidon runtime.
-        let remote_handler = remote_operation_installer.map(|installer| installer.install(bus.input_sender()));
-
+        // The remote dispatcher is installed only after all generated-operation receivers are registered.
         let iroh = substrate.start(
-            remote_handler,
+            remote_operation_installer.map(|installer| installer.install(bus.input_sender())),
             auth_construction.first_contact_handler.clone(),
             auth_construction.pairing_owner.clone(),
         );
+
+        // Finally, the bus handle is created.
         let bus = BusHandle::new(bus, transport_bindings, bus_publisher, root_jwt, peer_connectivity).await?;
+
         Ok(Self {
             domains: installed_domains,
             services,
@@ -214,28 +189,8 @@ where
             auth_admission_registry: registry,
             auth_task,
             iroh,
-            pairing_owner: auth_construction.pairing_owner,
-            auth_service,
             shutdown_started: AtomicBool::new(false),
         })
-    }
-
-    /// Calls one generated public operation on a confirmed remote machine.
-    pub async fn call_remote_operation(
-        &self,
-        target: MachineIssuerId,
-        qualified_operation: String,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value, RemoteOperationError> {
-        call_remote_operation_with(
-            &self.iroh.remote_endpoint().await?,
-            &self.pairing_owner,
-            &self.auth_service,
-            target,
-            qualified_operation,
-            input,
-        )
-        .await
     }
 
     /// Returns the shared registry used to admit locally and remotely issued JWTs.
@@ -334,134 +289,6 @@ where
                 Err(error)
             }
         }
-    }
-}
-
-/// Runtime implementation of the flow mobility service.
-struct RuntimeFlowMobilityService {
-    /// The flow sync services.
-    services: FlowSyncServices,
-
-    /// The auth service.
-    auth_service: Arc<dyn AuthSudoService>,
-
-    /// The source issuer.
-    source_issuer: MachineIssuerId,
-
-    /// The pairing owner.
-    pairing_owner: PairingOwner,
-}
-
-impl FlowMobilityService for RuntimeFlowMobilityService {
-    fn import_snapshot(
-        &self,
-        destination: FlowMobilityDestination,
-        snapshot: FlowMobilitySnapshot,
-    ) -> Pin<Box<dyn Future<Output = Result<FlowMobilityCommitAcknowledgement, FlowError>> + Send + '_>> {
-        Box::pin(async move {
-            let input = serde_json::json!({ "snapshot": snapshot, "sourcePeerKey": self.source_issuer });
-
-            let output = self
-                .call(destination.peer_key, "flow.importMobilitySnapshot", input)
-                .await?;
-
-            #[derive(serde::Deserialize)]
-            struct CommitOutput {
-                acknowledgement: FlowMobilityCommitAcknowledgement,
-            }
-
-            serde_json::from_value::<CommitOutput>(output)
-                .map(|output| output.acknowledgement)
-                .map_err(|error| FlowError::MobilityPeer {
-                    message: error.to_string(),
-                })
-        })
-    }
-
-    fn promote_replica(
-        &self,
-        destination: FlowMobilityDestination,
-        acknowledgement: FlowYieldAcknowledgement,
-    ) -> Pin<Box<dyn Future<Output = Result<FlowActivationAcknowledgement, FlowError>> + Send + '_>> {
-        Box::pin(async move {
-            let input = serde_json::json!({ "flowId": acknowledgement.flow_id, "acknowledgement": acknowledgement });
-
-            let output = self
-                .call(destination.peer_key, "flow.promoteFlowReplica", input)
-                .await?;
-
-            #[derive(serde::Deserialize)]
-            struct PromotionOutput {
-                acknowledgement: FlowActivationAcknowledgement,
-            }
-
-            serde_json::from_value::<PromotionOutput>(output)
-                .map(|output| output.acknowledgement)
-                .map_err(|error| FlowError::MobilityPeer {
-                    message: error.to_string(),
-                })
-        })
-    }
-}
-
-impl RuntimeFlowMobilityService {
-    async fn call(
-        &self,
-        target: MachineIssuerId,
-        qualified_operation: &str,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value, FlowError> {
-        let endpoint = self.services.native.read().await.endpoint.clone();
-        if !self.services.connectivity.is_enabled() {
-            return Err(WorkspaceError::ProviderUnavailable.into());
-        }
-        call_remote_operation_with(
-            &endpoint,
-            &self.pairing_owner,
-            &self.auth_service,
-            target,
-            qualified_operation.to_owned(),
-            input,
-        )
-        .await
-        .map_err(|error| FlowError::MobilityPeer {
-            message: error.to_string(),
-        })
-    }
-}
-
-async fn call_remote_operation_with(
-    endpoint: &Endpoint,
-    pairing_owner: &PairingOwner,
-    auth_service: &Arc<dyn AuthSudoService>,
-    target: MachineIssuerId,
-    qualified_operation: String,
-    input: serde_json::Value,
-) -> Result<serde_json::Value, RemoteOperationError> {
-    let (peer_endpoint, audience) = PairingCoordinator::refresh_audience(pairing_owner, &target)
-        .await
-        .map_err(|error| RemoteOperationError::Auth(Box::new(error)))?;
-
-    let output = auth_service
-        .issue_peer_jwt(IssuePeerJwtInput {
-            target,
-            audience,
-            sub: "remote-operation".to_owned(),
-            cap: vec![AuthCapability::AllBus],
-        })
-        .await
-        .map_err(|error| RemoteOperationError::Auth(Box::new(error)))?;
-
-    let request = RemoteOperationRequest {
-        qualified_operation,
-        input,
-        jwt: output.token,
-    };
-
-    match call::<_, RemoteOperationReply<serde_json::Value>>(endpoint, peer_endpoint, &request).await? {
-        RemoteOperationReply::Success(output) => Ok(output),
-        RemoteOperationReply::DomainError(error) => Err(RemoteOperationError::Domain(error)),
-        RemoteOperationReply::Rejected(error) => Err(RemoteOperationError::Rejected(error)),
     }
 }
 

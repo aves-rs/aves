@@ -1,11 +1,42 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use super::ast::{FlowNode, NodeDataSpace};
+use super::ast::{ContentAddressedRoot, FlowNode, NodeDataSpace};
 use super::registration::FlowNodeRegistry;
-use super::types::{FlowGraphLoadError, FlowNodeId, FlowRegistrationError};
+use super::types::{FlowError, FlowGraphLoadError, FlowNodeId, FlowRegistrationError};
+
+/// Collects immutable code and state identities referenced by a graph.
+pub(super) fn content_roots(
+    graph: &FlowGraph,
+    registry: &FlowNodeRegistry,
+) -> Result<(Vec<ContentAddressedRoot>, Vec<ContentAddressedRoot>), FlowError> {
+    let mut code = BTreeMap::new();
+    let mut state = BTreeMap::new();
+    let mut error = None;
+    graph.ast().root.for_each_leaf(&mut |node| {
+        match registry.get(&node.node_kind) {
+            Ok(registration) => {
+                for root in registration.node_content_roots(&node.configuration) {
+                    code.insert(root.digest.as_str().to_owned(), root);
+                }
+            }
+            Err(failure) => error = Some(FlowError::from(failure)),
+        }
+        let data = node.data_space();
+        for path in &data.code_paths {
+            code.insert(path.root.digest.as_str().to_owned(), path.root.clone());
+        }
+        for path in &data.state_paths {
+            state.insert(path.root.digest.as_str().to_owned(), path.root.clone());
+        }
+    });
+    error.map_or_else(
+        || Ok((code.into_values().collect(), state.into_values().collect())),
+        Err,
+    )
+}
 
 /// Bonsai-supported policy variants for a parallel controller.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, Type, schemars::JsonSchema)]

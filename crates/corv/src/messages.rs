@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use agent_client_protocol::schema::v1::SessionId;
+use agent_client_protocol::v1::schema::SessionId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 

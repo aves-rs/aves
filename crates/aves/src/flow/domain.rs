@@ -1,17 +1,16 @@
-use std::sync::Arc;
-
-use crate::auth::{AuthCapability, AuthProjection, AuthSudoService};
+use crate::auth::{AuthSudoService, PairingOwner};
 use crate::bus::{BusRpcContext, BusSudoService, EventBus};
 use crate::config::{
     ConfigError, ConfigRegistrationSudoService, GetConfigSectionInput, RegisterSectionInput, SectionRegistration,
     dispatch_get_config_section,
 };
+use crate::machine::{MachinePeerService, MachinePeerServices};
 use crate::runtime::{
     ConstructionFacade, DomainCallbacks, DomainDescriptorFactory, DomainFuture, ServicePublisher, ServiceReader,
     dispatch_lifecycle_request,
 };
 
-use super::handle::new as construct_flow_domain;
+use super::handle::{ensure_caller_has_capabilities, new as construct_flow_domain};
 use super::messages::{
     FireSourceTriggerInput, FlowBroadcast, FlowPrivilegedFireSourceTrigger, FlowPrivilegedListSourceTriggers,
     FlowPrivilegedStartRuntime, FlowPrivilegedStopRuntime, FlowPrivilegedUpdateRetention, FlowRequest,
@@ -19,11 +18,9 @@ use super::messages::{
     RuntimeStartedOutput, RuntimeStoppedOutput, SourceTriggersListedOutput, StartRuntimeInput, StartedOutput,
     StopRuntimeInput, UpdateRetentionInput,
 };
-use super::mobility::FlowMobilityService;
 use super::registration::NodeRegistrationSupply;
-use super::sync::FlowSyncServices;
 use super::triggers::TriggerRegistry;
-use super::types::{FlowBootOptions, FlowError, FlowSettings, FlowWorkspaceSourceService, WorkspaceError};
+use super::types::{FlowBootOptions, FlowError, FlowSettings, FlowWorkspaceSourceService};
 
 /// Aves Flow domain marker.
 pub struct FlowDomain;
@@ -33,17 +30,14 @@ impl FlowDomain {
     pub(crate) const RUNTIME_DOMAIN_NAME: &'static str = "FlowDomain";
 }
 
-/// Typed construction services for the Flow domain.
+/// Published and late-bound kernel services used by Flow.
 pub(super) struct FlowKernelServices {
     pub(super) trigger_source_service: ServicePublisher<dyn FlowTriggerSourceService>,
-    pub(super) trigger_registry: TriggerRegistry,
     pub(super) service: ServicePublisher<dyn FlowControlService>,
     pub(super) auth_service: ServiceReader<dyn AuthSudoService>,
     pub(super) mcp_bus_service: ServiceReader<dyn BusSudoService>,
-    pub(super) bus_context: BusRpcContext,
     pub(super) workspace_source_service: ServiceReader<dyn FlowWorkspaceSourceService>,
-    pub(super) sync_services: FlowSyncServices,
-    pub(super) mobility_service: Arc<dyn FlowMobilityService>,
+    pub(super) sync_services: ServiceReader<dyn MachinePeerService>,
 }
 
 aves::domain! {
@@ -54,7 +48,7 @@ aves::domain! {
     transport = FlowError
     target = "flow";
 
-    authorization_hook = authorize_public_request;
+    authorization_hook = ensure_caller_has_capabilities;
 
     pub service FlowControlService {
         UpdateRetention => RetentionUpdated,
@@ -108,26 +102,42 @@ where
                 .cloned()
                 .unwrap_or_default();
 
+            let trigger_source_service = facade.publisher();
+            let service = facade.publisher();
+
+            let auth_service = facade.reader::<dyn AuthSudoService>();
+            let sync_services = facade.reader::<dyn MachinePeerService>();
+            let mcp_bus_service = facade.reader::<dyn BusSudoService>();
+            let workspace_source_service = facade.reader::<dyn FlowWorkspaceSourceService>();
+
             let services = FlowKernelServices {
-                trigger_source_service: facade.publisher(),
-                trigger_registry: facade
-                    .input::<TriggerRegistry>()
-                    .cloned()
-                    .unwrap_or_default(),
-                service: facade.publisher(),
-                auth_service: facade.reader::<dyn AuthSudoService>(),
-                mcp_bus_service: facade.reader::<dyn BusSudoService>(),
-                bus_context: config_context.clone(),
-                workspace_source_service: facade.reader::<dyn FlowWorkspaceSourceService>(),
-                sync_services: facade
-                    .input::<FlowSyncServices>()
-                    .expect("Flow sync services must be supplied explicitly")
-                    .clone(),
-                mobility_service: facade
-                    .input::<Arc<dyn FlowMobilityService>>()
-                    .expect("Flow mobility service must be supplied explicitly")
-                    .clone(),
+                trigger_source_service,
+                service,
+                auth_service,
+                mcp_bus_service,
+                workspace_source_service,
+                sync_services,
             };
+
+            let pairing_owner = facade
+                .input::<PairingOwner>()
+                .expect("Auth pairing owner must be supplied by the runtime")
+                .clone();
+            let trigger_registry = facade
+                .input::<TriggerRegistry>()
+                .cloned()
+                .unwrap_or_default();
+
+            // TODO: when the "default" impl of the workspace trait moves into sluice
+            // revert this hard wiring so that machine is an optional peer to flow and
+            // flow simply turns off the machine sync services when not connected.
+            //
+            // The only reason this block is here is because the current default workspace
+            // implementation requires blobs and docs.
+            let machine = facade
+                .input::<MachinePeerServices>()
+                .expect("peer services must be supplied")
+                .clone();
             let bus = facade.bus_mut();
 
             Box::pin(async move {
@@ -145,14 +155,21 @@ where
                 )
                 .await
                 .expect("Flow settings must load from Config");
+
                 let settings: FlowSettings =
                     serde_json::from_value(config.value).expect("Flow settings must match their registration");
+
                 let handler = construct_flow_domain(
                     bus,
                     options.with_retention_completed_runs(settings.retention_completed_runs),
                     services,
+                    trigger_registry,
+                    config_context,
+                    pairing_owner,
+                    &machine,
                 )
                 .await;
+
                 tokio::spawn(async move { handler.run().await });
             })
         }
@@ -208,28 +225,5 @@ impl FlowDomain {
             payload: FlowRequestPayload::StopRuntime,
         })
         .await;
-    }
-}
-
-/// Binds mobility imports to the authenticated peer and limits cloud blob pulls.
-fn authorize_public_request(payload: &FlowRequestPayload, projection: &AuthProjection) -> Result<(), FlowError> {
-    if let FlowRequestPayload::ImportMobilitySnapshot { source_peer_key, .. } = payload
-        && source_peer_key != &projection.issuer
-    {
-        return Err(FlowError::MobilityPeer {
-            message: "Flow mobility source peer does not match authenticated issuer".to_string(),
-        });
-    }
-    if !matches!(payload, FlowRequestPayload::DownloadWorkspaceBlob { .. }) {
-        return Ok(());
-    }
-    if projection
-        .cap
-        .iter()
-        .any(|capability| matches!(capability, AuthCapability::PullCloudBlobs | AuthCapability::AllBus))
-    {
-        Ok(())
-    } else {
-        Err(FlowError::Workspace(WorkspaceError::CapabilityDenied))
     }
 }

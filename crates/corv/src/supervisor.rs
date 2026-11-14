@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, RequestPermissionRequest, RequestPermissionResponse, SessionId,
 };
-use agent_client_protocol::{Agent, ConnectionTo, Responder};
+use agent_client_protocol::{Agent, Responder};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     McpError, McpServer, McpServerAcp, McpServerAcpId, MessageMcpNotification, MessageMcpRequest, MessageMcpResponse,
 };
 use agent_client_protocol::{Agent, ConnectionTo, Dispatch, HandleDispatchFrom, Handled, Responder};

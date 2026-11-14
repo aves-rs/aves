@@ -11,11 +11,11 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::auth::AvesAuthError;
+use crate::machine::PeerConnectivity;
 use crate::runtime::ServicePublisher;
 use crate::utils::errors::SharedInfraError;
 
 use super::event_bus::OpaqueRequestEnvelope;
-use super::iroh::PeerConnectivity;
 use super::messages::BusRpcContext;
 
 const LOOPBACK: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);

@@ -1,7 +1,7 @@
 ---
 title: Aves Engineering Navigation
 type: reference
-updated: 2026-10-29
+updated: 2026-11-14
 references:
   - AGENTS.md
   - crates/aves/AGENTS.md
@@ -29,6 +29,8 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 |---|---|
 | [Runtime Supervisor](architecture/aves/runtime-supervisor.md) | Domain construction and lifecycle |
 | [Auth Domain](architecture/aves/auth-domain.md) | JWT issuance and peer admission |
+| [Machine Domain](architecture/aves/machine-domain.md) | Peering, inventory, content and encryption |
+| [Coordination Domain](architecture/aves/coordination-domain.md) | Chain hosting, signing and recovery |
 | [Flow Domain](architecture/aves/flow-domain.md) | Graph execution and persistence |
 | [Tasks Domain](architecture/aves/tasks-domain.md) | ScriptNode and WASI |
 | [Iroh Peer Runtime](architecture/aves/iroh-peer-runtime.md) | Native transport and trust |
@@ -48,6 +50,7 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 | [Declaration-Driven Routing](concepts/declaration-driven-handler-routing.md) | Generated domain handlers |
 | [Flow Dataflow](concepts/flow-dataflow.md) | Node inputs, outputs and blackboard |
 | [Flow Execution Workspace](concepts/flow-execution-workspace.md) | Checkpoints and workspace files |
+| [Flow Workspace Trait](concepts/flow-workspace-trait.md) | Workspace ownership and lifecycle |
 | [Knowledge Data Store](concepts/knowledge-data-store.md) | Kea JSON data |
 | [Knowledge Markdown Directory](concepts/knowledge-markdown-directory.md) | Kea notes and search |
 | [MCP-over-ACP Tooling](concepts/mcp-over-acp-tooling.md) | Discuss MCP transport |

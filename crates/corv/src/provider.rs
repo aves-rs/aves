@@ -3,8 +3,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::McpServer;
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
+use agent_client_protocol::v1::{ConnectionTo, schema::McpServer};
+use agent_client_protocol::{Agent, ByteStreams, Client};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -430,25 +430,24 @@ impl Actor {
                 let mut sink = tokio::io::sink();
                 let _ = tokio::io::copy(&mut child_stderr, &mut sink).await;
             });
-            let connection =
-                Client
-                    .builder()
-                    .connect_with(transport, move |connection: ConnectionTo<Agent>| async move {
-                        let _callback_handler = connection.add_dynamic_handler(
-                            super::session::SessionCallbackRouter::new(callback_routes_for_connection.clone()),
-                        )?;
-                        let init_response = connection
-                            .send_request(initialize_request())
-                            .block_task()
-                            .await?;
-                        let _ = ready_tx.send(Ok((
-                            connection.clone(),
-                            init_response.agent_capabilities.mcp_capabilities.acp,
-                            init_response.agent_capabilities.mcp_capabilities.http,
-                        )));
-                        connection.incoming_closed().await;
-                        Ok(())
-                    });
+            let connection = Client
+                .v1()
+                .connect_with(transport, move |connection: ConnectionTo<Agent>| async move {
+                    let _callback_handler = connection.add_dynamic_handler(
+                        super::session::SessionCallbackRouter::new(callback_routes_for_connection.clone()),
+                    )?;
+                    let init_response = connection
+                        .send_request(initialize_request())
+                        .block_task()
+                        .await?;
+                    let _ = ready_tx.send(Ok((
+                        connection.clone(),
+                        init_response.agent_capabilities.mcp_capabilities.acp,
+                        init_response.agent_capabilities.mcp_capabilities.http,
+                    )));
+                    connection.incoming_closed().await;
+                    Ok(())
+                });
             tokio::pin!(connection);
             tokio::select! {
                 _ = &mut connection => {}
@@ -1220,7 +1219,7 @@ pub(super) fn effective_workspace_copy_sources(provider_name: &str, provider: &A
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::schema::v1::{McpServer, McpServerStdio};
+    use agent_client_protocol::v1::schema::{McpServer, McpServerStdio};
 
     use super::{AcpProvider, effective_workspace_copy_sources};
 

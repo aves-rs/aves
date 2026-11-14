@@ -1,6 +1,6 @@
 [package]
 name = "aves"
-version = "0.8.0"
+version = "0.9.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Typed async application runtime with domain messaging, RPC, and durable workflow automation"
 authors = { workspace = true }
@@ -36,39 +36,55 @@ tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves_macros = { path = "macros", version = "=0.8.0" }
+aves_macros = { path = "macros", version = "=0.9.0" }
 
 # external
+arc-malachitebft-app-channel.workspace = true
+arc-malachitebft-codec = { workspace = true }
+arc-malachitebft-core-consensus = { workspace = true }
+arc-malachitebft-core-types = { workspace = true }
+arc-malachitebft-engine = { workspace = true }
+arc-malachitebft-network = { workspace = true }
+arc-malachitebft-signing = { workspace = true }
+arc-malachitebft-sync = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
-bonsai-bt = { workspace = true }
-oxc = { workspace = true }
 base64 = { workspace = true }
+bonsai-bt = { workspace = true }
+bytes = { workspace = true }
+chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
+ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
+gethostname = { workspace = true }
+getrandom = { workspace = true }
+hpke = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-docs = { workspace = true }
 iroh-gossip = { workspace = true }
 jsonwebtoken = { workspace = true }
 keyring = { workspace = true }
+oxc = { workspace = true }
 pkcs8 = { workspace = true }
-rspc = { workspace = true }
+ractor = { workspace = true }
 rand = { workspace = true }
-rust_decimal = { workspace = true }
+rspc = { workspace = true }
 rspc-axum = { workspace = true }
-sha2 = { workspace = true }
+rust_decimal = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
+serde-big-array = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 specta = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 turso = { workspace = true }
 uuid = { workspace = true }
-toml = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 zeroize = { workspace = true }

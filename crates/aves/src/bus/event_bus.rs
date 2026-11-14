@@ -327,6 +327,15 @@ where
         );
     }
 
+    /// Shares the installed admission projection with native domain transports.
+    pub(crate) fn admission_registry(&self) -> Option<AuthAdmissionRegistry> {
+        self.auth_configuration
+            .read()
+            .expect("auth registry lock poisoned")
+            .as_ref()
+            .map(|auth| auth.registry.clone())
+    }
+
     /// Registers a marker and returns its opaque input sender plus typed mailbox.
     pub fn register<Marker, Request, Broadcast>(&mut self) -> DomainChannels<Request, Broadcast, Root>
     where

@@ -9,8 +9,8 @@ mod checkpoints;
 mod controllers;
 mod cron;
 mod database;
+mod default_workspace;
 mod domain;
-mod files;
 mod graph;
 mod handle;
 mod hook;
@@ -21,20 +21,14 @@ mod mobility;
 mod registration;
 mod replication;
 mod snapshot;
-mod storage;
-mod sync;
 mod tick;
 mod triggers;
 mod types;
-mod workspace;
 
 #[cfg(test)]
 mod fixtures;
 
 pub(crate) use ast::resolve_script_limits;
-pub(crate) use files::checked_relative;
-pub(crate) use mobility::FlowMobilityService;
-pub(crate) use sync::{FlowNativeServices, FlowSyncServices};
 
 pub use adapter::OwnerLifecycleResult;
 pub use ast::{
@@ -46,8 +40,10 @@ pub use cron::{CronExpression, CronTriggerConfig, FlowTriggerRecord};
 pub use domain::{FlowControlService, FlowDomain, FlowTriggerSourceService};
 pub use graph::{FlowGraphAst, GraphNode};
 pub use hook::{
-    FlowAppCheckpoint, FlowAppCheckpointFuture, FlowAppHookContext, FlowAppHookError, FlowAppHookFuture,
-    FlowAppLandingContext, FlowAppWorkspaceHook,
+    FlowAppCheckpointCommittedContext, FlowAppCheckpointContext, FlowAppCheckpointFuture, FlowAppCheckpointResult,
+    FlowAppHookContext, FlowAppHookError, FlowAppHookFuture, FlowAppLandingContext, FlowAppRestoreContext,
+    FlowAppRestoreFuture, FlowAppTakeoffContext, FlowAppTakeoffFuture, FlowAppTakeoffResult, FlowAppWorkspaceHook,
+    FlowWorkspaceFuture,
 };
 pub use messages::{
     AbortInput, CreateFlowInput, CreateFlowTriggerInput, DeleteFlowInput, DeleteFlowTriggerInput,

@@ -1,14 +1,21 @@
 //! Native Iroh transport for generated Bus operations.
 
-use std::{error::Error as StdError, sync::Arc};
+use std::{
+    error::Error as StdError,
+    future::Future,
+    io::{Error as IoError, ErrorKind},
+    pin::Pin,
+    sync::Arc,
+};
 
+use iroh::endpoint::{Connection, ConnectionError};
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::auth::{AvesAuthError, Jwt, MachineIssuerId, issuer_from_jwt};
 
-use super::iroh::{IrohProtocolHandler, RequestFuture};
 use super::messages::{BusIngress, BusRpcContext};
 use super::operations::{DomainPublication, RequestOperationDescriptor};
 
@@ -16,6 +23,58 @@ use super::operations::{DomainPublication, RequestOperationDescriptor};
 pub(crate) const BUS_ALPN: &[u8] = b"aves_app/bus";
 
 const MAX_OPERATION_BYTES: usize = 512 * 1024;
+const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+
+type RequestFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>;
+type RequestHandler = dyn Fn(iroh::PublicKey, Vec<u8>) -> RequestFuture + Send + Sync;
+
+#[derive(Clone)]
+pub struct IrohProtocolHandler {
+    request_handler: Arc<RequestHandler>,
+}
+
+impl IrohProtocolHandler {
+    fn new(request_handler: Arc<RequestHandler>) -> Self {
+        Self { request_handler }
+    }
+}
+
+impl std::fmt::Debug for IrohProtocolHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("IrohProtocolHandler").finish()
+    }
+}
+
+impl ProtocolHandler for IrohProtocolHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let remote_node_id = connection.remote_id();
+        loop {
+            let (mut send, mut recv) = match connection.accept_bi().await {
+                Ok(streams) => streams,
+                Err(ConnectionError::LocallyClosed) | Err(ConnectionError::ApplicationClosed(_)) => return Ok(()),
+                Err(source) => return Err(AcceptError::from_err(source)),
+            };
+            let request = recv
+                .read_to_end(MAX_REQUEST_SIZE)
+                .await
+                .map_err(AcceptError::from_err)?;
+            let response = (self.request_handler)(remote_node_id, request)
+                .await
+                .map_err(AcceptError::from_boxed)?;
+            if response.len() > MAX_RESPONSE_SIZE {
+                return Err(AcceptError::from_err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "iroh Bus response exceeds the configured limit",
+                )));
+            }
+            send.write_all(&response)
+                .await
+                .map_err(AcceptError::from_err)?;
+            send.finish().map_err(AcceptError::from_err)?;
+        }
+    }
+}
 
 /// The minimal wire request for one generated public Bus operation.
 #[derive(Debug, Deserialize, Serialize)]

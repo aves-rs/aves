@@ -7,7 +7,7 @@ use std::{
     process::Stdio,
 };
 
-use agent_client_protocol::schema::v1::{EnvVariable, McpServer, SessionId};
+use agent_client_protocol::v1::schema::{EnvVariable, McpServer, SessionId};
 use chrono::Utc;
 use serde::Serialize;
 use tokio::{
@@ -891,7 +891,7 @@ fn capture_write_error(path: &Path, error: std::io::Error) -> DiscussError {
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::schema::v1::McpServerStdio;
+    use agent_client_protocol::v1::schema::McpServerStdio;
 
     use super::super::super::test_library;
     use super::*;

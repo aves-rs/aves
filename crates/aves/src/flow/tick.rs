@@ -624,6 +624,7 @@ mod tests {
         CancellationDisposition, NodeKindDescriptor, NodeKindRegistration, NodeLifecycleResult, SideEffectDisposition,
         WorkspacePreparation,
     };
+    use super::super::snapshot::WorkspaceProvenance;
     use super::super::snapshot::{NodeExecutionSnapshot, ScratchpadSnapshot};
     use super::super::{FlowExecutionSnapshot, FlowExecutionStatus, FlowTimestamp};
     use super::*;
@@ -702,6 +703,9 @@ mod tests {
             workspace_checkpoint: None,
             workspace_entries: BTreeMap::new(),
             imported_workspace_root: None,
+            workspace: WorkspaceProvenance::Native {
+                root: std::path::PathBuf::from("workspace"),
+            },
             reconstruction: ReconstructionState::default(),
             scratchpad: ScratchpadSnapshot {
                 pending: vec![node_execution_id],

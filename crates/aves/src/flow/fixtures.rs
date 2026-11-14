@@ -6,9 +6,7 @@ use iroh_blobs::{BlobsProtocol, api::Store as BlobsStore, protocol::ALPN as BLOB
 use iroh_docs::{api::DocsApi, net::ALPN as DOCS_ALPN, protocol::Docs};
 use iroh_gossip::net::{GOSSIP_ALPN, Gossip};
 
-use crate::bus::PeerConnectivity;
-
-use super::sync::FlowSyncServices;
+use crate::machine::{MachinePeerServices, PeerConnectivity};
 
 pub(super) struct NativeDocsFixture {
     _endpoint: Endpoint,
@@ -54,8 +52,8 @@ impl NativeDocsFixture {
         }
     }
 
-    pub(super) fn sync_services(&self) -> FlowSyncServices {
-        FlowSyncServices::new(
+    pub(super) fn sync_services(&self) -> MachinePeerServices {
+        MachinePeerServices::new(
             self.blobs.clone(),
             self.docs_api.clone(),
             self._endpoint.clone(),

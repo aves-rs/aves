@@ -148,7 +148,7 @@ struct PendingPeer {
 }
 
 /// Owns pairing policy, durable peer state, and live Auth admission changes.
-pub(crate) struct PairingCoordinator {
+pub struct PairingCoordinator {
     peers: Vec<PeerRecord>,
     pending: Vec<(PublicKey, PendingPeer)>,
     config_path: Option<PathBuf>,
@@ -168,7 +168,7 @@ struct InvitationRecord {
 }
 
 impl PairingCoordinator {
-    pub(crate) fn load(
+    pub fn load(
         path: &Path,
         admission_registry: AuthAdmissionRegistry,
         local_issuer: MachineIssuerId,
@@ -195,7 +195,7 @@ impl PairingCoordinator {
         })
     }
 
-    pub(crate) fn new_invitation(&mut self, ttl_seconds: u64) -> Result<PairingInvitation, AvesAuthError> {
+    pub fn new_invitation(&mut self, ttl_seconds: u64) -> Result<PairingInvitation, AvesAuthError> {
         if !(1..=3600).contains(&ttl_seconds) {
             return Err(AvesAuthError::MalformedInvitation);
         }
@@ -297,7 +297,7 @@ impl PairingCoordinator {
         })
     }
 
-    pub(crate) fn confirm(&mut self, peer: MachineIssuerId) -> Result<(), AvesAuthError> {
+    pub fn confirm(&mut self, peer: MachineIssuerId) -> Result<(), AvesAuthError> {
         if peer == self.local_issuer {
             return Err(AvesAuthError::LocalIssuerImmutable);
         }
@@ -332,21 +332,21 @@ impl PairingCoordinator {
         Ok(())
     }
 
+    pub fn attach_endpoint(&mut self, endpoint: Endpoint, endpoint_addr: EndpointAddr) {
+        self.endpoint = Some(endpoint);
+        self.endpoint_addr = Some(endpoint_addr);
+    }
+
+    pub fn detach_endpoint(&mut self) {
+        self.endpoint = None;
+        self.endpoint_addr = None;
+    }
+
     pub(super) fn is_confirmed(&self, peer: &MachineIssuerId) -> bool {
         self.peers
             .iter()
             .find(|record| record.peer == peer.public_key())
             .is_some_and(|record| record.state == PeerTrustState::Confirmed)
-    }
-
-    pub(crate) fn attach_endpoint(&mut self, endpoint: Endpoint, endpoint_addr: EndpointAddr) {
-        self.endpoint = Some(endpoint);
-        self.endpoint_addr = Some(endpoint_addr);
-    }
-
-    pub(crate) fn detach_endpoint(&mut self) {
-        self.endpoint = None;
-        self.endpoint_addr = None;
     }
 
     fn observe(
@@ -410,7 +410,7 @@ impl PairingCoordinator {
     }
 
     #[cfg(not(test))]
-    pub(crate) async fn outbound_first_contact(
+    pub async fn outbound_first_contact(
         owner: &PairingOwner,
         invitation: &PairingInvitation,
     ) -> Result<MachineIssuerId, AvesAuthError> {
@@ -438,11 +438,11 @@ impl PairingCoordinator {
             .map(|()| MachineIssuerId::from(remote_id))
     }
 
-    pub(crate) fn peers(&self) -> Vec<PeerRecord> {
+    pub fn peers(&self) -> Vec<PeerRecord> {
         self.peers.clone()
     }
 
-    pub(crate) fn pending_candidates(&self) -> Vec<MachineIssuerId> {
+    pub fn pending_candidates(&self) -> Vec<MachineIssuerId> {
         let mut candidates: Vec<_> = self
             .pending
             .iter()
@@ -453,7 +453,7 @@ impl PairingCoordinator {
         candidates
     }
 
-    pub(crate) async fn refresh_audience(
+    pub async fn refresh_audience(
         owner: &PairingOwner,
         target: &MachineIssuerId,
     ) -> Result<(EndpointAddr, uuid::Uuid), AvesAuthError> {
@@ -514,7 +514,7 @@ impl PairingCoordinator {
             .map_err(AvesAuthError::from)
     }
 
-    pub(crate) fn revoke(&mut self, peer: MachineIssuerId) -> Result<(), AvesAuthError> {
+    pub fn revoke(&mut self, peer: MachineIssuerId) -> Result<(), AvesAuthError> {
         if peer == self.local_issuer {
             return Err(AvesAuthError::LocalIssuerImmutable);
         }
@@ -575,16 +575,16 @@ impl PairingCoordinator {
 }
 
 /// Shared coordinator handle used by Auth and the native Iroh protocol handler.
-pub(crate) type PairingOwner = Arc<Mutex<PairingCoordinator>>;
+pub type PairingOwner = Arc<Mutex<PairingCoordinator>>;
 
 /// Auth's minimal native-Iroh first-contact protocol.
 #[derive(Clone)]
-pub(crate) struct AuthFirstContactHandler {
+pub struct AuthFirstContactHandler {
     pairing: PairingOwner,
 }
 
 impl AuthFirstContactHandler {
-    pub(crate) fn new(pairing: PairingOwner) -> Self {
+    pub fn new(pairing: PairingOwner) -> Self {
         Self { pairing }
     }
 }

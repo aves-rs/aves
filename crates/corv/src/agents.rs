@@ -5,12 +5,13 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
 };
 
-use agent_client_protocol::{
-    Dispatch, Error as AcpCrateError, Responder, SessionMessage,
-    schema::v1::{
+use agent_client_protocol::v1::{
+    SessionMessage,
+    schema::{
         CreateElicitationRequest, PermissionOptionId, RequestPermissionRequest, RequestPermissionResponse, SessionId,
     },
 };
+use agent_client_protocol::{Dispatch, Error as AcpCrateError, Responder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -113,7 +114,7 @@ pub async fn resolve_permission_responder(
     responder: Responder<RequestPermissionResponse>,
     option: DiscussPermissionOption,
 ) -> Result<(), AcpCrateError> {
-    use agent_client_protocol::schema::v1::{PermissionOptionId, RequestPermissionOutcome, SelectedPermissionOutcome};
+    use agent_client_protocol::v1::schema::{PermissionOptionId, RequestPermissionOutcome, SelectedPermissionOutcome};
 
     let response = match option {
         DiscussPermissionOption::Select { option_id } => RequestPermissionResponse::new(
@@ -291,7 +292,7 @@ pub(super) async fn send_message_to_user(
         capture_state,
     } = context;
     let stop_reason = match &message {
-        SessionMessage::StopReason(reason) => Some(*reason),
+        SessionMessage::PromptResponse(Ok(response)) => Some(response.stop_reason),
         _ => None,
     };
 
@@ -406,7 +407,7 @@ fn is_transcript_dispatch(dispatch: &AcpDispatchPayload) -> bool {
 }
 
 /// Serialize a `StopReason` to the snake_case string the provider emitted.
-fn stop_reason_to_string(reason: agent_client_protocol::schema::v1::StopReason) -> String {
+fn stop_reason_to_string(reason: agent_client_protocol::v1::schema::StopReason) -> String {
     serde_json::to_value(reason)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -478,13 +479,13 @@ fn extract_text_from_content_block(content: &serde_json::Value) -> Option<String
 
 fn acp_message_payload(session: &SessionId, message: SessionMessage) -> Result<AcpAgentMessagePayload, AcpCrateError> {
     match message {
-        SessionMessage::SessionMessage(dispatch) => Ok(AcpAgentMessagePayload::Dispatch {
+        SessionMessage::Message(dispatch) => Ok(AcpAgentMessagePayload::Dispatch {
             session_id: session.to_string(),
-            dispatch: dispatch_payload(dispatch),
+            dispatch: dispatch_payload(dispatch.into_raw()),
         }),
-        SessionMessage::StopReason(stop_reason) => Ok(AcpAgentMessagePayload::StopReason {
+        SessionMessage::PromptResponse(result) => Ok(AcpAgentMessagePayload::StopReason {
             session_id: session.to_string(),
-            stop_reason,
+            stop_reason: result?.stop_reason,
         }),
         _ => Err(AcpCrateError::into_internal_error(DiscussError::ProtocolError {
             message: "unsupported ACP session message variant is not forwarded as an agent message".to_string(),
@@ -626,8 +627,8 @@ fn parse_config_option_update(session_id: Option<String>, update: &serde_json::V
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::SessionMessage;
-    use agent_client_protocol::schema::v1::{SessionId, StopReason};
+    use agent_client_protocol::v1::SessionMessage;
+    use agent_client_protocol::v1::schema::{PromptResponse, SessionId, StopReason};
     use tokio::sync::mpsc;
 
     use super::super::elicitation::{DiscussRestrictedFormFieldType, sdk_to_restricted_schema};
@@ -642,7 +643,7 @@ mod tests {
     #[test]
     fn restricted_schema_projects_titled_multi_select_fields() {
         let mode =
-            serde_json::from_value::<agent_client_protocol::schema::v1::ElicitationFormMode>(serde_json::json!({
+            serde_json::from_value::<agent_client_protocol::v1::schema::ElicitationFormMode>(serde_json::json!({
                 "sessionId": "session-1",
                 "requestedSchema": {
                     "type": "object",
@@ -768,7 +769,7 @@ mod tests {
         let notification =
             UntypedMessage::new("tools/progress", serde_json::json!({"pct": 90})).expect("valid untyped message");
         let dispatch = agent_client_protocol::Dispatch::Notification(notification);
-        let message = SessionMessage::SessionMessage(dispatch);
+        let message = SessionMessage::Message(dispatch);
 
         let payload = acp_message_payload(&session, message).expect("payload ok");
 
@@ -792,7 +793,7 @@ mod tests {
         let notification =
             UntypedMessage::new("session/update", serde_json::json!({"data": "x"})).expect("valid untyped message");
         let dispatch = agent_client_protocol::Dispatch::Notification(notification);
-        let message = SessionMessage::SessionMessage(dispatch);
+        let message = SessionMessage::Message(dispatch);
 
         let payload = acp_message_payload(&session, message).expect("payload ok");
         let json = serde_json::to_value(&payload).expect("serialize");
@@ -800,7 +801,7 @@ mod tests {
         assert_eq!(
             json.get("kind").and_then(|v| v.as_str()),
             Some("dispatch"),
-            "kind must be 'dispatch' for SessionMessage::SessionMessage"
+            "kind must be 'dispatch' for SessionMessage::Message"
         );
         assert_eq!(
             json.get("sessionId").and_then(|v| v.as_str()),
@@ -812,8 +813,11 @@ mod tests {
     #[test]
     fn stop_reason_payload_serializes_to_bridge_shape() {
         let session = SessionId::from("serde-session");
-        let payload =
-            super::acp_message_payload(&session, SessionMessage::StopReason(StopReason::Refusal)).expect("payload ok");
+        let payload = super::acp_message_payload(
+            &session,
+            SessionMessage::PromptResponse(Ok(PromptResponse::new(StopReason::Refusal))),
+        )
+        .expect("payload ok");
 
         let json = serde_json::to_value(&payload).expect("serialize");
         let obj = json.as_object().expect("object");
@@ -1068,7 +1072,7 @@ mod tests {
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
             },
-            SessionMessage::StopReason(StopReason::EndTurn),
+            SessionMessage::PromptResponse(Ok(PromptResponse::new(StopReason::EndTurn))),
             &mut buffer,
             false,
         )
@@ -1130,7 +1134,7 @@ mod tests {
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
             },
-            SessionMessage::StopReason(StopReason::EndTurn),
+            SessionMessage::PromptResponse(Ok(PromptResponse::new(StopReason::EndTurn))),
             &mut buffer,
             false,
         )
@@ -1180,7 +1184,7 @@ mod tests {
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
             },
-            SessionMessage::SessionMessage(agent_client_protocol::Dispatch::Notification(replayed_dispatch)),
+            SessionMessage::Message(agent_client_protocol::Dispatch::Notification(replayed_dispatch)),
             &mut buffer,
             true,
         )
@@ -1196,7 +1200,7 @@ mod tests {
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
             },
-            SessionMessage::StopReason(StopReason::EndTurn),
+            SessionMessage::PromptResponse(Ok(PromptResponse::new(StopReason::EndTurn))),
             &mut buffer,
             true,
         )
@@ -1237,7 +1241,7 @@ mod tests {
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
             },
-            SessionMessage::SessionMessage(dispatch),
+            SessionMessage::Message(dispatch),
             &mut AssistantTurnBuffer::default(),
             false,
         )

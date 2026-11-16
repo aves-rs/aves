@@ -39,7 +39,7 @@ axum08 = { package = "axum", version = "=0.8.9", default-features = false, featu
 base64 = { version = "=0.23.1" }
 bonsai-bt = { version = "=0.14.0" }
 bytes = { version = "=1.12.1", default-features = false }
-chacha20poly1305 = { version = "=0.11.0" }
+chacha20poly1305 = { version = "=0.10.0" }
 chrono = { version = "=0.4.45", features = ["serde"] }
 croner = { version = "=4.0.3" }
 ed25519-dalek = { version = "=3.0.0" }

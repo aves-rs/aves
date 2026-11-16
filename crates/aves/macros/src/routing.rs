@@ -48,13 +48,20 @@ pub(super) fn render_routing_blocks(config: &SudoServices) -> String {
         .strip_suffix("Payload")
         .map_or_else(|| format!("{request_type}Request"), str::to_string);
     let (run_bounds, constructor_bounds) = render_handler_bounds(inbound, outbound);
+    let timed = config.response_timeout.is_some();
     let mut rendered = format!(
         "#[doc = \"Generated handler routing for {domain}.\"]\npub(crate) mod {routing_module} {{\n    use super::*;\n"
     );
     rendered.push_str(&format!(
         "    fn check_authenticated_subject_and_capabilities(_projection: &::aves::AuthProjection) -> ::core::result::Result<(), ()> {{ Ok(()) }}\n\n    pub(crate) struct {base}GeneratedHandler<Root, Broadcast>\n    where\n        Root: Clone + Send + 'static,\n        Broadcast: Into<Root> + Clone + Send + 'static,\n    {{\n        public_requests_rx: ::tokio::sync::mpsc::Receiver<({request_wrapper}, ::aves::AuthProjection)>,\n        actor_tasks: ::tokio::sync::mpsc::Sender<{request_wrapper}>,\n"
     ));
-    rendered.push_str(&render_handler_fields(inbound, outbound, services, &request_wrapper));
+    rendered.push_str(&render_handler_fields(
+        inbound,
+        outbound,
+        services,
+        &request_wrapper,
+        timed,
+    ));
     rendered.push_str(&render_routing_mappings(inbound, outbound, &request_wrapper));
     rendered.push_str(&render_forward_request(config, &request_wrapper));
     rendered.push_str(&render_forward_payload(request_type, &request_wrapper));
@@ -70,11 +77,11 @@ pub(super) fn render_routing_blocks(config: &SudoServices) -> String {
         rendered.push_str("broadcast_rx, ");
     }
     rendered.push_str("broadcast_tx,\n");
-    rendered.push_str(&render_constructor_initializers(outbound, services));
+    rendered.push_str(&render_constructor_initializers(outbound, services, timed));
     rendered.push_str(&format!(
         "        }} }}\n\n        pub(crate) async fn run(mut self){run_bounds} {{\n            loop {{\n                ::tokio::select! {{\n"
     ));
-    rendered.push_str(&render_select_branches(inbound, outbound, services));
+    rendered.push_str(&render_select_branches(inbound, outbound, services, timed));
     rendered
         .push_str("                    else => { break; },\n                };\n            }\n        }\n    }\n}\n");
     rendered
@@ -135,8 +142,11 @@ fn render_constructor_fields(outbound: &[RoutingBlock], services: &[SudoService]
     fields
 }
 
-fn render_constructor_initializers(outbound: &[RoutingBlock], services: &[SudoService]) -> String {
+fn render_constructor_initializers(outbound: &[RoutingBlock], services: &[SudoService], timed: bool) -> String {
     let mut fields = String::new();
+    if timed {
+        fields.push_str("            pending: ::aves::__private::FuturesUnordered::new(),\n");
+    }
     for (index, _) in outbound.iter().enumerate() {
         fields.push_str(&format!("            actor_event_rx_{index},\n"));
     }
@@ -146,12 +156,29 @@ fn render_constructor_initializers(outbound: &[RoutingBlock], services: &[SudoSe
     fields
 }
 
-fn render_select_branches(inbound: &[RoutingBlock], outbound: &[RoutingBlock], services: &[SudoService]) -> String {
-    let mut branches = String::from(
-        "                    Some(request) = self.public_requests_rx.recv() => { public_request_branch(&self.actor_tasks, request).await; },\n",
+fn render_select_branches(
+    inbound: &[RoutingBlock],
+    outbound: &[RoutingBlock],
+    services: &[SudoService],
+    timed: bool,
+) -> String {
+    // A full pending set stops request intake until a timed reply completes, preserving backpressure.
+    let (capacity_guard, pending_argument) = if timed {
+        (
+            ", if self.pending.len() < ::aves::utils::buffers::DEFAULT_BUFFER_SIZE",
+            "&mut self.pending, ",
+        )
+    } else {
+        ("", "")
+    };
+    let mut branches = format!(
+        "                    Some(request) = self.public_requests_rx.recv(){capacity_guard} => {{ public_request_branch(&self.actor_tasks, {pending_argument}request).await; }},\n",
     );
     for (index, _) in services.iter().enumerate() {
-        branches.push_str(&format!("                    Some(request) = self.sudo_requests_rx_{index}.recv() => {{ let _ = forward_request(&self.actor_tasks, request).await; }},\n"));
+        branches.push_str(&format!("                    Some(request) = self.sudo_requests_rx_{index}.recv(){capacity_guard} => {{ forward_request(&self.actor_tasks, {pending_argument}request).await; }},\n"));
+    }
+    if timed {
+        branches.push_str("                    Some(()) = ::aves::__private::StreamExt::next(&mut self.pending), if !self.pending.is_empty() => {},\n");
     }
     for (index, _) in inbound.iter().enumerate() {
         branches.push_str(&format!("                    Ok(root_event) = self.broadcast_rx.recv() => {{ if let Some(payload) = <__InboundRouter{index} as __InboundRouting{index}>::route(root_event) {{ forward_payload(&self.actor_tasks, payload).await; }} }},\n"));
@@ -222,25 +249,22 @@ fn render_routing_mappings(inbound: &[RoutingBlock], outbound: &[RoutingBlock], 
 
 fn render_forward_request(config: &SudoServices, request_wrapper: &str) -> String {
     let domain = config.target_domain.as_str();
-    let error_type = config.error.as_str();
     let transport_error_path = config.transport_error_path.as_str();
-    let mut rendered = format!(
-        "    async fn forward_request(\n        actor_tasks: &::tokio::sync::mpsc::Sender<{request_wrapper}>,\n        request: {request_wrapper},\n    ) -> ::core::result::Result<(), {error_type}> {{\n        let caller_reply = request.reply_to;\n        let (actor_reply, actor_response) = ::tokio::sync::oneshot::channel();\n"
+    // The caller's own oneshot goes to the actor, so the handler never waits on a reply.
+    let send_failed = format!(
+        "            let cause = error.to_string();\n            let _ = error.0.reply_to.send(Err({transport_error_path}::ChannelSend {{ target_domain: \"{domain}\".to_string(), operation: \"actor_request\".to_string(), cause: cause.to_string() }}.into()));\n"
     );
-    if let Some(timeout) = &config.response_timeout {
-        rendered.push_str(&format!(
-            "        let side_effecting = ({})(&request.payload);\n",
-            timeout.side_effecting_predicate
-        ));
-    }
-    rendered.push_str(&format!(
-        "        actor_tasks.send({request_wrapper} {{ payload: request.payload, reply_to: actor_reply }}).await\n            .map_err(|error| {transport_error_path}::ChannelSend {{ target_domain: \"{domain}\".to_string(), operation: \"actor_request\".to_string(), cause: error.to_string() }}.into())?;\n"
-    ));
-    rendered.push_str(&render_response_wait(config));
-    rendered.push_str(&format!(
-        "        caller_reply.send(response)\n            .map_err(|_| {transport_error_path}::ChannelSend {{ target_domain: \"{domain}\".to_string(), operation: \"handler.inbound_response\".to_string(), cause: \"caller reply receiver dropped\".to_string() }}.into())?;\n        Ok(())\n    }}\n\n"
-    ));
-    rendered
+    let Some(timeout) = &config.response_timeout else {
+        return format!(
+            "    async fn forward_request(\n        actor_tasks: &::tokio::sync::mpsc::Sender<{request_wrapper}>,\n        request: {request_wrapper},\n    ) {{\n        if let Err(error) = actor_tasks.send(request).await {{\n{send_failed}        }}\n    }}\n\n"
+        );
+    };
+    let duration = timeout.duration.as_str();
+    // Timed replies are polled by the handler loop from a bounded set rather than awaited inline.
+    format!(
+        "    type PendingReply = ::std::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = ()> + Send>>;\n\n    async fn forward_request(\n        actor_tasks: &::tokio::sync::mpsc::Sender<{request_wrapper}>,\n        pending: &mut ::aves::__private::FuturesUnordered<PendingReply>,\n        request: {request_wrapper},\n    ) {{\n        if ({predicate})(&request.payload) {{\n            if let Err(error) = actor_tasks.send(request).await {{\n    {send_failed}            }}\n            return;\n        }}\n        let caller_reply = request.reply_to;\n        let (actor_reply, actor_response) = ::tokio::sync::oneshot::channel();\n        if let Err(error) = actor_tasks.send({request_wrapper} {{ payload: request.payload, reply_to: actor_reply }}).await {{\n            let cause = error.to_string();\n            let _ = caller_reply.send(Err({transport_error_path}::ChannelSend {{ target_domain: \"{domain}\".to_string(), operation: \"actor_request\".to_string(), cause: cause.to_string() }}.into()));\n            return;\n        }}\n        pending.push(::std::boxed::Box::pin(async move {{\n            let response = match ::tokio::time::timeout({duration}, actor_response).await {{\n                Ok(Ok(response)) => response,\n                Err(_) => Err({transport_error_path}::OneshotReplyTimeout {{ target_domain: \"{domain}\".to_string(), operation: \"handler.actor_response\".to_string(), timeout: format!(\"{{:?}}\", {duration}) }}.into()),\n                Ok(Err(error)) => Err({transport_error_path}::OneshotReplyMissing {{ target_domain: \"{domain}\".to_string(), operation: \"handler.actor_response\".to_string(), cause: error.to_string() }}.into()),\n            }};\n            let _ = caller_reply.send(response);\n        }}));\n    }}\n\n",
+        predicate = timeout.side_effecting_predicate,
+    )
 }
 
 fn render_forward_payload(request_type: &str, request_wrapper: &str) -> String {
@@ -251,8 +275,16 @@ fn render_forward_payload(request_type: &str, request_wrapper: &str) -> String {
 
 fn render_public_request_branch(config: &SudoServices, request_wrapper: &str) -> String {
     let authorization_check = render_authorization_check(config.authorization_hook.as_deref());
+    let (pending_parameter, pending_argument) = if config.response_timeout.is_some() {
+        (
+            "        pending: &mut ::aves::__private::FuturesUnordered<PendingReply>,\n",
+            "pending, ",
+        )
+    } else {
+        ("", "")
+    };
     format!(
-        "    async fn public_request_branch(\n        actor_tasks: &::tokio::sync::mpsc::Sender<{request_wrapper}>,\n        request: ({request_wrapper}, ::aves::AuthProjection),\n    ) {{\n        let (request, projection) = request;\n{authorization_check}        let _ = forward_request(actor_tasks, request).await;\n    }}\n\n"
+        "    async fn public_request_branch(\n        actor_tasks: &::tokio::sync::mpsc::Sender<{request_wrapper}>,\n{pending_parameter}        request: ({request_wrapper}, ::aves::AuthProjection),\n    ) {{\n        let (request, projection) = request;\n{authorization_check}        forward_request(actor_tasks, {pending_argument}request).await;\n    }}\n\n"
     )
 }
 
@@ -285,8 +317,12 @@ fn render_handler_fields(
     outbound: &[RoutingBlock],
     services: &[SudoService],
     request_wrapper: &str,
+    timed: bool,
 ) -> String {
     let mut fields = String::new();
+    if timed {
+        fields.push_str("        pending: ::aves::__private::FuturesUnordered<PendingReply>,\n");
+    }
     if !inbound.is_empty() {
         fields.push_str("        broadcast_rx: ::tokio::sync::broadcast::Receiver<Root>,\n");
     }
@@ -304,20 +340,6 @@ fn render_handler_fields(
     }
     fields.push_str("    }\n\n");
     fields
-}
-
-fn render_response_wait(config: &SudoServices) -> String {
-    let domain = config.target_domain.as_str();
-    let transport_error_path = config.transport_error_path.as_str();
-    match &config.response_timeout {
-        None => format!(
-            "        let response = actor_response\n            .await\n            .map_err(|error| {transport_error_path}::ChannelRecv {{ target_domain: \"{domain}\".to_string(), operation: \"handler.actor_response\".to_string(), cause: error.to_string() }}.into())?;\n"
-        ),
-        Some(timeout) => format!(
-            "        let response = if side_effecting {{\n            actor_response\n                .await\n                .map_err(|error| {transport_error_path}::ChannelRecv {{ target_domain: \"{domain}\".to_string(), operation: \"handler.actor_response\".to_string(), cause: error.to_string() }}.into())?\n        }} else {{\n            ::tokio::time::timeout({duration}, actor_response)\n                .await\n                .map_err(|_| {transport_error_path}::OneshotReplyTimeout {{ target_domain: \"{domain}\".to_string(), operation: \"handler.actor_response\".to_string(), timeout: format!(\"{{:?}}\", {duration}) }}.into())?\n                .map_err(|error| {transport_error_path}::OneshotReplyMissing {{ target_domain: \"{domain}\".to_string(), operation: \"handler.actor_response\".to_string(), cause: error.to_string() }}.into())?\n        }};\n",
-            duration = timeout.duration,
-        ),
-    }
 }
 
 fn render_outbound_block(block: &RoutingBlock, index: usize) -> String {

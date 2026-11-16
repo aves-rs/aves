@@ -7,10 +7,12 @@ use crate::runtime::{
 use super::client::GuestRpcBindingFactoryHandle;
 use super::handle::Handle;
 use super::messages::{
-    CancelScriptExecutionInput, ScriptNodeTickedOutput, StartRuntimeInput, StartScriptInput, StartedOutput,
-    StopRuntimeInput, SuccessOutput, TasksBroadcast, TasksPrivilegedCancelScriptExecution, TasksPrivilegedStartRuntime,
-    TasksPrivilegedStartScript, TasksPrivilegedStopRuntime, TasksPrivilegedTickScript, TasksRequest,
-    TasksRequestPayload, TasksSudoServicePrivilegeMapping, TickScriptInput,
+    CancelScriptExecutionInput, CancelShellExecutionInput, ScriptNodeTickedOutput, ShellNodeCancelledOutput,
+    ShellNodeTickedOutput, StartRuntimeInput, StartScriptInput, StartShellInput, StartedOutput, StopRuntimeInput,
+    SuccessOutput, TasksBroadcast, TasksPrivilegedCancelScriptExecution, TasksPrivilegedCancelShellExecution,
+    TasksPrivilegedStartRuntime, TasksPrivilegedStartScript, TasksPrivilegedStartShell, TasksPrivilegedStopRuntime,
+    TasksPrivilegedTickScript, TasksPrivilegedTickShell, TasksRequest, TasksRequestPayload,
+    TasksSudoServicePrivilegeMapping, TickScriptInput, TickShellInput,
 };
 use super::sandbox::ScriptSandbox;
 use super::types::TasksError;
@@ -27,10 +29,13 @@ aves::domain! {
     target = "tasks";
 
     pub service TasksLifecycleSudoService {
+        StartRuntime => Success,
         StartScript => Started,
         TickScript => ScriptNodeTicked,
         CancelScriptExecution => Success,
-        StartRuntime => Success,
+        StartShell => Started,
+        TickShell => ShellNodeTicked,
+        CancelShellExecution => ShellNodeCancelled,
         StopRuntime => Success,
     }
 }

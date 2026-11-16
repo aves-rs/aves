@@ -16,12 +16,21 @@ Import helpers from concrete `aves::utils` modules; there are no root utility re
 ## Config, Flow, and Tasks
 
 - Config (`src/config/`) registers typed sections before sealing. Public `getConfigSection` and `saveConfigSection` operate on one section; saves validate merged values and broadcast `ConfigChanged`.
-- Flow (`src/flow/`) owns the open `NodeKind` + opaque `configuration` envelope. Owners push `NodeKindRegistration` into the shared `NodeRegistrationSupply` before Flow drains it at boot. Tasks registers ScriptNode; Corv registers AgentNode. New kinds require no Flow-core dispatch changes.
+- Flow (`src/flow/`) owns the open `NodeKind` + opaque `configuration` envelope. Owners push `NodeKindRegistration` into the shared `NodeRegistrationSupply` before Flow drains it at boot. Tasks registers ScriptNode and ShellNode; Corv registers AgentNode. New kinds require no Flow-core dispatch changes.
 - Unregistered kinds load as definitions, but START/ENABLE reject them. Interrupted executions with missing kinds become persisted FAILED at recovery without preventing boot.
 - Each execution has one writable directory under `{data_root}/executions/{execution_id}`. Disk is the live projection; Iroh blobs, per-execution docs, and immutable checkpoint collections are durable. Restore uses `materialize_clean`, never a crash-surviving directory.
 - ScriptNode has exactly one WASI preopen (guest `/`). ScriptNode and AgentNode cancellation use privileged lifecycle requests. Guest RPC is not a filesystem.
 - `importWorkspace` is host-local ingress. `downloadWorkspaceBlob` checks `PullCloudBlobs` or `AllBus` before network I/O; only Collection tickets are accepted.
 - Capture/load failure before `PreparedCheckpointCommit` can drop successor Start (accepted NO FIX). Native Collection transfer lacks an acceptance test (accepted NO FIX).
+
+## ShellNode
+
+Tasks registers `ShellNode` beside `ScriptNode`: a host process, not a WASM guest. See [Using Shell Nodes](../../docs/guides/using-shell-nodes.md).
+
+- **Child-only kill.** Timeout, cancel, and `StopRuntime` kill only the interpreter child — no process groups, no Job Objects. Descendants survive; one holding the output pipes costs the 5s drain window and marks that tail abandoned.
+- **Cancel shape.** Cancel is a privileged lifecycle request (`CancelShellExecution`); it answers `NodeLifecycleResult::Failed` with the terminal snapshot, never `NodeLifecycleResult::Cancelled`.
+- **Separate state.** Shell state and shell capacity are independent of ScriptNode, and `StopRuntime` has a shell-only 10s stop window.
+- **Test doubles.** `TasksLifecycleSudoService` implementations must provide `start_shell`, `tick_shell`, and `cancel_shell_execution`.
 
 ## Peer runtime
 
@@ -48,6 +57,6 @@ Flow exposes an opt-in `FlowAppWorkspaceHook` through `FlowBootOptions.app_works
 
 ## References and tests
 
-Start at [engineering navigation](../../docs/navigation.md). See [Flow Execution Workspace](../../docs/concepts/flow-execution-workspace.md), [Pluggable Flow Nodes](../../docs/architecture/aves/pluggable-flow-nodes.md), and [Iroh Peer Runtime](../../docs/architecture/aves/iroh-peer-runtime.md).
+Start at [engineering navigation](../../docs/navigation.md). See [Flow Execution Workspace](../../docs/concepts/flow-execution-workspace.md), [Pluggable Flow Nodes](../../docs/architecture/aves/pluggable-flow-nodes.md), [Using Shell Nodes](../../docs/guides/using-shell-nodes.md), and [Iroh Peer Runtime](../../docs/architecture/aves/iroh-peer-runtime.md).
 
 Run `direnv exec . cargo test --package aves` from the repository root. Downstream crate tests use Aves's existing `test-support` feature; never widen production APIs for fixtures.

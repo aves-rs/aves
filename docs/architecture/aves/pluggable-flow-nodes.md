@@ -1,7 +1,7 @@
 ---
 title: Pluggable Flow Nodes Architecture
 type: architecture
-updated: 2026-11-14
+updated: 2026-11-15
 references:
   - AGENTS.md
   - crates/aves/src/flow/registration.rs
@@ -34,7 +34,7 @@ Aves Flow owns an open, validated `NodeKind` identifier and a common node envelo
 
 ## Data flow
 
-1. **Boot supply.** The embedding application constructs one `NodeRegistrationSupply::default()` and threads it through `ConstructionInputs`. Tasks' `Handle::new` (`crates/aves/src/tasks/handle.rs`) pushes `script_node_registration`; Discuss's constructor (`crates/corv/src/discuss/handle.rs`) pushes `agent_node_registration`. Flow's handle drains the supply into `FlowNodeRegistry` before actor construction. Owners MUST be constructed before FlowDomain because pushes after the drain are not registered.
+1. **Boot supply.** The embedding application constructs one `NodeRegistrationSupply::default()` and threads it through `ConstructionInputs`. Tasks' `Handle::new` (`crates/aves/src/tasks/handle.rs`) pushes `script_node_registration` and `shell_node_registration`; Discuss's constructor (`crates/corv/src/discuss/handle.rs`) pushes `agent_node_registration`. Flow's handle drains the supply into `FlowNodeRegistry` before actor construction. Owners MUST be constructed before FlowDomain because pushes after the drain are not registered.
 2. **Dispatch.** `HostLifecycleAdapter::start/tick/cancel` (`crates/aves/src/flow/adapter.rs`) resolves the registration via `registry.get(kind)`, decodes the owner configuration, and invokes the registration's typed callback. The envelope's transport JWT is the Flow domain's authenticated `BusRpcContext` for all three operations; the node-scoped token carries `AuthCapability::AllBus` and is issued only at Start (tick/cancel carry `node_token: None`).
 3. **Typed error propagation.** `NodeLifecycleDispatchError` distinguishes `ConfigurationTypeMismatch`, `Send`, `ReplyDropped`, and `Owner` — replacing the prior lossy `Option` shape. `map_dispatch_error` converts these to stable `FlowAdapterError` variants.
 4. **Workspace.** The selected workspace handles takeoff. `DefaultWorkspace` resolves graph seeds before preparing the execution workspace; an application workspace replaces the default rather than running alongside it. `WorkspacePreparationError` retains typed `ServiceUnavailable` / `Configuration` / `Resolution { source }` identity.
@@ -58,6 +58,7 @@ Aves Flow owns an open, validated `NodeKind` identifier and a common node envelo
 
 - [Pluggable Flow Nodes](../../concepts/pluggable-flow-nodes.md)
 - [Adding a Flow Node Kind](../../guides/adding-a-flow-node-kind.md)
+- [Using Shell Nodes](../../guides/using-shell-nodes.md)
 - [Aves Flow Domain Architecture](flow-domain.md)
 - [Flow Workspace Trait](../../concepts/flow-workspace-trait.md)
 - `crates/aves/AGENTS.md`

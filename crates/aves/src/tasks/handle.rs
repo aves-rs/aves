@@ -5,7 +5,7 @@ use crate::flow::NodeRegistrationSupply;
 use crate::runtime::ServicePublisher;
 
 use super::actor::{Actor, run_actor};
-use super::adapter::script_node_registration;
+use super::adapter::{script_node_registration, shell_node_registration};
 use super::client::GuestRpcBindingFactoryHandle;
 use super::domain::{TasksDomain, TasksGeneratedHandler, TasksLifecycleSudoService, TasksLifecycleSudoServiceImpl};
 use super::messages::{TasksBroadcast, TasksRequest};
@@ -36,6 +36,7 @@ where
         let (lifecycle_service_impl, lifecycle_service_rx) = TasksLifecycleSudoServiceImpl::channel(64);
 
         node_registration_supply.push(script_node_registration(lifecycle_service_impl.clone(), node_bus));
+        node_registration_supply.push(shell_node_registration(lifecycle_service_impl.clone()));
         let actor = Actor::new(receiver, sandbox, guest_rpc_factory);
         tokio::spawn(run_actor(actor));
 

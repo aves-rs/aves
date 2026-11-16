@@ -1,7 +1,7 @@
 ---
 title: Adding a Flow Node Kind
 type: guide
-updated: 2026-10-23
+updated: 2026-11-15
 references:
   - AGENTS.md
   - crates/aves/src/flow/registration.rs
@@ -28,7 +28,7 @@ Add a new node kind from an owner domain by supplying a `NodeKindRegistration` t
 
 ### 1. Define the typed configuration
 
-In the owner domain, declare a `#[derive(Deserialize, Serialize, Clone, Debug)]` config struct with `#[serde(deny_unknown_fields)]`. This is the type the registration will decode from the envelope's opaque JSON. The real `ScriptNodeConfig` in `crates/aves/src/flow/ast.rs:118-129` shows the shape:
+In the owner domain, declare a `#[derive(Deserialize, Serialize, Clone, Debug)]` config struct with `#[serde(deny_unknown_fields)]`. This is the type the registration will decode from the envelope's opaque JSON. The real `ScriptNodeConfig` in `crates/aves/src/flow/ast.rs:122-134` shows the shape:
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, Type)]
@@ -45,7 +45,7 @@ Do not include `inputs` or `outputs` — bindings live on the Flow-owned envelop
 
 ### 2. Build the registration
 
-Use `NodeKindRegistration::typed` with the eight type parameters (Config, Validate, Start, StartFuture, Tick, TickFuture, Cancel, CancelFuture). The descriptor carries the validated `NodeKind`, the two dispositions, and nothing else. The real `script_node_registration` in `crates/aves/src/tasks/adapter.rs:26-31` shows the descriptor and owner state construction:
+Use `NodeKindRegistration::typed` with the eight type parameters (Config, Validate, Start, StartFuture, Tick, TickFuture, Cancel, CancelFuture). The descriptor carries the validated `NodeKind`, the two dispositions, and nothing else. The real `script_node_registration` in `crates/aves/src/tasks/adapter.rs:38-43` shows the descriptor and owner state construction:
 
 ```rust
 let descriptor = NodeKindDescriptor {
@@ -56,7 +56,7 @@ let descriptor = NodeKindDescriptor {
 let owner_state = Arc::new(ScriptNodeOwnerState { lifecycle, node_bus });
 ```
 
-The full registration function at `crates/aves/src/tasks/adapter.rs:22-120` invokes `NodeKindRegistration::typed::<ScriptNodeConfig, _, _, _, _, _, _, _>(descriptor, validate, start, tick, cancel, Some(owner_state), workspace)` where `validate` is `Fn(&Config) -> Result<(), FlowRegistrationError>`, and `start`/`tick`/`cancel` are `Fn(NodeLifecycleContext, Config) -> Future<Output = Result<NodeLifecycleResult, NodeLifecycleDispatchError>>`.
+The full registration function at `crates/aves/src/tasks/adapter.rs:34-137` invokes `NodeKindRegistration::typed::<ScriptNodeConfig, _, _, _, _, _, _, _>(descriptor, validate, start, tick, cancel, Some(owner_state), workspace)` where `validate` is `Fn(&Config) -> Result<(), FlowRegistrationError>`, and `start`/`tick`/`cancel` are `Fn(NodeLifecycleContext, Config) -> Future<Output = Result<NodeLifecycleResult, NodeLifecycleDispatchError>>`. A second real registration is `shell_node_registration` (`crates/aves/src/tasks/adapter.rs:143-244`): its config type is `ShellNodeConfig`, its owner state holds only the lifecycle service, and it declares `Cancellable` + `SideEffecting`.
 
 ### 3. Supply owner state when needed
 
@@ -72,7 +72,7 @@ In the owner domain's `Handle::new` (the same file that publishes the domain's l
 node_registration_supply.push(script_node_registration(lifecycle_service_impl.clone(), node_bus));
 ```
 
-The embedding application constructs one `NodeRegistrationSupply::default()` and threads it through `ConstructionInputs`. Each owner domain reads it via `facade.input::<NodeRegistrationSupply>()` and pushes before Flow's adapter builds. Owners MUST be constructed before FlowDomain because `Actor::new_with_recovery` drains the supply via `mem::take`; pushes after that take are not registered.
+The embedding application constructs one `NodeRegistrationSupply::default()` and threads it through `ConstructionInputs`. Each owner domain reads it via `facade.input::<NodeRegistrationSupply>()` and pushes before Flow's adapter builds. Owners MUST be constructed before FlowDomain because Flow's `handle::new` drains the supply via `NodeRegistrationSupply::drain` (`mem::take`, `handle.rs:53`); pushes after that take are not registered. One owner may push several kinds: Tasks pushes both `script_node_registration` and `shell_node_registration` from the same `Handle::new`.
 
 ### 5. Add workspace hooks if needed
 
@@ -109,5 +109,6 @@ No edits to:
 
 - [Pluggable Flow Nodes](../concepts/pluggable-flow-nodes.md)
 - [Pluggable Flow Nodes Architecture](../architecture/aves/pluggable-flow-nodes.md)
+- [Using Shell Nodes](using-shell-nodes.md)
 - [Aves Flow Domain Architecture](../architecture/aves/flow-domain.md)
 - `crates/aves/AGENTS.md`

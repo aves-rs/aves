@@ -1,7 +1,7 @@
 ---
 title: Aves Tasks Domain Architecture
 type: architecture
-updated: 2026-10-23
+updated: 2026-11-15
 references:
   - crates/aves/src/tasks/mod.rs
   - crates/aves/src/tasks/domain.rs
@@ -11,20 +11,22 @@ references:
   - crates/aves/src/tasks/compiler.rs
   - crates/aves/src/tasks/sandbox.rs
   - crates/aves/src/tasks/adapter.rs
+  - crates/aves/src/tasks/shell.rs
   - crates/aves/src/flow/registration.rs
   - AGENTS.md
 ---
 
 # Aves Tasks Domain Architecture
 
-Aves Tasks owns ScriptNode Flow registration: Oxc TypeScript compile and a fresh QuickJS-in-Wasmtime guest per run. Discuss owns AgentNode registration and execution. Flow owns the shared execution directory and recovery; Tasks does not persist graphs or checkpoints.
+Aves Tasks owns two Flow node kinds: `ScriptNode` (Oxc TypeScript compile and a fresh QuickJS-in-Wasmtime guest per run) and `ShellNode` (a host shell process). Discuss owns AgentNode registration and execution. Flow owns the shared execution directory and recovery; Tasks does not persist graphs or checkpoints.
 
 ## Ownership and boundaries
 
-- **Tasks owns:** `TypeScriptCompiler`, `ScriptSandbox` (bundled `qjs-wasi-reactor.wasm`), privileged `StartScript` / `TickScript`, fuel + wall-clock timeout, opaque `ScriptNodeCompletion` outputs. Tasks pushes `script_node_registration` onto `NodeRegistrationSupply` in `tasks/handle.rs`; Discuss owns the AgentNode registration, lifecycle requests, limits, completions, and ACP sessions.
+- **Tasks owns:** `TypeScriptCompiler`, `ScriptSandbox` (bundled `qjs-wasi-reactor.wasm`), privileged `StartScript` / `TickScript`, fuel + wall-clock timeout, opaque `ScriptNodeCompletion` outputs. Tasks pushes `script_node_registration` and `shell_node_registration` onto `NodeRegistrationSupply` in `tasks/handle.rs`; Discuss owns the AgentNode registration, lifecycle requests, limits, completions, and ACP sessions.
+- **ShellNode boundary:** `ShellNode` runs `<interpreter> -c <script>` as a host process outside Wasmtime. Timeout, cancel, and `StopRuntime` kill only the interpreter child — no process groups, no Job Objects — so descendants survive. Shell state, capacity, and the stop window are separate from ScriptNode. See [Using Shell Nodes](../../guides/using-shell-nodes.md).
 - **Flow owns:** when a ScriptNode or AgentNode starts/ticks, the execution workspace, and durable node status. `StartScript.workspace_path` is the shared execution root.
 - **No public RPC/MCP.** Tasks has only privileged lifecycle operations.
-- **Does not own:** extra host mounts, Node.js APIs, Browser guests, remote Iroh, AgentNode, or ACP sessions. ScriptNode cancellation is a privileged lifecycle request (`CancelScriptExecution`); AgentNode cancellation (`CancelAgentExecution`) belongs to Discuss.
+- **Does not own:** extra host mounts, Node.js APIs, Browser guests, remote Iroh, AgentNode, or ACP sessions. ScriptNode cancellation is a privileged lifecycle request (`CancelScriptExecution`); ShellNode cancellation is `CancelShellExecution`; AgentNode cancellation (`CancelAgentExecution`) belongs to Discuss.
 
 ## Data flow
 
@@ -39,14 +41,21 @@ Aves Tasks owns ScriptNode Flow registration: Oxc TypeScript compile and a fresh
 let source_type = SourceType::ts().with_module(true);
 ```
 
+## Shell
+
+1. Flow dispatches `StartShell` with the interpreter, ordered commands, `cwd`, timeout, and BoundInputs. The actor rejects a missing or non-directory `cwd` before spawning.
+2. The runner joins the commands with newlines and executes `<interpreter> -c <script>` with null stdin, piped stdout/stderr, and the inherited host environment.
+3. `TickShell` reports `Running` until the runner yields one terminal cause, then projects `exit_code` / `stdout` / `stderr` as bound outputs. On failure the same values, plus dropped-byte and abandoned-tail markers, live in the node state.
+
 ## Persistence
 
-None. Execution state is process-local and **resets on restart**. Flow recovery re-issues Start/Tick for unfinished ScriptNodes. In-process `completed` makes duplicate `StartScript` for the same `node_execution_id` a no-op `Started`.
+None. Execution state is process-local and **resets on restart**. Flow recovery re-issues Start/Tick for unfinished nodes (both ScriptNode and ShellNode). In-process `completed` makes duplicate `StartScript` for the same `node_execution_id` a no-op `Started`.
 
-Capacity: 4 concurrent executions (`MAX_CONCURRENT_EXECUTIONS`). Stop clears `pending`.
+Capacity: 4 concurrent script executions (`MAX_CONCURRENT_EXECUTIONS`) and 4 concurrent shells (`MAX_CONCURRENT_SHELL_EXECUTIONS`); a fifth shell stays pending. Stop clears script `pending` and fails pending shells. `StopRuntime` gives running shells a 10s supervision window before reporting `ShellStopCleanupFailed`.
 
 ## Related
 
+- [Using Shell Nodes](../../guides/using-shell-nodes.md)
 - [Flow Execution Workspace](../../concepts/flow-execution-workspace.md)
 - [Flow Dataflow](../../concepts/flow-dataflow.md)
 - [Pluggable Flow Nodes Architecture](pluggable-flow-nodes.md)

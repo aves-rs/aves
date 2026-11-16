@@ -595,7 +595,7 @@ Compose the owner domain for each node kind you need:
 
 | Owner | Registered kinds |
 |---|---|
-| Aves Tasks | `ScriptNode` |
+| Aves Tasks | `ScriptNode`, `ShellNode` |
 | Corv Discuss | `AgentNode` |
 | Tyto Messaging | `MessageNode`, `PermissionNode` |
 | Application owners | Additional kinds, such as Poseidon's `OrderNode` |
@@ -625,6 +625,9 @@ Do not assume an AgentNode's process working directory provides equivalent confi
 Read [Tasks architecture](./docs/architecture/aves/tasks-domain.md) and [the script adapter](src/tasks/adapter.rs).
 Keep source compilation, execution, and terminal output handling with Tasks.
 Keep graph scheduling, persistence, and checkpoint policy with Flow.
+
+Tasks also registers `ShellNode`, a host shell process outside Wasmtime.
+Read [Using Shell Nodes](./docs/guides/using-shell-nodes.md) before configuring one.
 
 ### Open databases and apply owner migrations
 

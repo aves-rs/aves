@@ -41,11 +41,17 @@ async fn start_script_applies_finite_defaults_and_rejects_input_replay() {
     let (_tx, rx) = mpsc::channel(1);
     let mut actor = test_actor(rx);
     let (completion_tx, _completion_rx) = mpsc::channel(1);
+    let (shell_completion_tx, _shell_completion_rx) = mpsc::channel(MAX_CONCURRENT_SHELL_EXECUTIONS);
     let workspace = tempdir().unwrap();
     let workspace_path = workspace.path().to_path_buf();
     let (runtime_reply_tx, runtime_reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(TasksRequestPayload::StartRuntime, runtime_reply_tx, &completion_tx)
+        .handle_message(
+            TasksRequestPayload::StartRuntime,
+            runtime_reply_tx,
+            &completion_tx,
+            &shell_completion_tx,
+        )
         .await;
     assert!(matches!(runtime_reply_rx.await.unwrap(), Ok(TasksResponse::Success)));
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -65,6 +71,7 @@ async fn start_script_applies_finite_defaults_and_rejects_input_replay() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Started { .. })));
@@ -99,6 +106,7 @@ async fn start_script_applies_finite_defaults_and_rejects_input_replay() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(
@@ -115,6 +123,7 @@ async fn start_script_applies_finite_defaults_and_rejects_input_replay() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(
@@ -138,6 +147,7 @@ async fn start_script_applies_finite_defaults_and_rejects_input_replay() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(
@@ -153,6 +163,7 @@ async fn runtime_lifecycle_rejects_work_while_stopped_and_discards_pending_work(
     let (_tx, rx) = mpsc::channel(1);
     let mut actor = test_actor(rx);
     let (completion_tx, _completion_rx) = mpsc::channel(1);
+    let (shell_completion_tx, _shell_completion_rx) = mpsc::channel(MAX_CONCURRENT_SHELL_EXECUTIONS);
     let workspace = tempdir().unwrap();
     let workspace_path = workspace.path().to_path_buf();
     let correlation = correlation();
@@ -170,25 +181,35 @@ async fn runtime_lifecycle_rejects_work_while_stopped_and_discards_pending_work(
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(start_payload(), reply_tx, &completion_tx)
+        .handle_message(start_payload(), reply_tx, &completion_tx, &shell_completion_tx)
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Err(TasksError::RuntimeStopped)));
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(TasksRequestPayload::StartRuntime, reply_tx, &completion_tx)
+        .handle_message(
+            TasksRequestPayload::StartRuntime,
+            reply_tx,
+            &completion_tx,
+            &shell_completion_tx,
+        )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Success)));
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(start_payload(), reply_tx, &completion_tx)
+        .handle_message(start_payload(), reply_tx, &completion_tx, &shell_completion_tx)
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Started { .. })));
     assert!(actor.pending.contains_key(&correlation.node_execution_id));
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(TasksRequestPayload::StopRuntime, reply_tx, &completion_tx)
+        .handle_message(
+            TasksRequestPayload::StopRuntime,
+            reply_tx,
+            &completion_tx,
+            &shell_completion_tx,
+        )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Success)));
     assert!(actor.pending.is_empty());
@@ -201,6 +222,7 @@ async fn runtime_lifecycle_rejects_work_while_stopped_and_discards_pending_work(
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Err(TasksError::RuntimeStopped)));
@@ -211,11 +233,17 @@ async fn tick_requires_an_in_process_start() {
     let (_tx, rx) = mpsc::channel(1);
     let mut actor = test_actor(rx);
     let (completion_tx, _completion_rx) = mpsc::channel(1);
+    let (shell_completion_tx, _shell_completion_rx) = mpsc::channel(MAX_CONCURRENT_SHELL_EXECUTIONS);
     let correlation = correlation();
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(TasksRequestPayload::StartRuntime, reply_tx, &completion_tx)
+        .handle_message(
+            TasksRequestPayload::StartRuntime,
+            reply_tx,
+            &completion_tx,
+            &shell_completion_tx,
+        )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Success)));
 
@@ -228,6 +256,7 @@ async fn tick_requires_an_in_process_start() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(
@@ -240,6 +269,7 @@ async fn execution_capacity_is_four_and_finite_limits_remain_pending_on_rejectio
     let (_tx, rx) = mpsc::channel(1);
     let mut actor = test_actor(rx);
     let (completion_tx, _completion_rx) = mpsc::channel(1);
+    let (shell_completion_tx, _shell_completion_rx) = mpsc::channel(MAX_CONCURRENT_SHELL_EXECUTIONS);
     let workspace = tempdir().unwrap();
     let workspace_path = workspace.path().to_path_buf();
     let mut permits = Vec::new();
@@ -250,7 +280,12 @@ async fn execution_capacity_is_four_and_finite_limits_remain_pending_on_rejectio
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(TasksRequestPayload::StartRuntime, reply_tx, &completion_tx)
+        .handle_message(
+            TasksRequestPayload::StartRuntime,
+            reply_tx,
+            &completion_tx,
+            &shell_completion_tx,
+        )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Success)));
     let correlation = correlation();
@@ -271,6 +306,7 @@ async fn execution_capacity_is_four_and_finite_limits_remain_pending_on_rejectio
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Started { .. })));
@@ -284,6 +320,7 @@ async fn execution_capacity_is_four_and_finite_limits_remain_pending_on_rejectio
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(
@@ -302,11 +339,17 @@ async fn pre_execution_start_failures_leave_no_pending_work() {
     let (_tx, rx) = mpsc::channel(1);
     let mut actor = test_actor(rx);
     let (completion_tx, _completion_rx) = mpsc::channel(1);
+    let (shell_completion_tx, _shell_completion_rx) = mpsc::channel(MAX_CONCURRENT_SHELL_EXECUTIONS);
     let workspace = tempdir().unwrap();
     let workspace_path = workspace.path().to_path_buf();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(TasksRequestPayload::StartRuntime, reply_tx, &completion_tx)
+        .handle_message(
+            TasksRequestPayload::StartRuntime,
+            reply_tx,
+            &completion_tx,
+            &shell_completion_tx,
+        )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Success)));
 
@@ -327,6 +370,7 @@ async fn pre_execution_start_failures_leave_no_pending_work() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Err(TasksError::Compilation { .. })));
@@ -353,6 +397,7 @@ async fn pre_execution_start_failures_leave_no_pending_work() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Err(TasksError::MissingNodeToken)));
@@ -375,6 +420,7 @@ async fn pre_execution_start_failures_leave_no_pending_work() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Err(TasksError::MissingNodeToken)));
@@ -396,6 +442,7 @@ async fn pre_execution_start_failures_leave_no_pending_work() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Started { .. })));
@@ -407,6 +454,7 @@ async fn restarted_script_node_starts_and_executes_without_durable_replay() {
     let (_tx, rx) = mpsc::channel(1);
     let mut actor = test_actor(rx);
     let (completion_tx, _completion_rx) = mpsc::channel(1);
+    let (shell_completion_tx, _shell_completion_rx) = mpsc::channel(MAX_CONCURRENT_SHELL_EXECUTIONS);
     let workspace = tempdir().unwrap();
     let workspace_path = workspace.path().to_path_buf();
     let correlation = correlation();
@@ -414,7 +462,12 @@ async fn restarted_script_node_starts_and_executes_without_durable_replay() {
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_message(TasksRequestPayload::StartRuntime, reply_tx, &completion_tx)
+        .handle_message(
+            TasksRequestPayload::StartRuntime,
+            reply_tx,
+            &completion_tx,
+            &shell_completion_tx,
+        )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Success)));
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -433,6 +486,7 @@ async fn restarted_script_node_starts_and_executes_without_durable_replay() {
             },
             reply_tx,
             &completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Started { .. })));
@@ -443,7 +497,12 @@ async fn restarted_script_node_starts_and_executes_without_durable_replay() {
     let (restarted_completion_tx, mut restarted_completion_rx) = mpsc::channel(1);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     restarted
-        .handle_message(TasksRequestPayload::StartRuntime, reply_tx, &restarted_completion_tx)
+        .handle_message(
+            TasksRequestPayload::StartRuntime,
+            reply_tx,
+            &restarted_completion_tx,
+            &shell_completion_tx,
+        )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Success)));
 
@@ -463,6 +522,7 @@ async fn restarted_script_node_starts_and_executes_without_durable_replay() {
             },
             reply_tx,
             &restarted_completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(reply_rx.await.unwrap(), Ok(TasksResponse::Started { .. })));
@@ -481,6 +541,7 @@ async fn restarted_script_node_starts_and_executes_without_durable_replay() {
             },
             reply_tx,
             &restarted_completion_tx,
+            &shell_completion_tx,
         )
         .await;
     assert!(matches!(
@@ -498,6 +559,7 @@ async fn restarted_script_node_starts_and_executes_without_durable_replay() {
             TasksRequestPayload::TickScript { correlation, input },
             reply_tx,
             &restarted_completion_tx,
+            &shell_completion_tx,
         )
         .await;
     let response = reply_rx.await.unwrap();

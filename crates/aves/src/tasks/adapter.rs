@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -13,12 +13,22 @@ use crate::flow::{
 };
 
 use super::domain::TasksLifecycleSudoService;
-use super::messages::{CancelScriptExecutionInput, StartScriptInput, TickScriptInput};
-use super::types::{ScriptNodeOutputs, ScriptNodeTickResult};
+use super::messages::{
+    CancelScriptExecutionInput, CancelShellExecutionInput, StartScriptInput, StartShellInput, TickScriptInput,
+    TickShellInput,
+};
+use super::types::{
+    ScriptNodeOutputs, ScriptNodeTickResult, ShellNodeCompletion, ShellNodeConfig, ShellNodeFailure,
+    ShellNodeTickResult, TasksError,
+};
 
 pub(super) struct ScriptNodeOwnerState {
     lifecycle: Arc<dyn TasksLifecycleSudoService>,
     node_bus: Option<BusIngress>,
+}
+
+struct ShellNodeOwnerState {
+    lifecycle: Arc<dyn TasksLifecycleSudoService>,
 }
 
 pub(super) fn script_node_registration(
@@ -130,6 +140,149 @@ fn script_node_kind() -> NodeKind {
     NodeKind::parse("ScriptNode").expect("static node kind is valid")
 }
 
+pub(super) fn shell_node_registration(lifecycle: Arc<dyn TasksLifecycleSudoService>) -> NodeKindRegistration {
+    let descriptor = NodeKindDescriptor {
+        kind: shell_node_kind(),
+        cancellation: CancellationDisposition::Cancellable,
+        side_effects: SideEffectDisposition::SideEffecting,
+    };
+    let owner_state = Arc::new(ShellNodeOwnerState { lifecycle });
+    NodeKindRegistration::typed::<ShellNodeConfig, _, _, _, _, _, _, _>(
+        descriptor,
+        |configuration| {
+            let message = if configuration.interpreter.trim().is_empty() {
+                Some("interpreter must not be empty")
+            } else if configuration.commands.is_empty() {
+                Some("commands must not be empty")
+            } else if configuration.cwd.trim().is_empty() {
+                Some("cwd must not be empty")
+            } else {
+                None
+            };
+            match message {
+                Some(message) => Err(FlowRegistrationError::Configuration {
+                    message: message.to_owned(),
+                }),
+                None => Ok(()),
+            }
+        },
+        |context, configuration| async move {
+            let lifecycle = shell_owner_state(&context)?;
+            lifecycle
+                .start_shell(StartShellInput {
+                    correlation: context.correlation,
+                    interpreter: configuration.interpreter,
+                    commands: configuration.commands,
+                    cwd: PathBuf::from(configuration.cwd),
+                    timeout_secs: configuration.timeout_secs,
+                    input: context.inputs.as_value(),
+                })
+                .await
+                .map_err(|error| NodeLifecycleDispatchError::Owner(Box::new(error)))?;
+            Ok(NodeLifecycleResult::Running)
+        },
+        |context, _configuration| async move {
+            let lifecycle = shell_owner_state(&context)?;
+            let output = lifecycle
+                .tick_shell(TickShellInput {
+                    correlation: context.correlation,
+                    input: context.inputs.as_value(),
+                })
+                .await
+                .map_err(|error| NodeLifecycleDispatchError::Owner(Box::new(error)))?;
+            match output.result {
+                ShellNodeTickResult::Running => Ok(NodeLifecycleResult::Running),
+                ShellNodeTickResult::Succeeded { completion } => {
+                    let state = shell_completion_state(&completion);
+                    let emitted = BTreeMap::from([
+                        (String::from("exit_code"), json!(completion.exit_code)),
+                        (String::from("stdout"), json!(completion.stdout)),
+                        (String::from("stderr"), json!(completion.stderr)),
+                    ]);
+                    match project_shell_outputs(&context.node.outputs, &emitted) {
+                        Ok(outputs) => Ok(NodeLifecycleResult::Succeeded { outputs, state }),
+                        Err(error) => Ok(NodeLifecycleResult::Failed {
+                            message: error.to_string(),
+                            state,
+                        }),
+                    }
+                }
+                ShellNodeTickResult::Failed { failure } => Ok(NodeLifecycleResult::Failed {
+                    message: failure.error.to_string(),
+                    state: shell_failure_state(&failure),
+                }),
+            }
+        },
+        |context, _configuration| async move {
+            let lifecycle = shell_owner_state(&context)?;
+            match lifecycle
+                .cancel_shell_execution(CancelShellExecutionInput {
+                    node_execution_id: context.correlation.node_execution_id,
+                })
+                .await
+            {
+                Ok(output) => {
+                    let state = match output.result {
+                        ShellNodeTickResult::Running => Value::Null,
+                        ShellNodeTickResult::Succeeded { completion } => shell_completion_state(&completion),
+                        ShellNodeTickResult::Failed { failure } => shell_failure_state(&failure),
+                    };
+                    Ok(NodeLifecycleResult::Failed {
+                        message: String::from("ShellNode execution cancelled"),
+                        state,
+                    })
+                }
+                Err(error) => Ok(NodeLifecycleResult::Failed {
+                    message: error.to_string(),
+                    state: Value::Null,
+                }),
+            }
+        },
+        Some(owner_state),
+        WorkspacePreparation::new(),
+    )
+}
+
+fn shell_node_kind() -> NodeKind {
+    NodeKind::parse("ShellNode").expect("static node kind is valid")
+}
+
+fn shell_owner_state(
+    context: &NodeLifecycleContext,
+) -> Result<Arc<dyn TasksLifecycleSudoService>, NodeLifecycleDispatchError> {
+    context
+        .owner_state
+        .as_ref()
+        .and_then(|state| state.downcast_ref::<ShellNodeOwnerState>())
+        .map(|state| state.lifecycle.clone())
+        .ok_or_else(|| NodeLifecycleDispatchError::Owner(Box::new(TasksError::ShellOwnerStateUnavailable)))
+}
+
+fn shell_completion_state(completion: &ShellNodeCompletion) -> Value {
+    json!({
+        "exit_code": completion.exit_code, "stdout": completion.stdout, "stderr": completion.stderr,
+        "stdout_dropped_bytes": completion.stdout_dropped_bytes, "stderr_dropped_bytes": completion.stderr_dropped_bytes,
+        "stdout_abandoned_tail": completion.stdout_abandoned_tail, "stderr_abandoned_tail": completion.stderr_abandoned_tail,
+    })
+}
+
+fn shell_failure_state(failure: &ShellNodeFailure) -> Value {
+    json!({
+        "error": failure.error, "exit_code": failure.exit_code, "stdout": failure.stdout, "stderr": failure.stderr,
+        "stdout_dropped_bytes": failure.stdout_dropped_bytes, "stderr_dropped_bytes": failure.stderr_dropped_bytes,
+        "stdout_abandoned_tail": failure.stdout_abandoned_tail, "stderr_abandoned_tail": failure.stderr_abandoned_tail,
+    })
+}
+
+fn project_shell_outputs(
+    bindings: &[BlackboardBinding],
+    outputs: &BTreeMap<String, Value>,
+) -> Result<BoundOutputs, FlowAdapterError> {
+    project_outputs(bindings, shell_node_kind(), "ShellNode", |name| {
+        outputs.get(name).cloned()
+    })
+}
+
 fn script_owner_state(
     context: &NodeLifecycleContext,
 ) -> Result<(Arc<dyn TasksLifecycleSudoService>, Option<BusIngress>), NodeLifecycleDispatchError> {
@@ -187,15 +340,23 @@ fn project_script_outputs(
     bindings: &[BlackboardBinding],
     outputs: ScriptNodeOutputs,
 ) -> Result<BoundOutputs, FlowAdapterError> {
+    project_outputs(bindings, script_node_kind(), "ScriptNode", |name| {
+        outputs.get(name).cloned()
+    })
+}
+
+fn project_outputs(
+    bindings: &[BlackboardBinding],
+    kind: NodeKind,
+    label: &str,
+    lookup: impl Fn(&str) -> Option<Value>,
+) -> Result<BoundOutputs, FlowAdapterError> {
     let mut values = BTreeMap::new();
     for binding in bindings {
-        let value = outputs
-            .get(&binding.name)
-            .cloned()
-            .ok_or_else(|| FlowAdapterError::InvalidOwnerInput {
-                kind: script_node_kind(),
-                message: format!("ScriptNode did not emit configured output {}", binding.name),
-            })?;
+        let value = lookup(&binding.name).ok_or_else(|| FlowAdapterError::InvalidOwnerInput {
+            kind: kind.clone(),
+            message: format!("{label} did not emit configured output {}", binding.name),
+        })?;
         values.insert(binding.name.clone(), value);
     }
     Ok(BoundOutputs::new(values))

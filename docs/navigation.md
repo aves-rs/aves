@@ -1,7 +1,7 @@
 ---
 title: Aves Engineering Navigation
 type: reference
-updated: 2026-11-14
+updated: 2026-11-15
 references:
   - AGENTS.md
   - crates/aves/AGENTS.md
@@ -32,7 +32,7 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 | [Machine Domain](architecture/aves/machine-domain.md) | Peering, inventory, content and encryption |
 | [Coordination Domain](architecture/aves/coordination-domain.md) | Chain hosting, signing and recovery |
 | [Flow Domain](architecture/aves/flow-domain.md) | Graph execution and persistence |
-| [Tasks Domain](architecture/aves/tasks-domain.md) | ScriptNode and WASI |
+| [Tasks Domain](architecture/aves/tasks-domain.md) | ScriptNode, ShellNode and WASI |
 | [Iroh Peer Runtime](architecture/aves/iroh-peer-runtime.md) | Native transport and trust |
 | [Pluggable Flow Nodes](architecture/aves/pluggable-flow-nodes.md) | Node registration and dispatch |
 | [Discuss Domain](architecture/corv/discuss-domain.md) | ACP sessions, providers and MCP |
@@ -69,6 +69,7 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 | [Adding a Flow Node Kind](guides/adding-a-flow-node-kind.md) | Implementing a node registration |
 | [Aves Domain RPC](guides/aves-domain-rpc.md) | Publishing generated RPC operations |
 | [Using the Decide Domain](guides/using-the-decide-domain.md) | Installing Decide, supplying credentials, asking questions, Decide nodes |
+| [Using Shell Nodes](guides/using-shell-nodes.md) | Running host shell commands from a Flow node |
 | [Stale Named References](guides/stale-named-references.md) | Diagnosing missing Tyto connections |
 
 ## External Documentation Cache

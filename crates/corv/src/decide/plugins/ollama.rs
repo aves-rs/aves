@@ -118,7 +118,9 @@ impl DecidePlugin for OllamaPlugin {
         let body = wire_request(request)?;
         let response = post_json(
             base,
-            credential.map(|value| value.api_key.as_str()),
+            credential
+                .and_then(|value| value.api_key.as_ref())
+                .map(|key| key.as_str()),
             &body,
             request.timeout,
             |status| matches!(status, 429 | 502 | 503),
@@ -365,13 +367,14 @@ mod tests {
             })
             .await;
             let credential = DecideCredential {
-                api_key: Zeroizing::new("test-key".into()),
+                provider: PROVIDER_ID.into(),
+                api_key: keyed.then(|| Zeroizing::new("test-key".into())),
                 endpoint: server.base.clone(),
             };
             for question in [bool_question(), choice_question(), score_question()] {
                 let mut r = request(question);
                 r.endpoint = Some(server.base.clone());
-                let outcome = PLUGIN.ask(&r, keyed.then_some(&credential)).await.unwrap();
+                let outcome = PLUGIN.ask(&r, Some(&credential)).await.unwrap();
                 assert_eq!(outcome.model, "clef");
                 match outcome.answer {
                     DecideAnswer::Bool(answer) => assert_eq!(answer.probability, 0.7),

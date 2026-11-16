@@ -1,7 +1,9 @@
 //! Discuss-owned MCP tool collation and the service shared by ACP and HTTP transports.
 
+use std::str::FromStr;
 use std::{collections::HashSet, error::Error, fmt::Debug, future::Future, pin::Pin, sync::Arc};
 
+use agent_client_protocol::v1::schema::McpServer;
 use async_trait::async_trait;
 use axum08::http::request::Parts;
 use base64::Engine;
@@ -20,9 +22,264 @@ use tokio_util::sync::CancellationToken;
 use aves::auth::Jwt;
 use aves::bus::{BusRpcContext, DomainPublication, RequestOperationDescriptor};
 
+use super::actor::Actor;
 use super::boot::{DiscussMcpDomain, DiscussMcpService};
+use super::library::AgentId;
 use super::mcp_direct::McpAcpTransport;
-use super::types::DiscussError;
+use super::messages::DiscussResponse;
+use super::storage::{
+    DiscussPersistence, McpAssignmentScope, delete_custom_mcp, delete_mcp_assignment, delete_mcp_assignments_by_name,
+    delete_mcp_assignments_by_scope, insert_mcp_assignment, list_custom_mcps, list_mcp_assignments_by_scope,
+    load_custom_mcp, load_discuss_session, upsert_custom_mcp,
+};
+use super::types::{
+    CustomMcpEntry, CustomMcpScope, DiscussError, DiscussSessionId, DiscussSessionSetup, SensitiveMcpDescriptor,
+    SessionLaunchConfig,
+};
+
+fn mcp_transport(server: &McpServer) -> Result<(&str, &'static str), DiscussError> {
+    match server {
+        McpServer::Stdio(server) => Ok((&server.name, "stdio")),
+        McpServer::Http(server) => Ok((&server.name, "http")),
+        _ => Err(DiscussError::Validation {
+            message: "unsupported custom MCP transport".to_owned(),
+        }),
+    }
+}
+
+fn redact_custom_mcp(mut server: McpServer) -> Result<McpServer, DiscussError> {
+    match &mut server {
+        McpServer::Stdio(config) => {
+            config.meta = None;
+            for variable in &mut config.env {
+                variable.value = "<redacted>".to_owned();
+                variable.meta = None;
+            }
+        }
+        McpServer::Http(config) => {
+            config.meta = None;
+            for header in &mut config.headers {
+                header.value = "<redacted>".to_owned();
+                header.meta = None;
+            }
+        }
+        _ => {
+            return Err(DiscussError::Validation {
+                message: "unsupported custom MCP transport".to_owned(),
+            });
+        }
+    }
+    Ok(server)
+}
+
+fn safe_mcp_name(name: &str) -> Result<(), DiscussError> {
+    AgentId::new(name)
+        .map(|_| ())
+        .map_err(|_| DiscussError::Validation {
+            message: "invalid custom MCP name".to_owned(),
+        })
+}
+
+fn assignment_scope(scope: CustomMcpScope) -> McpAssignmentScope {
+    match scope {
+        CustomMcpScope::Provider => McpAssignmentScope::Provider,
+        CustomMcpScope::Team => McpAssignmentScope::Team,
+        CustomMcpScope::Session => McpAssignmentScope::Session,
+    }
+}
+
+/// Remove assignments for a deleted Team, Provider, or session scope.
+pub(super) async fn clear_mcp_scope(
+    conn: &turso::Connection,
+    scope: CustomMcpScope,
+    id: &str,
+) -> Result<(), DiscussError> {
+    delete_mcp_assignments_by_scope(conn, assignment_scope(scope), id).await
+}
+
+impl Actor {
+    pub(super) async fn handle_list_custom_mcps(&self) -> Result<DiscussResponse, DiscussError> {
+        let conn = self.persistence.acquire_connection().await?;
+        let mut entries = Vec::new();
+        for row in list_custom_mcps(&conn).await? {
+            let (_, kind) = mcp_transport(&row.descriptor)?;
+            entries.push(CustomMcpEntry {
+                name: row.name,
+                transport_kind: kind.to_owned(),
+                updated_at_ms: row.updated_at_ms,
+                descriptor: SensitiveMcpDescriptor(redact_custom_mcp(row.descriptor)?),
+            });
+        }
+        Ok(DiscussResponse::ListCustomMcps { entries })
+    }
+
+    pub(super) async fn handle_write_custom_mcp(
+        &self,
+        name: &str,
+        descriptor: SensitiveMcpDescriptor,
+        create: bool,
+    ) -> Result<DiscussResponse, DiscussError> {
+        safe_mcp_name(name)?;
+        if (self.mcp_domains)()?
+            .iter()
+            .any(|domain| domain.server_name == name)
+        {
+            return Err(DiscussError::ReservedMcpName);
+        }
+        if mcp_transport(&descriptor.0)?.0 != name {
+            return Err(DiscussError::Validation {
+                message: "custom MCP descriptor name mismatch".to_owned(),
+            });
+        }
+        let conn = self.persistence.acquire_connection().await?;
+        let exists = load_custom_mcp(&conn, name).await?.is_some();
+        if create && exists {
+            return Err(DiscussError::DuplicateMcpServerName);
+        }
+        if !create && !exists {
+            return Err(DiscussError::Validation {
+                message: "custom MCP does not exist".to_owned(),
+            });
+        }
+        upsert_custom_mcp(&conn, name, &descriptor.0, chrono::Utc::now().timestamp_millis()).await?;
+        Ok(DiscussResponse::Success)
+    }
+
+    pub(super) async fn handle_delete_custom_mcp(&self, name: &str) -> Result<DiscussResponse, DiscussError> {
+        safe_mcp_name(name)?;
+        let mut conn = self.persistence.acquire_connection().await?;
+        let tx = conn.transaction().await?;
+        delete_mcp_assignments_by_name(&tx, name).await?;
+        delete_custom_mcp(&tx, name).await?;
+        tx.commit().await?;
+        Ok(DiscussResponse::Success)
+    }
+
+    pub(super) async fn handle_mcp_assignment(
+        &self,
+        scope: CustomMcpScope,
+        id: &str,
+        name: &str,
+        assign: bool,
+    ) -> Result<DiscussResponse, DiscussError> {
+        safe_mcp_name(name)?;
+        let conn = self.persistence.acquire_connection().await?;
+        let mut scope_id = id.to_owned();
+        match scope {
+            CustomMcpScope::Provider if !self.agents.contains_key(id) => {
+                return Err(DiscussError::UnknownAgent {
+                    agent_key: id.to_owned(),
+                });
+            }
+            CustomMcpScope::Team => {
+                let team = AgentId::new(id).map_err(|_| DiscussError::Validation {
+                    message: "invalid Team identity".to_owned(),
+                })?;
+                self.resolve_team(&team).await?;
+            }
+            CustomMcpScope::Session => {
+                let session = DiscussSessionId::from_str(id).map_err(|_| DiscussError::Validation {
+                    message: "invalid session identity".to_owned(),
+                })?;
+                load_discuss_session(&conn, &session.to_string())
+                    .await?
+                    .ok_or(DiscussError::SessionNotFound {
+                        discuss_session_id: session,
+                    })?;
+                scope_id = session.to_string();
+            }
+            _ => {}
+        }
+        if assign {
+            if load_custom_mcp(&conn, name).await?.is_none() {
+                return Err(DiscussError::Validation {
+                    message: "custom MCP does not exist".to_owned(),
+                });
+            }
+            insert_mcp_assignment(&conn, assignment_scope(scope), &scope_id, name).await?;
+        } else {
+            delete_mcp_assignment(&conn, assignment_scope(scope), &scope_id, name).await?;
+        }
+        Ok(DiscussResponse::Success)
+    }
+}
+
+/// Compose a transient launch copy without modifying its persisted base.
+pub(super) async fn composed_launch_config(
+    persistence: &DiscussPersistence,
+    domains: fn() -> Result<Vec<DiscussMcpDomain>, DiscussError>,
+    provider: &str,
+    setup: Option<&DiscussSessionSetup>,
+    session_id: DiscussSessionId,
+    base: Option<&SessionLaunchConfig>,
+) -> Result<Option<SessionLaunchConfig>, DiscussError> {
+    let team = match setup {
+        Some(DiscussSessionSetup::Team { leader_id } | DiscussSessionSetup::TeamAtRoot { leader_id }) => {
+            Some(leader_id.as_str())
+        }
+        _ => None,
+    };
+    let mut config = base.cloned().unwrap_or_default();
+    config.mcp_servers =
+        compose_custom_mcps(persistence, domains, provider, team, session_id, &config.mcp_servers).await?;
+    Ok((base.is_some() || !config.mcp_servers.is_empty()).then_some(config))
+}
+
+pub(super) async fn compose_custom_mcps(
+    persistence: &DiscussPersistence,
+    domains: fn() -> Result<Vec<DiscussMcpDomain>, DiscussError>,
+    provider: &str,
+    team: Option<&str>,
+    session_id: DiscussSessionId,
+    base: &[McpServer],
+) -> Result<Vec<McpServer>, DiscussError> {
+    let conn = persistence.acquire_connection().await?;
+    let reserved: HashSet<_> = domains()?
+        .into_iter()
+        .map(|domain| domain.server_name)
+        .collect();
+    let mut servers = Vec::new();
+    let session = session_id.to_string();
+    for (scope, id) in [
+        (McpAssignmentScope::Provider, Some(provider)),
+        (McpAssignmentScope::Team, team),
+        (McpAssignmentScope::Session, Some(session.as_str())),
+    ] {
+        if let Some(id) = id {
+            for name in list_mcp_assignments_by_scope(&conn, scope, id).await? {
+                let row = load_custom_mcp(&conn, &name)
+                    .await?
+                    .ok_or_else(|| DiscussError::Persistence {
+                        code: "db_query".to_owned(),
+                        message: "custom MCP assignment has no descriptor".to_owned(),
+                    })?;
+                servers.push(row.descriptor);
+            }
+        }
+    }
+    servers.extend_from_slice(base);
+    let mut names = HashSet::new();
+    for server in &servers {
+        let name = match server {
+            McpServer::Stdio(server) => &server.name,
+            McpServer::Http(server) => &server.name,
+            McpServer::Sse(server) => &server.name,
+            McpServer::Acp(server) => &server.name,
+            _ => {
+                return Err(DiscussError::Validation {
+                    message: "unsupported custom MCP descriptor".to_owned(),
+                });
+            }
+        };
+        if reserved.contains(name.as_str()) {
+            return Err(DiscussError::ReservedMcpName);
+        }
+        if !names.insert(name) {
+            return Err(DiscussError::DuplicateMcpServerName);
+        }
+    }
+    Ok(servers)
+}
 
 pub(super) type DetailProjection<E> = fn(&E) -> Value;
 
@@ -404,11 +661,51 @@ impl From<McpCollationError> for DiscussError {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use agent_client_protocol::v1::schema::{EnvVariable, HttpHeader, McpServerHttp, McpServerStdio};
     use serde_json::json;
 
     use aves::bus::{OperationDispatchFuture, RequestOperationKind};
 
     use super::*;
+
+    #[test]
+    fn custom_descriptor_debug_redacts_secrets() {
+        let stdio = McpServer::Stdio(
+            McpServerStdio::new("example", "server")
+                .args(vec!["--flag".to_owned()])
+                .env(vec![EnvVariable::new("TOKEN", "secret-value")]),
+        );
+        let http = McpServer::Http(
+            McpServerHttp::new("remote", "https://example.test")
+                .headers(vec![HttpHeader::new("Authorization", "header-secret")]),
+        );
+        let stdio_public = serde_json::to_value(redact_custom_mcp(stdio.clone()).unwrap()).unwrap();
+        let http_public = serde_json::to_value(redact_custom_mcp(http.clone()).unwrap()).unwrap();
+        assert_eq!(stdio_public["command"], "server");
+        assert_eq!(stdio_public["args"][0], "--flag");
+        assert_eq!(
+            stdio_public["env"][0],
+            serde_json::json!({"name":"TOKEN", "value":"<redacted>"})
+        );
+        assert_eq!(http_public["url"], "https://example.test");
+        assert_eq!(
+            http_public["headers"][0],
+            serde_json::json!({"name":"Authorization", "value":"<redacted>"})
+        );
+        assert!(
+            serde_json::to_string(&stdio)
+                .unwrap()
+                .contains("secret-value")
+        );
+        assert!(
+            serde_json::to_string(&http)
+                .unwrap()
+                .contains("header-secret")
+        );
+        assert!(!format!("{:?}", SensitiveMcpDescriptor(stdio)).contains("secret-value"));
+        assert!(safe_mcp_name("../unsafe").is_err());
+        assert!(safe_mcp_name("safe-name").is_ok());
+    }
 
     static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
 

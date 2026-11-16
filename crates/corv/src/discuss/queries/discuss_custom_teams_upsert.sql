@@ -1,0 +1,1 @@
+INSERT INTO discuss_custom_teams VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(leader_id) DO UPDATE SET display_name=excluded.display_name, followers_json=excluded.followers_json, skills_json=excluded.skills_json, version=excluded.version, updated_at_ms=excluded.updated_at_ms;

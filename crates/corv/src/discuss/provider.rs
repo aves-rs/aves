@@ -18,14 +18,15 @@ use super::actor::{
 };
 use super::config::{config_options_from_json, config_settings_from_json, config_settings_from_value};
 use super::database::{cleanup_warning, persistence_context, retained_team_assets_by_scope};
-use super::library::AgentId;
+use super::library::{AgentId, SkillId};
 use super::messages::DiscussResponse;
 use super::plugins;
 use super::session::{initialize_request, revoke_worker_jti};
 use super::storage::{
-    DISCUSS_AGENT_CONFIG_UPSERT_SQL, DiscussAgentConfigRow, delete_discuss_agent_config, delete_discuss_session,
-    delete_discuss_team_installation, list_discuss_team_installations, list_discuss_team_installations_by_provider,
-    list_recent_discuss_sessions, load_discuss_agent_config, present_acp_session_id, upsert_discuss_agent_config,
+    CustomInstallationKind, DISCUSS_AGENT_CONFIG_UPSERT_SQL, DiscussAgentConfigRow, delete_custom_installation,
+    delete_discuss_agent_config, delete_discuss_session, delete_discuss_team_installation, list_custom_installations,
+    list_discuss_team_installations, list_discuss_team_installations_by_provider, list_recent_discuss_sessions,
+    load_discuss_agent_config, present_acp_session_id, upsert_discuss_agent_config,
 };
 use super::supervisor::{CallbackRouteRegistry, CallbackRouter, ProviderSupervisor, ProviderSupervisorResources};
 use super::types::{
@@ -44,14 +45,16 @@ impl Actor {
         provider_spec: AcpProvider,
     ) -> Result<DiscussResponse, DiscussError> {
         provider_spec.validate_workspace_copy_sources()?;
+        self.validate_new_managed_document(&provider_name, &provider_spec)?;
         let plugin = plugins::for_agent(&provider_name);
-        plugin.install_config(&self.agents_workspace)?;
+        self.install_managed_config(&provider_name, &provider_spec)?;
         let defaults = config_settings_from_value(provider_spec.default_session_config());
         let previous_provider = self.agents.insert(provider_name.clone(), provider_spec);
         let provider_was_new = previous_provider.is_none();
         if let Err(error) = self.persist_agents().await {
             match previous_provider {
                 Some(provider) => {
+                    let _ = self.install_managed_config(&provider_name, &provider);
                     self.agents.insert(provider_name, provider);
                 }
                 None => {
@@ -70,6 +73,7 @@ impl Actor {
         if let Err(error) = upsert_discuss_agent_config(&conn, &provider_name, None, &defaults).await {
             match previous_provider {
                 Some(provider) => {
+                    let _ = self.install_managed_config(&provider_name, &provider);
                     self.agents.insert(provider_name.clone(), provider);
                 }
                 None => {
@@ -110,12 +114,127 @@ impl Actor {
     }
 
     pub(super) fn handle_install_provider_config(&self, provider_name: &str) -> Result<DiscussResponse, DiscussError> {
-        if !self.agents.contains_key(provider_name) {
-            return Err(DiscussError::Validation {
-                message: format!("provider `{provider_name}` is not installed"),
-            });
+        let provider = self
+            .agents
+            .get(provider_name)
+            .ok_or_else(|| DiscussError::UnknownAgent {
+                agent_key: provider_name.to_owned(),
+            })?;
+        self.install_managed_config(provider_name, provider)?;
+        Ok(DiscussResponse::Success)
+    }
+
+    fn validate_new_managed_document(&self, name: &str, provider: &AcpProvider) -> Result<(), DiscussError> {
+        let Some(document) = provider.managed_document() else {
+            return Ok(());
+        };
+        if self
+            .agents
+            .get(name)
+            .and_then(AcpProvider::managed_document)
+            == Some(document)
+        {
+            return Ok(());
         }
-        plugins::for_agent(provider_name).install_config(&self.agents_workspace)?;
+        let config = plugins::for_agent(name)
+            .managed_config()
+            .ok_or_else(|| DiscussError::Validation {
+                message: format!("provider `{name}` does not support managed configuration"),
+            })?;
+        config.document(Some(document))?;
+        Ok(())
+    }
+
+    fn effective_managed_document(
+        &self,
+        provider_name: &str,
+        provider: &AcpProvider,
+    ) -> Result<(Option<String>, Vec<CleanupWarning>), DiscussError> {
+        let Some(config) = plugins::for_agent(provider_name).managed_config() else {
+            return Ok((None, Vec::new()));
+        };
+        match config.document(provider.managed_document()) {
+            Ok(document) => Ok((Some(document), Vec::new())),
+            Err(error @ DiscussError::ManagedConfigValidation { .. }) if provider.managed_document().is_some() => {
+                let warning = CleanupWarning {
+                    kind: "managed_config_validation".to_owned(),
+                    provider_name: provider_name.to_owned(),
+                    agent_id: None,
+                    path: None,
+                    message: error.to_string(),
+                };
+                Ok((Some(config.document(None)?), vec![warning]))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn install_managed_config(&self, name: &str, provider: &AcpProvider) -> Result<(), DiscussError> {
+        let (document, warnings) = self.effective_managed_document(name, provider)?;
+        for warning in warnings {
+            tracing::warn!(target: "application_acp", provider_name = name, message = %warning.message, "invalid managed Provider config; using default");
+        }
+        plugins::for_agent(name).install_config(&self.agents_workspace, document.as_deref())?;
+        Ok(())
+    }
+
+    pub(super) fn handle_get_provider_managed_config(&self, name: &str) -> Result<DiscussResponse, DiscussError> {
+        let provider = self
+            .agents
+            .get(name)
+            .ok_or_else(|| DiscussError::UnknownAgent {
+                agent_key: name.to_owned(),
+            })?;
+        let (document, warnings) = self.effective_managed_document(name, provider)?;
+        let (kind, path) = match plugins::for_agent(name).managed_config() {
+            Some(plugins::ManagedConfig::WorkspaceFile { path, .. }) => {
+                (Some("workspaceFile".to_owned()), Some(path.to_owned()))
+            }
+            Some(plugins::ManagedConfig::LaunchEnv { .. }) => (Some("launchEnv".to_owned()), None),
+            None => (None, None),
+        };
+        Ok(DiscussResponse::ProviderManagedConfig {
+            available: kind.is_some(),
+            kind,
+            path,
+            document,
+            warnings,
+        })
+    }
+
+    pub(super) async fn handle_set_provider_managed_config(
+        &mut self,
+        name: &str,
+        document: String,
+    ) -> Result<DiscussResponse, DiscussError> {
+        let provider = self
+            .agents
+            .get(name)
+            .ok_or_else(|| DiscussError::UnknownAgent {
+                agent_key: name.to_owned(),
+            })?;
+        let plugin = plugins::for_agent(name);
+        let config = plugin
+            .managed_config()
+            .ok_or_else(|| DiscussError::Validation {
+                message: format!("provider `{name}` does not support managed configuration"),
+            })?;
+        config.document(Some(&document))?;
+        let previous = provider.clone();
+        plugin.install_config(&self.agents_workspace, Some(&document))?;
+        if let Some(provider) = self.agents.get_mut(name) {
+            provider.set_managed_document(Some(document));
+        }
+        if let Err(error) = self.persist_agents().await {
+            self.agents.insert(name.to_owned(), previous.clone());
+            if let Err(restore_error) = self.install_managed_config(name, &previous) {
+                return Err(persistence_context(
+                    error,
+                    format!("managed configuration restore failed: {restore_error}"),
+                ));
+            }
+            return Err(error);
+        }
         Ok(DiscussResponse::Success)
     }
 
@@ -136,7 +255,13 @@ impl Actor {
         reply_to: oneshot::Sender<Result<DiscussResponse, DiscussError>>,
         force_connectivity: bool,
     ) -> Result<(), DiscussError> {
-        provider_spec.validate_workspace_copy_sources()?;
+        if let Err(error) = provider_spec
+            .validate_workspace_copy_sources()
+            .and_then(|()| self.validate_new_managed_document(&provider_name, &provider_spec))
+        {
+            let _ = reply_to.send(Err(error));
+            return Ok(());
+        }
         let previous_provider = self.agents.get(&provider_name).cloned();
         let requires_connectivity = force_connectivity
             || previous_provider.as_ref().is_none_or(|previous| {
@@ -268,6 +393,11 @@ impl Actor {
 
         match result {
             Ok(config_options) => {
+                if let Err(error) = self.install_managed_config(&pending.provider_name, &pending.candidate) {
+                    let reply = self.restore_provider_test_snapshot(pending, false).await;
+                    let _ = reply.send(Err(error));
+                    return;
+                }
                 let defaults = config_settings_from_value(pending.candidate.default_session_config());
                 let persist_result = async {
                     self.persist_agents().await?;
@@ -277,6 +407,11 @@ impl Actor {
                 }
                 .await;
                 if let Err(error) = persist_result {
+                    if let Some(previous) = &pending.previous_provider {
+                        let _ = self.install_managed_config(&pending.provider_name, previous);
+                    } else {
+                        let _ = plugins::for_agent(&pending.provider_name).remove_config(&self.agents_workspace);
+                    }
                     let reply = self.restore_provider_test_snapshot(pending, true).await;
                     let _ = reply.send(Err(error));
                 } else {
@@ -481,7 +616,10 @@ impl Actor {
             .ok_or_else(|| DiscussError::UnknownAgent {
                 agent_key: provider_name.to_string(),
             })?;
-        let McpServer::Stdio(server) = plugins::for_agent(provider_name).launch_server(provider.server()) else {
+        let plugin = plugins::for_agent(provider_name);
+        let mut launch_server = plugin.launch_server(provider.server());
+        plugins::apply_managed_launch_env(plugin, &mut launch_server, provider.managed_document())?;
+        let McpServer::Stdio(server) = launch_server else {
             return Err(DiscussError::Validation {
                 message: "Shared Providers require a stdio ACP server".to_string(),
             });
@@ -1075,47 +1213,93 @@ impl Actor {
         }
         let conn = self.persistence.acquire_connection().await?;
         self.remove_provider_sessions(&conn, provider_name).await?;
+        super::mcp::clear_mcp_scope(&conn, super::types::CustomMcpScope::Provider, provider_name).await?;
         let removed_team_installations = list_discuss_team_installations_by_provider(&conn, provider_name).await?;
         let surviving_team_installations = list_discuss_team_installations(&conn)
             .await?
             .into_iter()
             .filter(|installation| installation.provider_name != provider_name)
             .collect::<Vec<_>>();
-        let (retained_agents_by_scope, retained_skills_by_scope) =
-            retained_team_assets_by_scope(self.library, &surviving_team_installations);
+        let custom_teams = self.custom_team_compositions(&conn).await?;
+        let (mut retained_agents_by_scope, mut retained_skills_by_scope) =
+            retained_team_assets_by_scope(self.library, &custom_teams, &surviving_team_installations);
         let mut warnings = Vec::new();
+
+        for kind in [CustomInstallationKind::Agent, CustomInstallationKind::Skill] {
+            for row in list_custom_installations(&conn, kind).await? {
+                if row.provider_name == provider_name {
+                    continue;
+                }
+                if !self.agents.contains_key(&row.provider_name) {
+                    return Err(DiscussError::UnknownAgent {
+                        agent_key: row.provider_name,
+                    });
+                }
+                let plugin = plugins::for_agent(&row.provider_name);
+                match kind {
+                    CustomInstallationKind::Agent => {
+                        retained_agents_by_scope
+                            .entry(plugin.agent_scope_key())
+                            .or_default()
+                            .insert(AgentId::new(row.asset_id)?);
+                    }
+                    CustomInstallationKind::Skill => {
+                        retained_skills_by_scope
+                            .entry(plugin.skill_scope_key())
+                            .or_default()
+                            .insert(SkillId::new(row.asset_id)?);
+                    }
+                }
+            }
+        }
 
         for installation in &removed_team_installations {
             let plugin = plugins::for_agent(provider_name);
-            let cleanup_result = AgentId::try_from(installation.leader_id.clone())
-                .map_err(|error| DiscussError::WorkspaceInvalidAssetId {
-                    asset_id: installation.leader_id.clone(),
-                    violation: error.to_string(),
-                })
-                .and_then(|leader_id| {
-                    let Some(team) = self
-                        .library
-                        .teams_for()
-                        .find(|team| team.leader == leader_id)
-                    else {
-                        return Ok(());
-                    };
-                    let retain_agents = retained_agents_by_scope
-                        .get(plugin.agent_scope_key())
-                        .cloned()
-                        .unwrap_or_default();
-                    let retain_skills = retained_skills_by_scope
-                        .get(plugin.skill_scope_key())
-                        .cloned()
-                        .unwrap_or_default();
-                    plugin.destroy_team(
-                        self.library,
-                        &self.agents_workspace,
-                        team,
-                        &retain_agents,
-                        &retain_skills,
-                    )
-                });
+            let custom_team = custom_teams
+                .iter()
+                .find(|team| team.leader.as_ref() == installation.leader_id);
+            let cleanup_result = if let Some(team) = custom_team {
+                let retain_agents = retained_agents_by_scope
+                    .get(plugin.agent_scope_key())
+                    .cloned()
+                    .unwrap_or_default();
+                let retain_skills = retained_skills_by_scope
+                    .get(plugin.skill_scope_key())
+                    .cloned()
+                    .unwrap_or_default();
+                self.destroy_custom_team(plugin, team, &retain_agents, &retain_skills)
+                    .await
+            } else {
+                AgentId::try_from(installation.leader_id.clone())
+                    .map_err(|error| DiscussError::WorkspaceInvalidAssetId {
+                        asset_id: installation.leader_id.clone(),
+                        violation: error.to_string(),
+                    })
+                    .and_then(|leader_id| {
+                        let Some(team) = self
+                            .library
+                            .teams_for()
+                            .find(|team| team.leader == leader_id)
+                        else {
+                            return Ok(());
+                        };
+                        let retain_agents = retained_agents_by_scope
+                            .get(plugin.agent_scope_key())
+                            .cloned()
+                            .unwrap_or_default();
+                        let retain_skills = retained_skills_by_scope
+                            .get(plugin.skill_scope_key())
+                            .cloned()
+                            .unwrap_or_default();
+                        plugin.destroy_team(
+                            self.library,
+                            &self.agents_workspace,
+                            team,
+                            &retain_agents,
+                            &retain_skills,
+                        )
+                    })
+            };
             if let Err(error) = cleanup_result {
                 warnings.push(cleanup_warning(provider_name, &installation.leader_id, &error));
             }
@@ -1141,6 +1325,22 @@ impl Actor {
                     error,
                     format!("removing Provider `{provider_name}` left Team installation records: {remaining:?}"),
                 ));
+            }
+        }
+
+        for kind in [CustomInstallationKind::Agent, CustomInstallationKind::Skill] {
+            for row in list_custom_installations(&conn, kind)
+                .await?
+                .into_iter()
+                .filter(|row| row.provider_name == provider_name)
+            {
+                if let Err(error) = self
+                    .uninstall_custom_asset(kind, provider_name, &row.asset_id)
+                    .await
+                {
+                    warnings.push(cleanup_warning(provider_name, &row.asset_id, &error));
+                }
+                delete_custom_installation(&conn, kind, provider_name, &row.asset_id).await?;
             }
         }
 
@@ -1192,6 +1392,8 @@ impl Actor {
         }
 
         for session in &sessions {
+            super::mcp::clear_mcp_scope(conn, super::types::CustomMcpScope::Session, &session.discuss_session_id)
+                .await?;
             delete_discuss_session(conn, &session.discuss_session_id).await?;
         }
 

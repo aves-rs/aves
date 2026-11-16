@@ -6,17 +6,20 @@ use agent_client_protocol::v1::schema::SessionId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use aves::auth::Jwt;
+use aves::auth::{Jwt, MachineIssuerId};
 use aves::bus::{BusMcpEndpoint, BusRpcContext};
 use aves::flow::{LifecycleCorrelation, NodeExecutionId};
 
 use super::DiscussDomain;
 use super::types::{
-    AcpProvider, AgentNodeSessionLimits, AgentNodeTickResult, AgentThemeColor, CleanupWarning, DiscussChatTurnRecord,
-    DiscussConfigOption, DiscussConfigValues, DiscussElicitationAnswer, DiscussError, DiscussMcpStatus,
-    DiscussMemberOverrides, DiscussPermissionOption, DiscussProviderConfig, DiscussSessionId, DiscussSessionInfo,
-    DiscussSessionSetup, DiscussSubagentRecord, ElicitationRequestId, InspectorBinding, PermissionRequestId,
-    ProviderRuntimeState, SessionLaunchConfig, TeamCatalogEntry,
+    AcpProvider, AgentNodeSessionLimits, AgentNodeTickResult, AgentThemeColor, CleanupWarning, CustomAgentDetail,
+    CustomAssetMetadata, CustomMcpEntry, CustomMcpScope, CustomSkillBundleFile, CustomSkillDetail,
+    DiscussAllowanceGroupBy, DiscussAllowanceProjection, DiscussAllowanceReport, DiscussChatTurnRecord,
+    DiscussConfigOption, DiscussConfigValues, DiscussElicitationAnswer, DiscussError, DiscussImageAttachment,
+    DiscussMcpStatus, DiscussMemberOverrides, DiscussPermissionOption, DiscussProviderConfig, DiscussSessionId,
+    DiscussSessionInfo, DiscussSessionSetup, DiscussSubagentRecord, DiscussUsageGroupBy, DiscussUsageReport,
+    ElicitationRequestId, InspectorBinding, InstalledAssetKind, PermissionRequestId, ProviderRuntimeState,
+    SensitiveMcpDescriptor, SessionLaunchConfig, TeamCatalogEntry,
 };
 
 /// Discuss domain request wrapper.
@@ -33,6 +36,9 @@ pub struct DiscussRequest {
 #[aves::bus_requests(marker = DiscussDomain, context = BusRpcContext, root_error = DiscussError, domain_error = DiscussError)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiscussRequestPayload {
+    /// Resolve a verified bus identity to its configured session identity.
+    #[privileged(reason = "maps verified bus identities to sessions for application attribution")]
+    ResolveSessionIdentity { issuer: MachineIssuerId, subject: String },
     /// Starts an agent node execution.
     #[privileged(reason = "AgentNode lifecycle is admitted only from Aves Flow")]
     StartAgent {
@@ -99,6 +105,9 @@ pub enum DiscussRequestPayload {
         discuss_session_id: DiscussSessionId,
         /// Prompt text to send to the provider.
         text: String,
+        /// Images sent to the provider without durable storage.
+        #[serde(default)]
+        images: Vec<DiscussImageAttachment>,
     },
 
     /// Answer a pending permission request.
@@ -179,6 +188,39 @@ pub enum DiscussRequestPayload {
     #[operation(name = "listProviders", kind = "query", response = ProvidersListOutput, response_variant = "ProvidersList")]
     ListProviders,
 
+    /// Aggregate retained token evidence over an inclusive range.
+    #[operation(name = "getTokenUsageReport", kind = "query", response = TokenUsageReportOutput, response_variant = "TokenUsageReport")]
+    GetTokenUsageReport {
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        provider_name: Option<String>,
+        model_id: Option<String>,
+        group_by: DiscussUsageGroupBy,
+    },
+
+    /// Aggregate calculated and harness spend without mixing their scopes.
+    #[operation(name = "getSpendReport", kind = "query", response = SpendReportOutput, response_variant = "SpendReport")]
+    GetSpendReport {
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        provider_name: Option<String>,
+        model_id: Option<String>,
+        group_by: DiscussUsageGroupBy,
+    },
+
+    /// Read sampled historical allowance observations.
+    #[operation(name = "getAllowanceReport", kind = "query", response = AllowanceReportOutput, response_variant = "AllowanceReport")]
+    GetAllowanceReport {
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        provider_name: Option<String>,
+        group_by: DiscussAllowanceGroupBy,
+    },
+
+    /// Read the latest in-memory allowance snapshot.
+    #[operation(name = "getCurrentAllowance", kind = "query", response = CurrentAllowanceOutput, response_variant = "CurrentAllowance")]
+    GetCurrentAllowance,
+
     /// Get the database-backed provider menu and defaults for an installed provider.
 
     #[operation(name = "getProviderConfig", kind = "query", response = ProviderConfigOutput, response_variant = "ProviderConfig")]
@@ -186,6 +228,10 @@ pub enum DiscussRequestPayload {
         /// Exact installed provider name.
         provider_name: String,
     },
+
+    /// Read the effective provider-managed configuration document.
+    #[operation(name = "getProviderManagedConfig", kind = "query", response = ProviderManagedConfigOutput, response_variant = "ProviderManagedConfig")]
+    GetProviderManagedConfig { provider_name: String },
 
     /// Launch a transient Provider connectivity check and refresh its supported session settings.
 
@@ -281,6 +327,10 @@ pub enum DiscussRequestPayload {
         provider_name: String,
     },
 
+    /// Replace the complete provider-managed document.
+    #[privileged(reason = "provider config lifecycle is actor-owned")]
+    SetProviderManagedConfig { provider_name: String, document: String },
+
     /// Remove one Provider's shared Agent-workspace configuration.
 
     #[privileged(reason = "provider config lifecycle is actor-owned")]
@@ -288,6 +338,147 @@ pub enum DiscussRequestPayload {
         /// Exact Provider identifier.
         provider_name: String,
     },
+
+    /// List custom MCP descriptors with redacted environment and header values.
+    #[operation(name = "listCustomMcps", kind = "query", response = ListCustomMcpsOutput, response_variant = "ListCustomMcps")]
+    ListCustomMcps,
+    /// Create a custom MCP descriptor.
+    #[privileged(reason = "custom MCP descriptors may launch arbitrary processes")]
+    CreateCustomMcp {
+        name: String,
+        descriptor: SensitiveMcpDescriptor,
+    },
+    /// Replace a custom MCP descriptor.
+    #[privileged(reason = "custom MCP descriptors may launch arbitrary processes")]
+    UpdateCustomMcp {
+        name: String,
+        descriptor: SensitiveMcpDescriptor,
+    },
+    /// Delete a custom MCP and its assignments.
+    #[privileged(reason = "custom MCP configuration is actor-owned")]
+    DeleteCustomMcp { name: String },
+    /// Assign a custom MCP to a scope.
+    #[privileged(reason = "custom MCP descriptors may launch arbitrary processes")]
+    AssignMcp {
+        scope_kind: CustomMcpScope,
+        scope_id: String,
+        mcp_name: String,
+    },
+    /// Remove a scoped custom MCP assignment.
+    #[privileged(reason = "custom MCP configuration is actor-owned")]
+    UnassignMcp {
+        scope_kind: CustomMcpScope,
+        scope_id: String,
+        mcp_name: String,
+    },
+
+    /// List cached custom agents.
+    #[operation(name = "listCustomAgents", kind = "query", response = ListCustomAgentsOutput, response_variant = "ListCustomAgents")]
+    ListCustomAgents,
+    /// List cached custom skills.
+    #[operation(name = "listCustomSkills", kind = "query", response = ListCustomSkillsOutput, response_variant = "ListCustomSkills")]
+    ListCustomSkills,
+    /// Read one cached custom agent.
+    #[operation(name = "getCustomAgent", kind = "query", response = GetCustomAgentOutput, response_variant = "GetCustomAgent")]
+    GetCustomAgent { agent_id: String },
+    /// Read one cached custom skill.
+    #[operation(name = "getCustomSkill", kind = "query", response = GetCustomSkillOutput, response_variant = "GetCustomSkill")]
+    GetCustomSkill { skill_id: String },
+    /// Fetch and import a custom agent from an untrusted URL.
+    #[privileged(reason = "URL imports fetch external content")]
+    ImportCustomAgentFromUrl { agent_id: Option<String>, url: String },
+    /// Fetch and import a custom skill from an untrusted URL.
+    #[privileged(reason = "URL imports fetch external content")]
+    ImportCustomSkillFromUrl { skill_id: Option<String>, url: String },
+    /// Set instructions for a physical installed asset path; empty clears them.
+    #[operation(name = "setInstalledAssetInstructions", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    SetInstalledAssetInstructions {
+        provider_name: String,
+        asset_kind: InstalledAssetKind,
+        asset_id: String,
+        instructions: String,
+    },
+    /// Read instructions for a physical installed asset path.
+    #[operation(name = "getInstalledAssetInstructions", kind = "query", response = InstalledAssetInstructionsOutput, response_variant = "InstalledAssetInstructions")]
+    GetInstalledAssetInstructions {
+        provider_name: String,
+        asset_kind: InstalledAssetKind,
+        asset_id: String,
+    },
+    /// Create a local custom agent.
+    #[operation(name = "createCustomAgent", kind = "mutation", response = GetCustomAgentOutput, response_variant = "GetCustomAgent")]
+    CreateCustomAgent {
+        agent_id: Option<String>,
+        name: String,
+        job_title: String,
+        description: String,
+        body: String,
+    },
+    /// Create a local custom skill.
+    #[operation(name = "createCustomSkill", kind = "mutation", response = GetCustomSkillOutput, response_variant = "GetCustomSkill")]
+    CreateCustomSkill {
+        skill_id: Option<String>,
+        name: String,
+        description: String,
+        files: Vec<CustomSkillBundleFile>,
+    },
+
+    /// Update a custom agent; a later successful import pull overwrites local edits.
+    #[operation(name = "updateCustomAgent", kind = "mutation", response = GetCustomAgentOutput, response_variant = "GetCustomAgent")]
+    UpdateCustomAgent {
+        agent_id: String,
+        name: String,
+        job_title: String,
+        description: String,
+        body: String,
+    },
+    /// Update a custom skill; a later successful import pull overwrites local edits.
+    #[operation(name = "updateCustomSkill", kind = "mutation", response = GetCustomSkillOutput, response_variant = "GetCustomSkill")]
+    UpdateCustomSkill {
+        skill_id: String,
+        name: String,
+        description: String,
+        files: Vec<CustomSkillBundleFile>,
+    },
+    /// Delete an unreferenced custom agent.
+    #[operation(name = "deleteCustomAgent", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    DeleteCustomAgent { agent_id: String },
+    /// Delete an unreferenced custom skill.
+    #[operation(name = "deleteCustomSkill", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    DeleteCustomSkill { skill_id: String },
+
+    /// Install a custom agent for an installed Provider.
+    #[operation(name = "installCustomAgent", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    InstallCustomAgent { provider_name: String, agent_id: String },
+    /// Remove a Provider's custom agent installation.
+    #[operation(name = "uninstallCustomAgent", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    UninstallCustomAgent { provider_name: String, agent_id: String },
+    /// Install a custom skill for an installed Provider.
+    #[operation(name = "installCustomSkill", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    InstallCustomSkill { provider_name: String, skill_id: String },
+    /// Remove a Provider's custom skill installation.
+    #[operation(name = "uninstallCustomSkill", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    UninstallCustomSkill { provider_name: String, skill_id: String },
+
+    /// Create a user-defined Team.
+    #[operation(name = "createCustomTeam", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    CreateCustomTeam {
+        leader_id: String,
+        display_name: String,
+        followers: Vec<String>,
+        skills: Vec<String>,
+    },
+    /// Update a user-defined Team.
+    #[operation(name = "updateCustomTeam", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    UpdateCustomTeam {
+        leader_id: String,
+        display_name: String,
+        followers: Vec<String>,
+        skills: Vec<String>,
+    },
+    /// Delete an uninstalled user-defined Team.
+    #[operation(name = "deleteCustomTeam", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    DeleteCustomTeam { leader_id: String },
 
     /// List all Phanes-defined teams and their installation state.
 
@@ -391,10 +582,52 @@ pub enum DiscussRequestPayload {
     },
 }
 
+impl DiscussRequestPayload {
+    /// Identify operations gated by the Discuss server lifecycle.
+    pub(super) fn requires_running_server(&self) -> bool {
+        matches!(
+            self,
+            DiscussRequestPayload::StartAgent { .. }
+                | DiscussRequestPayload::TickAgent { .. }
+                | DiscussRequestPayload::AddProvider { .. }
+                | DiscussRequestPayload::RefreshProviderConfig { .. }
+                | DiscussRequestPayload::NewSession { .. }
+                | DiscussRequestPayload::InstallTeamAndStartSession { .. }
+                | DiscussRequestPayload::LoadSession { .. }
+                | DiscussRequestPayload::GetConfigOptions { .. }
+                | DiscussRequestPayload::SetConfigOption { .. }
+                | DiscussRequestPayload::SendUserTurn { .. }
+                | DiscussRequestPayload::AnswerPermission { .. }
+                | DiscussRequestPayload::AnswerElicitation { .. }
+                | DiscussRequestPayload::CancelElicitation { .. }
+                | DiscussRequestPayload::CancelTurn { .. }
+                | DiscussRequestPayload::CancelSession { .. }
+                | DiscussRequestPayload::ReserveInspector { .. }
+                | DiscussRequestPayload::StartInspector { .. }
+                | DiscussRequestPayload::DisposeInspector { .. }
+        )
+    }
+}
+
 /// Response types for Discuss operations.
 #[aves::bus_responses]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiscussResponse {
+    /// Session and configured agent associated with a verified identity.
+    SessionIdentityResolved {
+        discuss_session_id: DiscussSessionId,
+        agent_provider: String,
+        agent_name: String,
+        node_execution_id: Option<NodeExecutionId>,
+    },
+    /// Token usage report.
+    TokenUsageReport { report: DiscussUsageReport },
+    /// Spend report.
+    SpendReport { report: DiscussUsageReport },
+    /// Historical allowance report.
+    AllowanceReport { report: DiscussAllowanceReport },
+    /// Current normalized provider snapshot.
+    CurrentAllowance { entries: Vec<DiscussAllowanceProjection> },
     /// A Flow AgentNode session was accepted by its ACP worker.
     AgentNodeStarted {
         correlation: LifecycleCorrelation,
@@ -434,6 +667,29 @@ pub enum DiscussResponse {
         /// Effective sources, including the mandatory `.agents` directory.
         workspace_copy_sources: Vec<String>,
     },
+
+    /// Effective managed document and any fallback warning.
+    ProviderManagedConfig {
+        available: bool,
+        kind: Option<String>,
+        path: Option<String>,
+        document: Option<String>,
+        warnings: Vec<CleanupWarning>,
+    },
+
+    /// Stored custom MCP descriptors.
+    ListCustomMcps { entries: Vec<CustomMcpEntry> },
+    /// Cached custom agent metadata.
+    ListCustomAgents { entries: Vec<CustomAssetMetadata> },
+    /// Cached custom skill metadata.
+    ListCustomSkills { entries: Vec<CustomAssetMetadata> },
+    /// Complete cached agent.
+    GetCustomAgent { agent: CustomAgentDetail },
+    /// Complete cached skill.
+    GetCustomSkill { skill: CustomSkillDetail },
+
+    /// Appended instructions; empty means no instructions.
+    InstalledAssetInstructions { instructions: String },
 
     /// Phanes team catalog and persisted installation state.
     ListTeamCatalog { entries: Vec<TeamCatalogEntry> },
@@ -477,6 +733,13 @@ pub enum DiscussResponse {
     /// Provider-exposed config options for a live or loaded session.
     ConfigOptions { options: Vec<DiscussConfigOption> },
 
+    /// Internal session activity broadcast.
+    #[serde(skip)]
+    SessionActivity {
+        discuss_session_id: DiscussSessionId,
+        active: bool,
+    },
+
     /// An informational session warning to be broadcast to subscribers.
     /// The handle converts this to `DiscussBroadcast::SessionWarning`.
     #[serde(skip)]
@@ -519,6 +782,13 @@ pub enum DiscussBroadcast {
     SessionReady {
         /// Application-owned canonical session identity.
         discuss_session_id: DiscussSessionId,
+    },
+    /// A session's turn activity changed.
+    SessionActivity {
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
+        /// Whether a turn is active.
+        active: bool,
     },
     /// An informational session warning (e.g. missing MCP-over-ACP capability).
     ///

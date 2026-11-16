@@ -6,11 +6,19 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::super::library::{AgentDefinition, AgentId, AssetLibrary, SkillDefinition, SkillId, TeamDefinition};
-use super::super::types::{DiscussConfigOption, DiscussConfigOptionValue, DiscussError};
+use super::super::library::{
+    AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
+    TeamDefinition,
+};
+use super::super::types::{
+    DiscussConfigOption, DiscussConfigOptionValue, DiscussError, DiscussHarnessCostKind, DiscussUsageEvidenceSource,
+};
+use super::super::usage::{DiscussUsageEvidence, ModelUsage, UsageCaptureEvent, capture_standard_usage};
+use super::files::{RenderedFile, write_rendered_files};
 use super::{
-    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PrimaryAgentSelection, render_skill_file, resolve_agent,
-    resolve_skill,
+    BILLING_CACHED_READ, BILLING_CACHED_WRITE, BILLING_INPUT, BILLING_OUTPUT, BILLING_THOUGHT, BILLING_TOTAL,
+    BillingCategorySemantics, ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, ManagedConfig,
+    PrimaryAgentSelection, render_skill_file, resolve_agent, resolve_skill,
 };
 
 pub const GROK_PLUGIN_NAME: &str = "grok-build";
@@ -37,11 +45,6 @@ struct AgentFrontmatter<'a> {
     settings: BTreeMap<String, String>,
 }
 
-struct RenderedFile {
-    path: PathBuf,
-    contents: String,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GrokSessionConfig {
@@ -64,6 +67,65 @@ struct GrokConfigField {
 }
 
 impl DiscussAgentPlugin for GrokPlugin {
+    fn managed_config(&self) -> Option<ManagedConfig> {
+        Some(ManagedConfig::WorkspaceFile {
+            plugin: GROK_PLUGIN_NAME,
+            path: ".grok/config.toml",
+            default: || Ok(String::new()),
+            validate: validate_managed_config,
+        })
+    }
+    fn billing_semantics(&self) -> BillingCategorySemantics {
+        BillingCategorySemantics {
+            guaranteed_categories: BILLING_INPUT
+                | BILLING_OUTPUT
+                | BILLING_THOUGHT
+                | BILLING_CACHED_READ
+                | BILLING_CACHED_WRITE
+                | BILLING_TOTAL,
+            input_includes_cache: Some(true),
+        }
+    }
+
+    fn models_dev_provider_id(&self) -> Option<&'static str> {
+        Some("xai")
+    }
+
+    fn capture_usage_evidence(&self, event: &UsageCaptureEvent<'_>) -> Option<DiscussUsageEvidence> {
+        let (usage, model_id, source) = match event {
+            UsageCaptureEvent::PromptResponse(response) => {
+                let Some(meta) = response.meta.as_ref() else {
+                    return capture_standard_usage(event);
+                };
+                let Some(usage) = meta.get("usage") else {
+                    return capture_standard_usage(event);
+                };
+                (
+                    usage,
+                    meta.get("modelId").and_then(serde_json::Value::as_str),
+                    DiscussUsageEvidenceSource::ResponseMeta,
+                )
+            }
+            UsageCaptureEvent::Notification { method, params } if *method == "x.ai/session/prompt_complete" => {
+                let Some(usage) = params.get("usage") else {
+                    tracing::debug!("Grok prompt completion has no usage");
+                    return None;
+                };
+                (
+                    usage,
+                    params.get("modelId").and_then(serde_json::Value::as_str),
+                    DiscussUsageEvidenceSource::Complete,
+                )
+            }
+            _ => return capture_standard_usage(event),
+        };
+        let evidence = capture_grok_usage(usage, model_id, source);
+        if evidence.is_none() {
+            tracing::debug!("Unrecognized Grok usage payload");
+        }
+        evidence
+    }
+
     fn connection_strategy(&self) -> ConnectionStrategy {
         ConnectionStrategy::Isolated
     }
@@ -83,17 +145,28 @@ impl DiscussAgentPlugin for GrokPlugin {
 
     /// Grok's `_meta.agentProfile` ignores project-only agents, so the leader's instructions go
     /// through `_meta.rules`, which Grok appends to the session system prompt.
-    fn primary_agent_selection(&self, agent: &AgentDefinition) -> PrimaryAgentSelection {
+    fn primary_agent_selection(&self, agent: &AgentSelectionView<'_>) -> PrimaryAgentSelection {
         PrimaryAgentSelection::SessionMeta(serde_json::Map::from_iter([(
             RULES_META_KEY.to_string(),
             serde_json::Value::String(agent.body.to_string()),
         )]))
     }
 
-    fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
+    fn workspace_label(&self) -> &'static str {
+        GROK_PLUGIN_NAME
+    }
+
+    fn render_agent(
+        &self,
+        library: AssetLibrary,
+        agent_id: &AgentId,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<Vec<RenderedFile>, DiscussError> {
         let agent = resolve_agent(library, agent_id)?;
-        let file = render_agent(agent, None)?;
-        write_file(root, &file.path, &file.contents)
+        Ok(vec![render_agent(
+            &AgentSelectionView::from_builtin(agent),
+            member_settings,
+        )?])
     }
 
     fn destroy_agent(&self, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
@@ -105,36 +178,6 @@ impl DiscussAgentPlugin for GrokPlugin {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(capture_write_error(&path, error)),
         }
-    }
-
-    fn install_team_with_member_overrides(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        team: &TeamDefinition,
-        member_settings: &BTreeMap<AgentId, ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        self.install_team_member(library, root, &team.leader, member_settings.get(&team.leader))?;
-        for follower in &team.followers {
-            self.install_team_member(library, root, follower, member_settings.get(follower))?;
-        }
-        for skill_id in &team.skills {
-            let skill = resolve_skill(library, skill_id)?;
-            self.install_skill(root, skill)?;
-        }
-        Ok(())
-    }
-
-    fn install_team_member(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        agent_id: &AgentId,
-        member_settings: Option<&ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        let agent = resolve_agent(library, agent_id)?;
-        let file = render_agent(agent, member_settings)?;
-        write_file(root, &file.path, &file.contents)
     }
 
     fn destroy_team(
@@ -162,15 +205,76 @@ impl DiscussAgentPlugin for GrokPlugin {
         Ok(())
     }
 
-    fn install_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
+    fn installed_agent_path(&self, id: &AgentId) -> PathBuf {
+        Path::new(AGENTS_DIRECTORY).join(format!("{}.md", id.normalized_destination()))
+    }
+
+    fn installed_skill_path(&self, id: &SkillId) -> PathBuf {
+        Path::new(SKILLS_DIRECTORY)
+            .join(id.normalized_destination())
+            .join("SKILL.md")
+    }
+
+    fn install_custom_agent(
+        &self,
+        root: &Path,
+        agent: &CustomAgentDefinition,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<(), DiscussError> {
+        let file = render_agent(&AgentSelectionView::from_custom(agent), member_settings)?;
+        write_rendered_files(GROK_PLUGIN_NAME, root, &[file])
+    }
+
+    fn install_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        let mut files = Vec::new();
+        for file in &skill.bundle {
+            let path = Path::new(SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            let body = if file.relative_path == "SKILL.md" {
+                super::markdown_metadata(&file.contents)?.2
+            } else {
+                &file.contents
+            };
+            let contents = super::render_skill_contents(
+                GROK_PLUGIN_NAME,
+                &path,
+                &skill.id,
+                &skill.description,
+                &file.relative_path,
+                body,
+            )?;
+            files.push(RenderedFile {
+                relative_path: path,
+                contents,
+            });
+        }
+        write_rendered_files(GROK_PLUGIN_NAME, root, &files)
+    }
+
+    fn destroy_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        for file in &skill.bundle {
+            let path = Path::new(SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            remove_file(root, &path)?;
+        }
+        Ok(())
+    }
+
+    fn render_skill(&self, skill: &SkillDefinition) -> Result<Vec<RenderedFile>, DiscussError> {
+        let mut files = Vec::new();
         for file in &skill.bundle {
             let relative_path = Path::new(SKILLS_DIRECTORY)
                 .join(skill.id.normalized_destination())
                 .join(file.relative_path);
             let contents = render_skill_file(GROK_PLUGIN_NAME, &relative_path, skill, file)?;
-            write_file(root, &relative_path, &contents)?;
+            files.push(RenderedFile {
+                relative_path,
+                contents,
+            });
         }
-        Ok(())
+        Ok(files)
     }
 
     fn destroy_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
@@ -191,8 +295,129 @@ impl DiscussAgentPlugin for GrokPlugin {
     }
 }
 
+fn validate_managed_config(document: &str) -> Result<(), DiscussError> {
+    let table: toml::Table =
+        document
+            .parse()
+            .map_err(|error: toml::de::Error| DiscussError::ManagedConfigValidation {
+                plugin: GROK_PLUGIN_NAME.to_owned(),
+                reason: error.to_string(),
+            })?;
+    if table.iter().any(|(key, value)| {
+        key != "mcp_servers"
+            || !matches!(value, toml::Value::Table(servers) if servers.values().all(|entry| matches!(entry, toml::Value::Table(_))))
+    }) {
+        return Err(DiscussError::ManagedConfigValidation {
+            plugin: GROK_PLUGIN_NAME.to_owned(),
+            reason: "only the mcp_servers table is allowed".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn capture_grok_usage(
+    usage: &serde_json::Value,
+    model_id: Option<&str>,
+    source: DiscussUsageEvidenceSource,
+) -> Option<DiscussUsageEvidence> {
+    let object = usage.as_object()?;
+    let flag = |key| match object.get(key) {
+        Some(value) => value.as_bool(),
+        None => Some(false),
+    };
+    let usage_is_incomplete = flag("usageIsIncomplete")?;
+    let cost_is_partial = flag("costIsPartial")?;
+    let cost = match object.get("costUsdTicks") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let ticks = value.as_i64()?;
+            let magnitude = ticks.unsigned_abs();
+            let sign = if ticks < 0 { "-" } else { "" };
+            Some((
+                format!(
+                    "{sign}{}.{:010}",
+                    magnitude / 10_000_000_000,
+                    magnitude % 10_000_000_000
+                ),
+                "USD".to_string(),
+                DiscussHarnessCostKind::PerTurn,
+            ))
+        }
+    };
+    let total_model = if [
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "cachedReadTokens",
+        "cacheCreationTokens",
+        "totalTokens",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        Some(grok_model_usage(usage, model_id)?)
+    } else {
+        None
+    };
+    let models = match object.get("modelUsage") {
+        Some(value) => {
+            let entries = value.as_object()?;
+            if entries.is_empty() {
+                total_model.into_iter().collect()
+            } else {
+                entries
+                    .iter()
+                    .map(|(id, value)| grok_model_usage(value, Some(id)))
+                    .collect::<Option<Vec<_>>>()?
+            }
+        }
+        None => total_model.into_iter().collect(),
+    };
+    if models.is_empty() && cost.is_none() && !usage_is_incomplete && !cost_is_partial {
+        return None;
+    }
+    Some(DiscussUsageEvidence {
+        source,
+        models,
+        context_used_tokens: None,
+        context_window_tokens: None,
+        cost,
+        usage_is_incomplete,
+        cost_is_partial,
+        turn_correlatable: true,
+    })
+}
+
+fn grok_model_usage(value: &serde_json::Value, model_id: Option<&str>) -> Option<ModelUsage> {
+    let object = value.as_object()?;
+    let keys = [
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "cachedReadTokens",
+        "cacheCreationTokens",
+        "totalTokens",
+    ];
+    if !keys.iter().any(|key| object.contains_key(*key)) {
+        return None;
+    }
+    let count = |key| match object.get(key) {
+        Some(value) => value.as_u64().map(Some),
+        None => Some(None),
+    };
+    Some(ModelUsage {
+        model_id: model_id.map(str::to_owned),
+        input_tokens: count("inputTokens")?,
+        output_tokens: count("outputTokens")?,
+        thought_tokens: count("reasoningTokens")?,
+        cached_read_tokens: count("cachedReadTokens")?,
+        cached_write_tokens: count("cacheCreationTokens")?,
+        total_tokens: count("totalTokens")?,
+    })
+}
+
 fn render_agent(
-    agent: &AgentDefinition,
+    agent: &AgentSelectionView<'_>,
     member_settings: Option<&ConfigSettings>,
 ) -> Result<RenderedFile, DiscussError> {
     let path = PathBuf::from(AGENTS_DIRECTORY).join(format!("{}.md", agent.id.normalized_destination()));
@@ -215,17 +440,9 @@ fn render_markdown<T: Serialize>(path: &Path, frontmatter: &T, body: &str) -> Re
         message: source.to_string(),
     })?;
     Ok(RenderedFile {
-        path: path.to_path_buf(),
+        relative_path: path.to_path_buf(),
         contents: format!("---\n{yaml}---\n\n{body}"),
     })
-}
-
-fn write_file(root: &Path, relative_path: &Path, contents: &str) -> Result<(), DiscussError> {
-    let path = root.join(relative_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| capture_write_error(&path, error))?;
-    }
-    fs::write(&path, contents).map_err(|error| capture_write_error(&path, error))
 }
 
 fn remove_file(root: &Path, relative_path: &Path) -> Result<(), DiscussError> {
@@ -368,7 +585,7 @@ mod tests {
         fs::write(&skill_path, "peer skill").expect("skill file");
         fs::write(&command_path, "peer command").expect("command file");
         PLUGIN
-            .install_agent(library, directory.path(), &agent.id)
+            .install_team_member(library, directory.path(), &agent.id, None)
             .expect("install succeeds");
         let first = fs::read(
             directory
@@ -390,7 +607,7 @@ mod tests {
         )
         .expect("stale target");
         PLUGIN
-            .install_agent(library, directory.path(), &agent.id)
+            .install_team_member(library, directory.path(), &agent.id, None)
             .expect("repeat install succeeds");
         let second = fs::read(
             directory
@@ -544,5 +761,48 @@ mod tests {
         )
         .expect("untouched follower file exists");
         assert!(!untouched_file.contains("model:"));
+    }
+
+    #[test]
+    fn default_team_install_preserves_grok_rendering_layout() {
+        let library = test_library::library();
+        let directory = tempdir().expect("temporary workspace");
+        let team = library
+            .teams_for()
+            .find(|team| !team.skills.is_empty())
+            .expect("team with skill");
+        let settings = BTreeMap::from([(
+            team.leader.clone(),
+            ConfigSettings::from([(String::from("model"), String::from("leader-model"))]),
+        )]);
+        PLUGIN
+            .install_team_with_member_overrides(library, directory.path(), team, &settings)
+            .expect("team installs");
+
+        for id in std::iter::once(&team.leader).chain(&team.followers) {
+            let agent = resolve_agent(library, id).expect("registered agent");
+            let path = directory
+                .path()
+                .join(AGENTS_DIRECTORY)
+                .join(format!("{}.md", id.normalized_destination()));
+            let contents = fs::read_to_string(path).expect("agent file");
+            assert!(contents.starts_with("---\n"));
+            assert!(contents.contains(&format!("name: {}\n", id.as_ref())));
+            assert!(contents.ends_with(agent.body));
+            assert_eq!(contents.contains("model: leader-model\n"), id == &team.leader);
+        }
+        for id in &team.skills {
+            let skill = resolve_skill(library, id).expect("registered skill");
+            for file in &skill.bundle {
+                let path = Path::new(SKILLS_DIRECTORY)
+                    .join(id.normalized_destination())
+                    .join(file.relative_path);
+                let contents = fs::read_to_string(directory.path().join(&path)).expect("skill file");
+                assert_eq!(
+                    contents,
+                    render_skill_file(GROK_PLUGIN_NAME, &path, skill, file).expect("render skill")
+                );
+            }
+        }
     }
 }

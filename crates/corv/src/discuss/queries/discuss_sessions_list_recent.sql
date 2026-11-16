@@ -18,6 +18,7 @@ SELECT
     session_cwd_json,
     session_mcp_enabled,
     session_launch_config_json,
-    session_setup_kind
+    session_setup_kind,
+    launch_limitations_json
 FROM discuss_sessions
 ORDER BY last_interaction_at DESC NULLS LAST

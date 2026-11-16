@@ -24,14 +24,65 @@ pub(crate) trait DecidePlugin: Send + Sync {
     ) -> Result<DecideOutcome, DecideError>;
 }
 
+/// API-key requirements for a Decide provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecideAuth {
+    /// An API key is required.
+    Required,
+    /// An API key may be omitted.
+    Optional,
+}
+
+/// Public metadata for a supported Decide provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecideProviderDescriptor {
+    /// Stable provider identifier.
+    pub id: &'static str,
+    /// Human-readable provider name.
+    pub display_name: &'static str,
+    /// API-key requirement.
+    pub credential: DecideAuth,
+}
+
+struct ProviderRow {
+    id: &'static str,
+    display_name: &'static str,
+    credential: DecideAuth,
+    plugin: &'static dyn DecidePlugin,
+}
+
+static PROVIDERS: [ProviderRow; 2] = [
+    ProviderRow {
+        id: jev::PROVIDER_ID,
+        display_name: "Jev",
+        credential: DecideAuth::Required,
+        plugin: &jev::PLUGIN,
+    },
+    ProviderRow {
+        id: ollama::PROVIDER_ID,
+        display_name: "Ollama",
+        credential: DecideAuth::Optional,
+        plugin: &ollama::PLUGIN,
+    },
+];
+
+/// Enumerate the supported Decide providers and their credential requirements.
+pub fn decide_providers() -> impl Iterator<Item = DecideProviderDescriptor> {
+    PROVIDERS.iter().map(|row| DecideProviderDescriptor {
+        id: row.id,
+        display_name: row.display_name,
+        credential: row.credential,
+    })
+}
+
 pub(crate) fn for_provider(provider_id: &str) -> Result<&'static dyn DecidePlugin, DecideError> {
-    match provider_id {
-        jev::PROVIDER_ID => Ok(&jev::PLUGIN),
-        ollama::PROVIDER_ID => Ok(&ollama::PLUGIN),
-        _ => Err(DecideError::UnknownProvider {
+    PROVIDERS
+        .iter()
+        .find(|row| row.id == provider_id)
+        .map(|row| row.plugin)
+        .ok_or_else(|| DecideError::UnknownProvider {
             provider: provider_id.to_owned(),
-        }),
-    }
+        })
 }
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {

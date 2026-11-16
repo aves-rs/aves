@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use agent_client_protocol::Agent;
 use agent_client_protocol::v1::{ConnectionTo, schema::SessionId};
+use quota_core::model::ProviderUsage;
 use semver::Version;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use aves::auth::{AuthSudoService, Jwt};
 use aves::bus::{BusMcpEndpoint, BusRpcContext, BusSudoService};
@@ -18,27 +20,32 @@ use aves::runtime::ServiceReader;
 use aves::utils::buffers::DEFAULT_BUFFER_SIZE;
 use aves::utils::database::{MigrationRunner, maintain_database, open_database_at_path};
 
+use super::allowance::AllowanceService;
+use super::assets::{ImportCompletion, PendingImport};
 use super::boot::{DiscussBootOptions, DiscussMcpDomain, load_discuss_settings};
 use super::config::config_settings_from_value;
+use super::database::persist_accounting_prune;
 use super::library::AssetLibrary;
 use super::messages::{DiscussRequest, DiscussRequestPayload, DiscussResponse};
 use super::migration::MIGRATIONS as DISCUSS_MIGRATIONS;
 use super::plugins;
+use super::pricing::PriceIndex;
 use super::provider::effective_workspace_copy_sources;
 use super::session::{
     PendingElicitationCancel, PendingElicitationRegistration, PendingPermissionCancel, PendingPermissionRegistration,
     SessionCapabilitiesCache, WorkerReady, revoke_worker_jti,
 };
 use super::storage::{
-    DiscussAgentConfigRow, DiscussPersistence, list_recent_discuss_sessions, load_discuss_agent_config,
-    load_discuss_team_installation, present_acp_session_id, upsert_discuss_agent_config,
+    CustomInstallationKind, DiscussAgentConfigRow, DiscussPersistence, list_recent_discuss_sessions,
+    load_discuss_agent_config, load_discuss_team_installation, present_acp_session_id, upsert_discuss_agent_config,
 };
 use super::supervisor::{CallbackRouteRegistry, ProviderSupervisor};
 use super::types::{
     AcpProvider, ActorInboundPorts, AgentNodeTerminalResult, DiscussConfigOption, DiscussElicitationAnswer,
-    DiscussError, DiscussPermissionOption, DiscussSessionId, DiscussSessionSetup, DiscussStreamEvent,
-    ElicitationRequestId, InspectorBinding, PendingElicitation, PendingPermission, PendingPermissionRegistry,
-    SessionLaunchConfig, WorkerEntry, WorkerRegistry, WorkspaceCopySourceRequest, WorkspaceCopySources,
+    DiscussError, DiscussImageAttachment, DiscussMemberOverrides, DiscussPermissionOption, DiscussSessionId,
+    DiscussSessionSetup, DiscussStreamEvent, ElicitationRequestId, InspectorBinding, PendingElicitation,
+    PendingPermission, PendingPermissionRegistry, SessionLaunchConfig, WorkerEntry, WorkerRegistry,
+    WorkspaceCopySourceRequest, WorkspaceCopySources,
 };
 
 const DISCUSS_DOMAIN: &str = "discuss";
@@ -167,6 +174,9 @@ pub(super) struct Actor {
     /// Sender for capability updates, cloned into each worker.
     pub(super) capabilities_update_tx: mpsc::Sender<(DiscussSessionId, SessionCapabilitiesCache)>,
 
+    pub(super) activity_update_rx: mpsc::Receiver<(DiscussSessionId, bool)>,
+    pub(super) activity_update_tx: mpsc::Sender<(DiscussSessionId, bool)>,
+
     /// Receiver for workers that have completed setup and are ready.
     pub(super) worker_ready_rx: mpsc::Receiver<WorkerReady>,
 
@@ -178,6 +188,10 @@ pub(super) struct Actor {
 
     /// Sender cloned into transient workers.
     pub(super) transient_worker_tx: mpsc::Sender<TransientWorkerEvent>,
+    pub(super) import_completion_tx: mpsc::Sender<ImportCompletion>,
+    pub(super) import_completion_rx: mpsc::Receiver<ImportCompletion>,
+    pub(super) next_import_key: u64,
+    pub(super) pending_imports: HashMap<u64, PendingImport>,
 
     /// Receiver for pending-permission registrations from workers.
     /// Workers send registrations **before** publishing stream events so the
@@ -218,9 +232,25 @@ pub(super) struct Actor {
 
     /// Authoritative lifecycle state for ACP sessions.
     pub(super) server_running: bool,
+    pub(super) price_index: PriceIndex,
+    pub(super) allowance_snapshot: Option<Vec<ProviderUsage>>,
+    accounting_cancel: Option<CancellationToken>,
+    allowance: Option<AllowanceService>,
+    pricing_task: Option<JoinHandle<()>>,
+    accounting_retention_days: u32,
 }
 
 impl Actor {
+    /// Return the most recent observed allowance snapshot while the server is running.
+    pub(super) fn current_allowance(&self) -> Result<&[ProviderUsage], DiscussError> {
+        if !self.server_running {
+            return Err(DiscussError::AccountingUnavailable);
+        }
+        self.allowance_snapshot
+            .as_deref()
+            .ok_or(DiscussError::AccountingUnavailable)
+    }
+
     pub async fn new(
         receiver: mpsc::Receiver<DiscussRequest>,
         inbound_ports: ActorInboundPorts,
@@ -247,6 +277,7 @@ impl Actor {
         let config = load_discuss_settings(&root_context)
             .await
             .expect("ACP actor boot failed to request config from Config domain");
+        let accounting_retention_days = config.accounting_retention_days;
         let agents = config.agents;
 
         // Config-owned session cwd. The config default resolves to
@@ -302,8 +333,10 @@ impl Actor {
         // matching worker capability cache entry via `run_actor`.
         let (capabilities_update_tx, capabilities_update_rx) =
             mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
+        let (activity_update_tx, activity_update_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
+        let (import_completion_tx, import_completion_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (pending_permission_cancel_tx, pending_permission_cancel_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (pending_elicitation_tx, pending_elicitation_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -352,10 +385,16 @@ impl Actor {
             worker_capabilities: HashMap::new(),
             capabilities_update_rx,
             capabilities_update_tx,
+            activity_update_rx,
+            activity_update_tx,
             worker_ready_rx,
             worker_ready_tx,
             transient_worker_rx,
             transient_worker_tx,
+            import_completion_tx,
+            import_completion_rx,
+            next_import_key: 0,
+            pending_imports: HashMap::new(),
             pending_permission_rx,
             pending_permission_tx,
             pending_permission_cancel_rx,
@@ -368,9 +407,16 @@ impl Actor {
             pending_elicitations: HashMap::new(),
             pending_provider_tests: HashMap::new(),
             server_running: false,
+            price_index: PriceIndex::default(),
+            allowance_snapshot: None,
+            accounting_cancel: None,
+            allowance: None,
+            pricing_task: None,
+            accounting_retention_days,
         };
 
         actor.upgrade_installed_teams().await;
+        actor.upgrade_custom_installations().await;
         actor
     }
 
@@ -384,7 +430,7 @@ impl Actor {
             "actor handling request"
         );
 
-        if !self.server_running && request_requires_running_server(&payload) {
+        if !self.server_running && payload.requires_running_server() {
             let _ = reply_to.send(Err(DiscussError::ShuttingDown));
             return;
         }
@@ -419,7 +465,48 @@ impl Actor {
             return;
         }
 
+        if matches!(
+            &payload,
+            DiscussRequestPayload::ImportCustomAgentFromUrl { .. }
+                | DiscussRequestPayload::ImportCustomSkillFromUrl { .. }
+        ) {
+            self.start_custom_import(&payload, reply_to);
+            return;
+        }
         let result: Result<DiscussResponse, DiscussError> = match payload {
+            DiscussRequestPayload::ResolveSessionIdentity { issuer, subject } => {
+                super::identity::resolve(&self.persistence, issuer, subject).await
+            }
+            DiscussRequestPayload::GetTokenUsageReport {
+                from_ms,
+                to_ms,
+                provider_name,
+                model_id,
+                group_by,
+            } => {
+                self.usage_report(from_ms, to_ms, provider_name, model_id, group_by, false)
+                    .await
+            }
+            DiscussRequestPayload::GetSpendReport {
+                from_ms,
+                to_ms,
+                provider_name,
+                model_id,
+                group_by,
+            } => {
+                self.usage_report(from_ms, to_ms, provider_name, model_id, group_by, true)
+                    .await
+            }
+            DiscussRequestPayload::GetAllowanceReport {
+                from_ms,
+                to_ms,
+                provider_name,
+                group_by,
+            } => {
+                self.allowance_report(from_ms, to_ms, provider_name, group_by)
+                    .await
+            }
+            DiscussRequestPayload::GetCurrentAllowance => self.current_allowance_response(),
             DiscussRequestPayload::StartAgent {
                 correlation,
                 launch_config,
@@ -471,6 +558,16 @@ impl Actor {
             DiscussRequestPayload::GetProviderConfig { provider_name } => {
                 self.handle_get_provider_config(&provider_name).await
             }
+            DiscussRequestPayload::GetProviderManagedConfig { provider_name } => {
+                self.handle_get_provider_managed_config(&provider_name)
+            }
+            DiscussRequestPayload::SetProviderManagedConfig {
+                provider_name,
+                document,
+            } => {
+                self.handle_set_provider_managed_config(&provider_name, document)
+                    .await
+            }
             DiscussRequestPayload::RemoveProvider { provider_name } => {
                 self.handle_remove_provider(&provider_name).await
             }
@@ -480,6 +577,140 @@ impl Actor {
             DiscussRequestPayload::RemoveProviderConfig { provider_name } => {
                 self.handle_remove_provider_config(&provider_name)
             }
+            DiscussRequestPayload::ListCustomMcps => self.handle_list_custom_mcps().await,
+            DiscussRequestPayload::CreateCustomMcp { name, descriptor } => {
+                self.handle_write_custom_mcp(&name, descriptor, true).await
+            }
+            DiscussRequestPayload::UpdateCustomMcp { name, descriptor } => {
+                self.handle_write_custom_mcp(&name, descriptor, false).await
+            }
+            DiscussRequestPayload::DeleteCustomMcp { name } => self.handle_delete_custom_mcp(&name).await,
+            DiscussRequestPayload::AssignMcp {
+                scope_kind,
+                scope_id,
+                mcp_name,
+            } => {
+                self.handle_mcp_assignment(scope_kind, &scope_id, &mcp_name, true)
+                    .await
+            }
+            DiscussRequestPayload::UnassignMcp {
+                scope_kind,
+                scope_id,
+                mcp_name,
+            } => {
+                self.handle_mcp_assignment(scope_kind, &scope_id, &mcp_name, false)
+                    .await
+            }
+            DiscussRequestPayload::ListCustomAgents => self.handle_list_custom_agents().await,
+            DiscussRequestPayload::ListCustomSkills => self.handle_list_custom_skills().await,
+            DiscussRequestPayload::GetCustomAgent { agent_id } => self.handle_get_custom_agent(&agent_id).await,
+            DiscussRequestPayload::GetCustomSkill { skill_id } => self.handle_get_custom_skill(&skill_id).await,
+            DiscussRequestPayload::ImportCustomAgentFromUrl { .. }
+            | DiscussRequestPayload::ImportCustomSkillFromUrl { .. } => unreachable!("imports are handled above"),
+            DiscussRequestPayload::SetInstalledAssetInstructions {
+                provider_name,
+                asset_kind,
+                asset_id,
+                instructions,
+            } => {
+                self.installed_asset_instructions(&provider_name, asset_kind, &asset_id, Some(instructions))
+                    .await
+            }
+            DiscussRequestPayload::GetInstalledAssetInstructions {
+                provider_name,
+                asset_kind,
+                asset_id,
+            } => {
+                self.installed_asset_instructions(&provider_name, asset_kind, &asset_id, None)
+                    .await
+            }
+            DiscussRequestPayload::CreateCustomAgent {
+                agent_id,
+                name,
+                job_title,
+                description,
+                body,
+            } => {
+                self.handle_create_custom_agent(agent_id, name, job_title, description, body)
+                    .await
+            }
+            DiscussRequestPayload::CreateCustomSkill {
+                skill_id,
+                name,
+                description,
+                files,
+            } => {
+                self.handle_create_custom_skill(skill_id, name, description, files)
+                    .await
+            }
+            DiscussRequestPayload::UpdateCustomAgent {
+                agent_id,
+                name,
+                job_title,
+                description,
+                body,
+            } => {
+                self.handle_update_custom_agent(agent_id, name, job_title, description, body)
+                    .await
+            }
+            DiscussRequestPayload::UpdateCustomSkill {
+                skill_id,
+                name,
+                description,
+                files,
+            } => {
+                self.handle_update_custom_skill(skill_id, name, description, files)
+                    .await
+            }
+            DiscussRequestPayload::DeleteCustomAgent { agent_id } => self.handle_delete_custom_agent(&agent_id).await,
+            DiscussRequestPayload::DeleteCustomSkill { skill_id } => self.handle_delete_custom_skill(&skill_id).await,
+            DiscussRequestPayload::InstallCustomAgent {
+                provider_name,
+                agent_id,
+            } => {
+                self.install_custom_asset(CustomInstallationKind::Agent, &provider_name, &agent_id)
+                    .await
+            }
+            DiscussRequestPayload::UninstallCustomAgent {
+                provider_name,
+                agent_id,
+            } => {
+                self.uninstall_custom_asset(CustomInstallationKind::Agent, &provider_name, &agent_id)
+                    .await
+            }
+            DiscussRequestPayload::InstallCustomSkill {
+                provider_name,
+                skill_id,
+            } => {
+                self.install_custom_asset(CustomInstallationKind::Skill, &provider_name, &skill_id)
+                    .await
+            }
+            DiscussRequestPayload::UninstallCustomSkill {
+                provider_name,
+                skill_id,
+            } => {
+                self.uninstall_custom_asset(CustomInstallationKind::Skill, &provider_name, &skill_id)
+                    .await
+            }
+            DiscussRequestPayload::CreateCustomTeam {
+                leader_id,
+                display_name,
+                followers,
+                skills,
+            } => {
+                self.handle_create_custom_team(leader_id, display_name, followers, skills)
+                    .await
+            }
+            DiscussRequestPayload::UpdateCustomTeam {
+                leader_id,
+                display_name,
+                followers,
+                skills,
+            } => {
+                self.handle_update_custom_team(leader_id, display_name, followers, skills)
+                    .await
+            }
+            DiscussRequestPayload::DeleteCustomTeam { leader_id } => self.handle_delete_custom_team(leader_id).await,
             DiscussRequestPayload::ListTeamCatalog => self.handle_list_team_catalog().await,
             DiscussRequestPayload::InstallTeam {
                 leader_id,
@@ -519,7 +750,7 @@ impl Actor {
                     let conn = self.persistence.acquire_connection().await?;
                     let installation = load_discuss_team_installation(&conn, &leader_id).await?;
                     drop(conn);
-                    let (member_overrides, theme_color) = match installation {
+                    let (member_overrides, theme_color): (DiscussMemberOverrides, _) = match installation {
                         Some(row) => (
                             serde_json::from_str(&row.member_overrides_json)?,
                             row.theme_color_json
@@ -529,8 +760,25 @@ impl Actor {
                         ),
                         None => (BTreeMap::new(), None),
                     };
-                    self.handle_install_team(leader_id.clone(), provider_name.clone(), member_overrides, theme_color)
-                        .await?;
+                    let (setup, session_config_overrides) = if session_cwd.is_some() {
+                        let settings = if self
+                            .resolve_persisted_acp_session_id(discuss_session_id, None)
+                            .await?
+                            .is_none()
+                        {
+                            member_overrides
+                                .get(&leader_id)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            BTreeMap::new()
+                        };
+                        (DiscussSessionSetup::TeamAtRoot { leader_id }, settings)
+                    } else {
+                        self.handle_install_team(leader_id, provider_name.clone(), member_overrides, theme_color)
+                            .await?;
+                        (setup, BTreeMap::new())
+                    };
                     self.spawn_session(
                         discuss_session_id,
                         &provider_name,
@@ -538,7 +786,7 @@ impl Actor {
                             launch_config,
                             name: session_name,
                             setup: Some(setup),
-                            session_config_overrides: BTreeMap::new(),
+                            session_config_overrides,
                             acp_session_id: None,
                             announce_desktop_association: true,
                             transient_connectivity: false,
@@ -608,7 +856,11 @@ impl Actor {
             DiscussRequestPayload::SendUserTurn {
                 discuss_session_id,
                 text,
-            } => self.handle_send_user_turn(discuss_session_id, text).await,
+                images,
+            } => {
+                self.handle_send_user_turn(discuss_session_id, text, images)
+                    .await
+            }
             DiscussRequestPayload::AnswerPermission {
                 discuss_session_id,
                 permission_request_id,
@@ -678,6 +930,15 @@ impl Actor {
         };
 
         if !was_running {
+            let cancel = CancellationToken::new();
+            self.pricing_task = Some(super::pricing::spawn(
+                self.persistence.clone(),
+                cancel.clone(),
+                self.price_index.clone(),
+            ));
+            self.allowance = Some(super::allowance::spawn(self.persistence.clone(), cancel.clone()));
+            self.accounting_cancel = Some(cancel);
+            self.allowance_snapshot = None;
             self.server_running = true;
         }
 
@@ -895,8 +1156,21 @@ impl Actor {
 
     /// Stop the Discuss server: ordered shutdown.
     async fn handle_stop_server(&mut self) -> Result<DiscussResponse, DiscussError> {
+        self.cancel_custom_imports();
         let was_running = self.server_running;
         self.server_running = false;
+        if let Some(cancel) = self.accounting_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(service) = self.allowance.take() {
+            service.stop().await;
+        }
+        if let Some(task) = self.pricing_task.take()
+            && let Err(error) = task.await
+        {
+            tracing::warn!(?error, "Pricing task failed");
+        }
+        self.allowance_snapshot = None;
         self.agent_completions.clear();
 
         let provider_names = self
@@ -961,6 +1235,11 @@ impl Actor {
 /// config values, agent specs, or provider ids.
 fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
     match payload {
+        DiscussRequestPayload::ResolveSessionIdentity { .. } => "resolveSessionIdentity",
+        DiscussRequestPayload::GetTokenUsageReport { .. } => "getTokenUsageReport",
+        DiscussRequestPayload::GetSpendReport { .. } => "getSpendReport",
+        DiscussRequestPayload::GetAllowanceReport { .. } => "getAllowanceReport",
+        DiscussRequestPayload::GetCurrentAllowance => "getCurrentAllowance",
         DiscussRequestPayload::StartAgent { .. } => "startAgent",
         DiscussRequestPayload::TickAgent { .. } => "tickAgent",
         DiscussRequestPayload::CancelAgentExecution { .. } => "cancelAgentExecution",
@@ -981,10 +1260,39 @@ fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
         DiscussRequestPayload::AddProvider { .. } => "addProvider",
         DiscussRequestPayload::ListProviders => "listProviders",
         DiscussRequestPayload::GetProviderConfig { .. } => "getProviderConfig",
+        DiscussRequestPayload::GetProviderManagedConfig { .. } => "getProviderManagedConfig",
+        DiscussRequestPayload::SetProviderManagedConfig { .. } => "setProviderManagedConfig",
         DiscussRequestPayload::RefreshProviderConfig { .. } => "refreshProviderConfig",
         DiscussRequestPayload::RemoveProvider { .. } => "removeProvider",
         DiscussRequestPayload::InstallProviderConfig { .. } => "installProviderConfig",
         DiscussRequestPayload::RemoveProviderConfig { .. } => "removeProviderConfig",
+        DiscussRequestPayload::ListCustomMcps => "listCustomMcps",
+        DiscussRequestPayload::CreateCustomMcp { .. } => "createCustomMcp",
+        DiscussRequestPayload::UpdateCustomMcp { .. } => "updateCustomMcp",
+        DiscussRequestPayload::DeleteCustomMcp { .. } => "deleteCustomMcp",
+        DiscussRequestPayload::AssignMcp { .. } => "assignMcp",
+        DiscussRequestPayload::UnassignMcp { .. } => "unassignMcp",
+        DiscussRequestPayload::ListCustomAgents => "listCustomAgents",
+        DiscussRequestPayload::ListCustomSkills => "listCustomSkills",
+        DiscussRequestPayload::GetCustomAgent { .. } => "getCustomAgent",
+        DiscussRequestPayload::GetCustomSkill { .. } => "getCustomSkill",
+        DiscussRequestPayload::ImportCustomAgentFromUrl { .. } => "importCustomAgentFromUrl",
+        DiscussRequestPayload::ImportCustomSkillFromUrl { .. } => "importCustomSkillFromUrl",
+        DiscussRequestPayload::SetInstalledAssetInstructions { .. } => "setInstalledAssetInstructions",
+        DiscussRequestPayload::GetInstalledAssetInstructions { .. } => "getInstalledAssetInstructions",
+        DiscussRequestPayload::CreateCustomAgent { .. } => "createCustomAgent",
+        DiscussRequestPayload::CreateCustomSkill { .. } => "createCustomSkill",
+        DiscussRequestPayload::UpdateCustomAgent { .. } => "updateCustomAgent",
+        DiscussRequestPayload::UpdateCustomSkill { .. } => "updateCustomSkill",
+        DiscussRequestPayload::DeleteCustomAgent { .. } => "deleteCustomAgent",
+        DiscussRequestPayload::DeleteCustomSkill { .. } => "deleteCustomSkill",
+        DiscussRequestPayload::InstallCustomAgent { .. } => "installCustomAgent",
+        DiscussRequestPayload::UninstallCustomAgent { .. } => "uninstallCustomAgent",
+        DiscussRequestPayload::InstallCustomSkill { .. } => "installCustomSkill",
+        DiscussRequestPayload::UninstallCustomSkill { .. } => "uninstallCustomSkill",
+        DiscussRequestPayload::CreateCustomTeam { .. } => "createCustomTeam",
+        DiscussRequestPayload::UpdateCustomTeam { .. } => "updateCustomTeam",
+        DiscussRequestPayload::DeleteCustomTeam { .. } => "deleteCustomTeam",
         DiscussRequestPayload::ListTeamCatalog => "listTeamCatalog",
         DiscussRequestPayload::InstallTeam { .. } => "installTeam",
         DiscussRequestPayload::InstallTeamAndStartSession { .. } => "installTeamAndStartSession",
@@ -1000,37 +1308,30 @@ fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
     }
 }
 
-fn request_requires_running_server(payload: &DiscussRequestPayload) -> bool {
-    matches!(
-        payload,
-        DiscussRequestPayload::StartAgent { .. }
-            | DiscussRequestPayload::TickAgent { .. }
-            | DiscussRequestPayload::AddProvider { .. }
-            | DiscussRequestPayload::RefreshProviderConfig { .. }
-            | DiscussRequestPayload::NewSession { .. }
-            | DiscussRequestPayload::InstallTeamAndStartSession { .. }
-            | DiscussRequestPayload::LoadSession { .. }
-            | DiscussRequestPayload::GetConfigOptions { .. }
-            | DiscussRequestPayload::SetConfigOption { .. }
-            | DiscussRequestPayload::SendUserTurn { .. }
-            | DiscussRequestPayload::AnswerPermission { .. }
-            | DiscussRequestPayload::AnswerElicitation { .. }
-            | DiscussRequestPayload::CancelElicitation { .. }
-            | DiscussRequestPayload::CancelTurn { .. }
-            | DiscussRequestPayload::CancelSession { .. }
-            | DiscussRequestPayload::ReserveInspector { .. }
-            | DiscussRequestPayload::StartInspector { .. }
-            | DiscussRequestPayload::DisposeInspector { .. }
-    )
-}
-
-pub(super) fn validate_user_turn(text: &str) -> Result<(), DiscussError> {
+pub(super) fn validate_user_turn(text: &str, images: &[DiscussImageAttachment]) -> Result<(), DiscussError> {
     let actual_bytes = text.len();
     if actual_bytes > MAX_USER_TURN_BYTES {
         return Err(DiscussError::UserTurnTooLarge {
             actual_bytes: actual_bytes as u64,
             max_bytes: MAX_USER_TURN_BYTES as u64,
         });
+    }
+    for image in images {
+        let valid_mime = image
+            .mime_type
+            .split_once('/')
+            .is_some_and(|(kind, subtype)| {
+                !kind.is_empty()
+                    && !subtype.is_empty()
+                    && !subtype.contains('/')
+                    && !kind.chars().any(char::is_whitespace)
+                    && !subtype.chars().any(char::is_whitespace)
+            });
+        if image.data.is_empty() || !valid_mime {
+            return Err(DiscussError::Validation {
+                message: "image must have non-empty data and a type/subtype MIME type".to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -1054,8 +1355,26 @@ pub(super) fn channel_send_error(operation: &'static str, cause: impl Into<Strin
 }
 
 pub(super) async fn run_actor(mut actor: Actor) {
+    let mut retention = tokio::time::interval(Duration::from_secs(86_400));
     loop {
         tokio::select! {
+            _ = retention.tick() => {
+                if actor.accounting_retention_days != 0 {
+                    let cutoff = chrono::Utc::now().timestamp_millis().saturating_sub(i64::from(actor.accounting_retention_days) * 86_400_000);
+                    if let Err(error) = persist_accounting_prune(&actor.persistence, cutoff).await {
+                        tracing::warn!(?error, "Accounting retention prune failed");
+                    }
+                }
+            }
+            Some(snapshot) = async {
+                match actor.allowance.as_mut() {
+                    Some(service) => service.observations.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(service) = &actor.allowance { let _ = service.writer.try_send(snapshot.clone()); }
+                actor.allowance_snapshot = Some(snapshot);
+            }
             Some(request) = actor.workspace_copy_source_rx.recv() => {
                 let result = actor.resolve_workspace_copy_sources(request.provider_names);
                 let _ = request.reply_to.send(result);
@@ -1063,6 +1382,9 @@ pub(super) async fn run_actor(mut actor: Actor) {
             // Incoming request from the bus.
             Some(msg) = actor.receiver.recv() => {
                 let _ = actor.handle_message(msg).await;
+            }
+            Some(completion) = actor.import_completion_rx.recv() => {
+                actor.finish_custom_import(completion).await;
             }
             // Capability update from a worker.
             Some((discuss_session_id, mut caps)) = actor.capabilities_update_rx.recv() => {
@@ -1072,6 +1394,16 @@ pub(super) async fn run_actor(mut actor: Actor) {
                         .get(&discuss_session_id)
                         .is_some_and(|current| current.set_config_option);
                     actor.worker_capabilities.insert(discuss_session_id, caps);
+                }
+            }
+            Some((discuss_session_id, active)) = actor.activity_update_rx.recv() => {
+                if let Some(entry) = actor.worker_registry.get_mut(&discuss_session_id).filter(|entry| !entry.join_handle.is_finished()) {
+                    entry.active_turn = active;
+                    if let Err(error) = actor.broadcast_tx.send(DiscussResponse::SessionActivity { discuss_session_id, active }).await {
+                        tracing::warn!(%discuss_session_id, %error, "Failed to broadcast session activity");
+                    }
+                } else {
+                    tracing::debug!(%discuss_session_id, "Ignoring activity from absent or finished worker");
                 }
             }
             Some(event) = actor.shared_provider_event_rx.recv() => {
@@ -1143,11 +1475,6 @@ pub(super) async fn run_actor(mut actor: Actor) {
 #[derive(Debug)]
 pub(super) enum AgentVersionParseError {
     Installed(semver::Error),
-}
-
-#[cfg(test)]
-fn agent_versions_match(installed_version: &str, current_version: &Version) -> Result<bool, AgentVersionParseError> {
-    team_versions_match(installed_version, current_version)
 }
 
 #[cfg(test)]

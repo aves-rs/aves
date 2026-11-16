@@ -21,8 +21,52 @@ use aves::utils::uuid::SpectaUuid;
 
 use super::library::{AgentId, SkillId};
 
+/// An ACP MCP descriptor containing secrets; never log its contents.
+#[derive(Clone, Serialize, Deserialize, ::schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct SensitiveMcpDescriptor(pub McpServer);
+
+impl std::fmt::Debug for SensitiveMcpDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SensitiveMcpDescriptor([REDACTED])")
+    }
+}
+
+impl Type for SensitiveMcpDescriptor {
+    fn inline(type_map: &mut TypeCollection, generics: Generics<'_>) -> DataType {
+        serde_json::Value::inline(type_map, generics)
+    }
+}
+
+/// Assignment ownership for a custom MCP.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomMcpScope {
+    Provider,
+    Team,
+    Session,
+}
+
+/// A stored custom MCP with redacted environment and header values.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+pub struct CustomMcpEntry {
+    pub name: String,
+    pub transport_kind: String,
+    pub updated_at_ms: i64,
+    pub descriptor: SensitiveMcpDescriptor,
+}
+
+/// A base64-encoded image sent with an interactive user turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+pub struct DiscussImageAttachment {
+    /// MIME type of the encoded image.
+    pub mime_type: String,
+    /// Base64-encoded image data.
+    pub data: String,
+}
+
 /// A broad operation understood by permission translators.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ::schemars::JsonSchema)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Read,
@@ -31,7 +75,7 @@ pub enum Operation {
 }
 
 /// Permission effects in increasing order of restriction.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, ::schemars::JsonSchema)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Effect {
     Allow,
@@ -99,6 +143,73 @@ impl Type for SessionLaunchConfig {
     }
 }
 
+/// A limitation encountered when applying a session's launch configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchLimitation {
+    /// The requested setting affected by the limitation.
+    pub subject: LaunchLimitationSubject,
+    /// Why the setting could not be applied exactly.
+    pub reason: LaunchLimitationReason,
+}
+
+/// The setting affected by a launch limitation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchLimitationSubject {
+    /// A requested permission and the native outcome.
+    Permission {
+        /// The affected operation.
+        operation: Operation,
+        /// The requested permission effect.
+        requested: Effect,
+        /// The native or inherited outcome.
+        actual: LaunchPermissionOutcome,
+    },
+    /// Session-only configuration isolation is unavailable.
+    ConfigurationIsolation,
+    /// An affected MCP server, identified by its requested name.
+    McpServer {
+        /// The requested server name.
+        name: String,
+    },
+    /// An affected plugin reference, identified by its request index.
+    PluginReference {
+        /// Index into `SessionLaunchConfig::plugin_references`.
+        index: usize,
+    },
+}
+
+/// The native permission outcome, or unverified inherited settings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPermissionOutcome {
+    /// A native permission effect.
+    Effect(Effect),
+    /// A native mode identifier.
+    Mode(String),
+    /// Inherited settings whose effect has not been verified.
+    Inherited,
+}
+
+/// The reason a requested launch setting could not be applied exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchLimitationReason {
+    /// The native harness lacks the requested control.
+    UnsupportedNativeControl,
+    /// Native mode selection couples multiple permissions.
+    ModeCoupling,
+    /// Inherited configuration remains unverified.
+    InheritedUnverifiedConfiguration,
+    /// The required option was not advertised.
+    UnavailableAdvertisedOption,
+    /// The requested transport is unsupported.
+    UnsupportedTransport,
+    /// The requested plugin reference is unsupported.
+    UnsupportedPluginReference,
+}
+
 pub(super) use super::elicitation::{
     DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload,
 };
@@ -115,9 +226,19 @@ pub struct AcpProvider {
     /// Editable paths relative to the agents workspace; None uses provider defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_copy_sources: Option<Vec<String>>,
+    /// Provider-owned managed configuration document, if customized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_document: Option<String>,
 }
 
 impl AcpProvider {
+    pub(crate) fn managed_document(&self) -> Option<&str> {
+        self.managed_document.as_deref()
+    }
+
+    pub(crate) fn set_managed_document(&mut self, document: Option<String>) {
+        self.managed_document = document;
+    }
     pub fn server(&self) -> &McpServer {
         &self.server
     }
@@ -205,6 +326,7 @@ impl From<McpServer> for AcpProvider {
             default_session_config: serde_json::Value::Null,
             application_mcp_enabled: false,
             workspace_copy_sources: None,
+            managed_document: None,
         }
     }
 }
@@ -220,6 +342,7 @@ pub struct AgentNodeSessionLimits {
 
 /// ACP work for a Flow AgentNode after its execution limits have been validated.
 pub(super) struct TaskSessionStart {
+    pub(super) node_execution_id: NodeExecutionId,
     pub(super) launch_config: Option<SessionLaunchConfig>,
     pub(super) provider_name: String,
     pub(super) agent_name: String,
@@ -766,6 +889,8 @@ pub(crate) struct WorkerEntry {
     /// Join handle for the spawned worker task, used by `StopServer` to
     /// await termination.
     pub(crate) join_handle: tokio::task::JoinHandle<()>,
+    /// Latest worker-reported turn activity.
+    pub(crate) active_turn: bool,
     /// Provider ACP session id once the worker has completed setup.
     pub(crate) acp_session_id: Option<SessionId>,
     /// Whether Zeus is waiting for this worker's desktop channel association.
@@ -810,6 +935,7 @@ pub(crate) enum WorkerCommand {
     /// Send a user turn (prompt text) to the worker.
     SendUserTurn {
         text: String,
+        images: Vec<DiscussImageAttachment>,
         reply: oneshot::Sender<Result<(), DiscussError>>,
     },
     /// Send the single non-interactive AgentNode turn and report its real ACP boundary.
@@ -868,6 +994,12 @@ pub(crate) type PendingPermissionRegistry = HashMap<(DiscussSessionId, Permissio
 #[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscussSessionInfo {
+    /// Limitations recorded while applying launch configuration.
+    #[serde(default)]
+    pub launch_limitations: Vec<LaunchLimitation>,
+    /// Whether a live worker has an active turn.
+    #[serde(default)]
+    pub active_turn: bool,
     /// True for sessions created by a Flow Agent Task, not an interactive chat.
     #[serde(default)]
     pub is_task_session: bool,
@@ -895,6 +1027,330 @@ pub struct DiscussSessionInfo {
     pub first_prompt_at: Option<i64>,
     /// Unix-epoch ms of the most recent interaction, for dropdown ordering.
     pub last_interaction_at: Option<i64>,
+}
+
+/// Terminal outcome of an accounted turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussCompletionKind {
+    /// The turn completed normally.
+    Completed,
+    /// The turn was cancelled.
+    Cancelled,
+    /// The turn failed.
+    Failed,
+}
+
+/// Scope of a cost amount reported by a harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussHarnessCostKind {
+    /// Cost for this turn alone.
+    PerTurn,
+    /// Cumulative session cost.
+    SessionCumulative,
+}
+
+/// Source of the captured usage projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussUsageEvidenceSource {
+    /// Standard prompt response.
+    #[serde(rename = "prompt_response")]
+    Response,
+    /// Usage metadata on a prompt response.
+    #[serde(rename = "prompt_response_meta")]
+    ResponseMeta,
+    /// Provider prompt-complete notification.
+    #[serde(rename = "prompt_complete")]
+    Complete,
+}
+
+/// One terminal turn's timing, occupancy, and harness cost evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussTurnRecord {
+    pub discuss_session_id: String,
+    pub turn_ordinal: i64,
+    pub provider_name: String,
+    pub model_id: Option<String>,
+    pub turn_started_at_ms: i64,
+    pub turn_completed_at_ms: Option<i64>,
+    pub end_to_end_ms: Option<i64>,
+    pub completion_kind: DiscussCompletionKind,
+    pub stop_reason: Option<String>,
+    pub context_used_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub harness_cost_amount: Option<String>,
+    pub harness_cost_currency: Option<String>,
+    pub harness_cost_kind: Option<DiscussHarnessCostKind>,
+    pub usage_is_incomplete: bool,
+    pub cost_is_partial: bool,
+    pub evidence_source: DiscussUsageEvidenceSource,
+    /// Bounded usage-only projection, never arbitrary provider metadata.
+    pub evidence_json: Option<String>,
+    pub created_at_ms: i64,
+}
+
+/// Token evidence and exact calculated cost attributed to one model, if known.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussModelUsageEntry {
+    pub discuss_session_id: String,
+    pub turn_ordinal: i64,
+    pub provider_name: String,
+    pub turn_started_at_ms: i64,
+    pub model_id: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub thought_tokens: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub calculated_cost_usd: Option<String>,
+    pub incomplete_categories: i64,
+    pub usage_is_incomplete: bool,
+    pub cost_is_partial: bool,
+    pub pricing_basis: Option<String>,
+    pub price_snapshot_json: Option<String>,
+}
+
+/// Dimensions available to usage and spend reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussUsageGroupBy {
+    Session,
+    Provider,
+    Model,
+    UtcHour,
+    UtcDay,
+    UtcWeek,
+    UtcMonth,
+}
+
+/// Dimensions available to allowance reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussAllowanceGroupBy {
+    Provider,
+    Account,
+    UtcHour,
+    UtcDay,
+    UtcWeek,
+    UtcMonth,
+}
+
+/// Report group identity; absent fields are not grouping dimensions.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussReportKey {
+    pub session_id: Option<String>,
+    pub provider: Option<String>,
+    pub model_id: Option<String>,
+    pub account: Option<String>,
+    pub bucket_start_ms: Option<i64>,
+}
+
+/// Persisted evidence coverage for a report group.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussReportCoverage {
+    pub turns_total: u64,
+    pub turns_with_token_evidence: u64,
+    pub turns_with_calculated_cost: u64,
+    pub turns_with_throughput: u64,
+    pub turns_usage_incomplete: u64,
+    pub turns_harness_cost_partial: u64,
+    pub turns_excluded_multi_model: u64,
+}
+
+/// Nullable token sums and weighted end-to-end throughput.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussTokenSums {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub thought_tokens: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub throughput_output_tokens: u64,
+    pub throughput_end_to_end_ms: u64,
+    pub end_to_end_turn_tokens_per_second: Option<String>,
+}
+
+/// A cumulative harness cost observation, never summed with per-turn costs.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussHarnessCost {
+    pub amount: String,
+    pub currency: String,
+    pub is_partial: bool,
+}
+
+/// A usage or spend report group.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussUsageReportRow {
+    pub key: DiscussReportKey,
+    pub coverage: DiscussReportCoverage,
+    pub tokens: DiscussTokenSums,
+    pub calculated_cost_usd: Option<String>,
+    pub harness_per_turn_cost: std::collections::BTreeMap<String, String>,
+    pub harness_session_cost_latest: Option<DiscussHarnessCost>,
+    pub harness_session_cost_reason: Option<String>,
+}
+
+/// Bounded deterministic report output.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussUsageReport {
+    pub rows: Vec<DiscussUsageReportRow>,
+    pub truncated: bool,
+}
+
+/// An upstream allowance window, retaining its original units.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceWindow {
+    pub used_percent: f64,
+    pub raw_used_percent: Option<f64>,
+    pub resets_at: Option<String>,
+    pub window_minutes: Option<i64>,
+    pub window_kind: Option<String>,
+    pub used_count: Option<f64>,
+    pub total_count: Option<f64>,
+}
+
+/// A named or unnamed additional allowance window.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceExtraWindow {
+    pub title: Option<String>,
+    pub id: Option<String>,
+    pub window: Option<DiscussAllowanceWindow>,
+}
+
+/// Account-wide and extra allowance windows.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceWindows {
+    pub primary: Option<DiscussAllowanceWindow>,
+    pub secondary: Option<DiscussAllowanceWindow>,
+    pub tertiary: Option<DiscussAllowanceWindow>,
+    pub extra_rate_windows: Option<Vec<DiscussAllowanceExtraWindow>>,
+}
+
+/// A pool amount in the upstream minor units and exponent.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceAmount {
+    pub minor: i64,
+    pub exponent: u8,
+    pub unit: String,
+}
+
+/// An upstream balance or credit pool.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowancePool {
+    pub id: String,
+    pub label: String,
+    pub funding: String,
+    pub basis: String,
+    pub remaining: Option<DiscussAllowanceAmount>,
+    pub total: Option<DiscussAllowanceAmount>,
+    pub spendable: Option<bool>,
+    pub resets_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub unlimited: Option<bool>,
+}
+
+/// One kind of saved reset credit.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceResetKind {
+    pub kind: String,
+    pub available_count: u32,
+    pub soonest_expires_at: Option<String>,
+}
+
+/// Saved reset inventory and upstream credit expiry timestamps.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceSavedResets {
+    pub available_count: u32,
+    pub soonest_expires_at: Option<String>,
+    pub credit_expiries: Vec<String>,
+    pub kinds: Vec<DiscussAllowanceResetKind>,
+}
+
+/// Provider-supplied account display metadata.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceAccountInfo {
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    pub plan_type: Option<String>,
+    pub subscription_renews_at: Option<String>,
+    pub subscription_ends_at: Option<String>,
+}
+
+/// Reason and start time of a stale allowance reading.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceStale {
+    pub since: String,
+    pub class: Option<String>,
+}
+
+/// Normalized provider observation shared by historical and current reads.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceProjection {
+    pub provider: String,
+    pub display_provider: String,
+    pub api_provider: Option<String>,
+    pub account: Option<String>,
+    pub account_info: Option<DiscussAllowanceAccountInfo>,
+    pub fetched_at: Option<String>,
+    pub stale: Option<DiscussAllowanceStale>,
+    pub error: Option<String>,
+    pub error_class: Option<String>,
+    pub windows: Option<DiscussAllowanceWindows>,
+    pub pools: Option<Vec<DiscussAllowancePool>>,
+    pub saved_resets: Option<DiscussAllowanceSavedResets>,
+}
+
+/// A historical allowance sample and its normalized provider projection.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceSample {
+    pub provider: String,
+    pub display_provider: String,
+    pub account: Option<String>,
+    pub observed_at_ms: i64,
+    pub fetched_at_ms: Option<i64>,
+    pub stale_since_ms: Option<i64>,
+    pub error_class: Option<String>,
+    pub projection: DiscussAllowanceProjection,
+}
+
+/// A historical allowance group with its sampled observations.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceReportRow {
+    pub key: DiscussReportKey,
+    pub observation_count: u64,
+    pub observations: Vec<DiscussAllowanceSample>,
+}
+
+/// Bounded historical allowance output.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAllowanceReport {
+    pub rows: Vec<DiscussAllowanceReportRow>,
+    pub truncated: bool,
 }
 
 /// One bounded transcript turn for a chat, keyed by `(discuss_session_id, position)`.
@@ -1028,6 +1484,11 @@ pub enum DiscussSessionSetup {
         /// Stable Phanes Team leader identifier.
         leader_id: String,
     },
+    /// Use a custom agent installed for this Provider.
+    Agent {
+        /// Stable custom agent identifier.
+        agent_id: String,
+    },
     /// Use the Provider directly with the reviewed per-session selections.
     Provider {
         /// Session-level values layered over the Provider defaults.
@@ -1077,6 +1538,56 @@ pub enum AgentThemeColor {
     Text,
     /// Dimmed text color.
     Dimmed,
+}
+
+/// Metadata and provenance for a cached custom asset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomAssetMetadata {
+    pub id: String,
+    pub name: String,
+    pub job_title: Option<String>,
+    pub description: String,
+    pub version: String,
+    pub source_kind: String,
+    pub source_url: Option<String>,
+    pub last_pull_at_ms: Option<i64>,
+    pub last_pull_ok: Option<bool>,
+    pub pull_error: Option<String>,
+}
+
+/// Kind of installed asset addressed by workspace instructions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InstalledAssetKind {
+    /// An agent file.
+    Agent,
+    /// A skill's SKILL.md file.
+    Skill,
+}
+
+/// A file in a custom skill bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomSkillBundleFile {
+    pub relative_path: String,
+    pub contents: String,
+}
+
+/// A cached custom agent and its authored body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomAgentDetail {
+    pub metadata: CustomAssetMetadata,
+    pub body: String,
+}
+
+/// A cached custom skill and its complete bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomSkillDetail {
+    pub metadata: CustomAssetMetadata,
+    pub files: Vec<CustomSkillBundleFile>,
 }
 
 /// One canonical Phanes Team member in display order.
@@ -1181,6 +1692,18 @@ pub enum AcpDispatchResponsePayload {
 /// boundaries without carrying raw external error types.
 #[derive(Error, Debug, Clone, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 pub enum DiscussError {
+    /// The verified identity has no binding.
+    #[error("Session identity is unknown")]
+    SessionIdentityUnknown,
+    /// The session has no configured agent identity.
+    #[error("Session identity is unassigned")]
+    SessionIdentityUnassigned,
+    /// Multiple sessions were bound to the same verified identity.
+    #[error("Session identity is ambiguous")]
+    SessionIdentityAmbiguous,
+    /// A trusted issued token did not contain a valid issuer claim.
+    #[error("Issued worker token has an invalid issuer claim")]
+    SessionIdentityInvalidIssuer,
     /// OpenCode cannot provision a CLI login for a single session securely.
     #[error("OpenCode does not support secure per-session CLI tool login provisioning")]
     SessionCliLoginUnsupported,
@@ -1546,6 +2069,49 @@ pub enum DiscussError {
         agent_key: String,
     },
 
+    /// Accounting is not currently available.
+    #[error("Accounting unavailable")]
+    AccountingUnavailable,
+    /// The requested report range is invalid.
+    #[error("Invalid report range")]
+    ReportRangeInvalid,
+    /// A report aggregation exceeded its numeric bounds.
+    #[error("Report aggregation overflow")]
+    ReportAggregationOverflow,
+    /// The custom asset does not exist.
+    #[error("Unknown custom asset")]
+    UnknownCustomAsset,
+    /// The custom asset is still referenced by the listed providers or teams.
+    #[error("Custom asset is referenced: {references:?}")]
+    CustomAssetReferenced { references: Vec<String> },
+    /// The custom asset identifier collides with another asset.
+    #[error("Custom asset id collision")]
+    CustomAssetIdCollision,
+    /// The requested custom agent is not installed.
+    #[error("Custom agent is not installed")]
+    CustomAgentNotInstalled,
+    /// The team leader already identifies another team.
+    #[error("Team leader is in use")]
+    TeamLeaderInUse,
+    /// An asset import failed at a named stage.
+    #[error("Asset import failed at {stage}: {cause}")]
+    AssetImport { stage: String, cause: String },
+    /// An MCP server name appears more than once.
+    #[error("Duplicate MCP server name")]
+    DuplicateMcpServerName,
+    /// An MCP server name is reserved.
+    #[error("Reserved MCP server name")]
+    ReservedMcpName,
+    /// Provider-managed configuration failed validation.
+    #[error("Managed config for {plugin} is invalid: {reason}")]
+    ManagedConfigValidation { plugin: String, reason: String },
+    /// A usage value exceeded its supported range.
+    #[error("Usage value out of range")]
+    UsageValueOutOfRange,
+    /// Import destination address was blocked.
+    #[error("Import address blocked")]
+    ImportAddressBlocked,
+
     /// Legacy IPC boundary fallback for errors that do not yet have a structured variant.
     #[error("{0}")]
     Other(
@@ -1558,6 +2124,10 @@ impl DiscussError {
     /// Stable client-facing error code for the Discuss domain.
     pub fn rpc_code(&self) -> &'static str {
         match self {
+            DiscussError::SessionIdentityUnknown => "SessionIdentityUnknown",
+            DiscussError::SessionIdentityUnassigned => "SessionIdentityUnassigned",
+            DiscussError::SessionIdentityAmbiguous => "SessionIdentityAmbiguous",
+            DiscussError::SessionIdentityInvalidIssuer => "SessionIdentityInvalidIssuer",
             DiscussError::SessionCliLoginUnsupported => "SessionCliLoginUnsupported",
             DiscussError::SessionCliToolUnsupported => "SessionCliToolUnsupported",
             DiscussError::ChannelSend => "ChannelSend",
@@ -1607,6 +2177,20 @@ impl DiscussError {
             DiscussError::ProviderRestartExhausted { .. } => "ProviderRestartExhausted",
             DiscussError::ProviderNotRunning { .. } => "ProviderNotRunning",
             DiscussError::UnknownAgent { .. } => "UnknownAgent",
+            DiscussError::AccountingUnavailable => "AccountingUnavailable",
+            DiscussError::ReportRangeInvalid => "ReportRangeInvalid",
+            DiscussError::ReportAggregationOverflow => "ReportAggregationOverflow",
+            DiscussError::UnknownCustomAsset => "UnknownCustomAsset",
+            DiscussError::CustomAssetReferenced { .. } => "CustomAssetReferenced",
+            DiscussError::CustomAssetIdCollision => "CustomAssetIdCollision",
+            DiscussError::CustomAgentNotInstalled => "CustomAgentNotInstalled",
+            DiscussError::TeamLeaderInUse => "TeamLeaderInUse",
+            DiscussError::AssetImport { .. } => "AssetImport",
+            DiscussError::DuplicateMcpServerName => "DuplicateMcpServerName",
+            DiscussError::ReservedMcpName => "ReservedMcpName",
+            DiscussError::ManagedConfigValidation { .. } => "ManagedConfigValidation",
+            DiscussError::UsageValueOutOfRange => "UsageValueOutOfRange",
+            DiscussError::ImportAddressBlocked => "ImportAddressBlocked",
             DiscussError::Other(_) => "Other",
         }
     }

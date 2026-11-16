@@ -22,6 +22,7 @@ where
     let DiscussKernelServices {
         boot,
         streaming_service,
+        identity_service,
         provider_config_service,
         workspace_copy_source_port: workspace_copy_source_publisher,
         agent_node_lifecycle_service,
@@ -39,6 +40,8 @@ where
     let channels = driver.register::<super::DiscussDomain, DiscussRequest, DiscussBroadcast>();
     let (streaming_service_impl, streaming_service_rx) =
         super::DiscussStreamingServiceImpl::channel(DEFAULT_BUFFER_SIZE);
+    let (identity_service_impl, identity_service_rx) =
+        super::domain::DiscussIdentityServiceImpl::channel(DEFAULT_BUFFER_SIZE);
     let (provider_config_service_impl, provider_config_service_rx) =
         super::DiscussProviderConfigSudoServiceImpl::channel(DEFAULT_BUFFER_SIZE);
     let (agent_node_lifecycle_impl, agent_node_lifecycle_rx) =
@@ -67,6 +70,7 @@ where
     tokio::spawn(run_actor(actor));
 
     let _ = streaming_service.publish(streaming_service_impl);
+    let _ = identity_service.publish(identity_service_impl);
     let _ = provider_config_service.publish(provider_config_service_impl);
     let _ = agent_node_lifecycle_service.publish(agent_node_lifecycle_impl);
 
@@ -83,6 +87,7 @@ where
         channels.broadcasts_tx,
         actor_broadcast_rx,
         streaming_service_rx,
+        identity_service_rx,
         provider_config_service_rx,
         agent_node_lifecycle_rx,
     )

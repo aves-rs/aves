@@ -22,6 +22,7 @@ use super::types::{
     DiscussPermissionOption, DiscussSessionId, DiscussStreamEvent, DiscussUtilityPayload, DiscussUtilityUpdate,
     ElicitationRequestId, PendingElicitation, PermissionRequestId,
 };
+use super::usage::{DiscussUsageEvidence, UsageCaptureEvent};
 
 /// Handles an incoming permission request from the agent.
 ///
@@ -194,9 +195,13 @@ pub(super) struct AssistantTurnBuffer {
     accumulated_thought: String,
     parts: Vec<serde_json::Value>,
     metadata_updates: Vec<serde_json::Value>,
+    usage_evidence: Vec<DiscussUsageEvidence>,
 }
 
 impl AssistantTurnBuffer {
+    pub(super) fn take_usage_evidence(&mut self) -> Vec<DiscussUsageEvidence> {
+        std::mem::take(&mut self.usage_evidence)
+    }
     pub(super) fn append_text(&mut self, text: &str) {
         self.accumulated_text.push_str(text);
         self.parts
@@ -296,7 +301,35 @@ pub(super) async fn send_message_to_user(
         _ => None,
     };
 
-    let payload = acp_message_payload(session, message)?;
+    let payload = match message {
+        SessionMessage::Message(dispatch) => {
+            let raw = dispatch.into_raw();
+            if let Dispatch::Notification(notification) = &raw {
+                let (method, params) = notification.clone().into_parts();
+                if let Some(evidence) = agent_plugin.capture_usage_evidence(&UsageCaptureEvent::Notification {
+                    method: &method,
+                    params: &params,
+                }) {
+                    buffer.usage_evidence.push(evidence);
+                }
+            }
+            AcpAgentMessagePayload::Dispatch {
+                session_id: session.to_string(),
+                dispatch: dispatch_payload(raw),
+            }
+        }
+        SessionMessage::PromptResponse(result) => {
+            let response = result?;
+            if let Some(evidence) = agent_plugin.capture_usage_evidence(&UsageCaptureEvent::PromptResponse(&response)) {
+                buffer.usage_evidence.push(evidence);
+            }
+            AcpAgentMessagePayload::StopReason {
+                session_id: session.to_string(),
+                stop_reason: response.stop_reason,
+            }
+        }
+        other => acp_message_payload(session, other)?,
+    };
 
     if suppress_transcript && is_transcript_event(&payload) {
         return Ok(AgentMessageForwardOutcome::Continue { utility_payload: None });

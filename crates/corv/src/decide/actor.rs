@@ -22,8 +22,7 @@ use super::{
     plugins::DecidePlugin,
     types::{
         DecideAnswer, DecideAskRequest, DecideContent, DecideCredential, DecideError, DecideNodeConfig,
-        DecideNodeTickResult, DecideOutcome, DecideQuestion, canonical_endpoint, validate_credentialed_endpoint,
-        validate_keyless_endpoint,
+        DecideNodeTickResult, DecideOutcome, DecideQuestion, canonical_endpoint, validate_keyless_endpoint,
     },
 };
 
@@ -228,7 +227,6 @@ impl QuestionContext {
             value if value > 3600 => return Err(DecideError::TimeoutInvalid { value, maximum: 3600 }),
             value => value,
         };
-        let plugin = (self.lookup)(&input.provider)?;
         let credential = input
             .credential_id
             .map(|id| {
@@ -238,6 +236,15 @@ impl QuestionContext {
                     .ok_or(DecideError::CredentialUnavailable { credential_id: id })
             })
             .transpose()?;
+        if let (Some(credential_id), Some(credential)) = (input.credential_id, credential.as_ref())
+            && credential.provider != input.provider
+        {
+            return Err(DecideError::ProviderCredentialMismatch {
+                credential_id,
+                provider: input.provider,
+            });
+        }
+        let plugin = (self.lookup)(&input.provider)?;
         let endpoint = resolve_endpoint(credential.as_ref(), input.endpoint.as_deref())?;
         let permit = self
             .permits
@@ -354,32 +361,41 @@ impl Actor {
                 node_execution_id: correlation.node_execution_id,
             });
         }
+        let credential_id = match &config {
+            DecideNodeConfig::Bool(c) => c.credential_id,
+            DecideNodeConfig::Choice(c) => c.credential_id,
+            DecideNodeConfig::Score(c) => c.credential_id,
+        };
+        let credential = self
+            .credentials
+            .get(&credential_id)
+            .ok_or(DecideError::CredentialUnavailable { credential_id })?;
         let input = match config {
             DecideNodeConfig::Bool(c) => Input::new(
                 DecideQuestion::Bool(c.question),
-                c.provider,
+                credential.provider.clone(),
                 c.model,
                 c.state,
-                c.credential_id,
-                c.endpoint,
+                Some(c.credential_id),
+                None,
                 Some(c.timeout_secs),
             ),
             DecideNodeConfig::Choice(c) => Input::new(
                 DecideQuestion::Choice(c.question),
-                c.provider,
+                credential.provider.clone(),
                 c.model,
                 c.state,
-                c.credential_id,
-                c.endpoint,
+                Some(c.credential_id),
+                None,
                 Some(c.timeout_secs),
             ),
             DecideNodeConfig::Score(c) => Input::new(
                 DecideQuestion::Score(c.question),
-                c.provider,
+                credential.provider.clone(),
                 c.model,
                 c.state,
-                c.credential_id,
-                c.endpoint,
+                Some(c.credential_id),
+                None,
                 Some(c.timeout_secs),
             ),
         };
@@ -462,12 +478,8 @@ impl Actor {
                 credential_id,
                 credential,
             } => (|| {
-                if credential.api_key.trim().is_empty() {
-                    return Err(DecideError::Validation {
-                        message: "Credential key must not be empty".into(),
-                    });
-                }
-                validate_credentialed_endpoint(&credential.endpoint)?;
+                let credential =
+                    DecideCredential::new(&credential.provider, credential.api_key, credential.endpoint.as_str())?;
                 self.credentials.insert(credential_id, credential);
                 Ok(DecideResponse::Success)
             })(),

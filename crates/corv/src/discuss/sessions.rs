@@ -4,45 +4,91 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use agent_client_protocol::v1::ConnectionTo;
-use agent_client_protocol::v1::schema::{McpServer, PermissionOptionId, SessionId};
+use agent_client_protocol::v1::schema::{McpServer, Meta, SessionId};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::types::TaskSessionStart;
-use aves::auth::AuthSudoService;
+use aves::auth::{AuthSudoService, Jwt};
+use aves::bus::BusMcpEndpoint;
 use aves::runtime::ServiceReader;
 use aves::utils::buffers::DEFAULT_BUFFER_SIZE;
 
-use super::actor::{
-    Actor, CANCEL_TURN_DEADLINE, SpawnSessionOptions, TransientWorkerEvent, channel_send_error, validate_user_turn,
-};
+use super::actor::{Actor, SpawnSessionOptions, TransientWorkerEvent, channel_send_error, validate_user_turn};
 use super::config::{
     config_options_from_json, config_settings_from_json, config_settings_from_value, provider_config_options_json,
 };
-use super::database::*;
-use super::elicitation::validate_elicitation_content;
-use super::library::AgentId;
+use super::database::persist_session_anchor_inner;
+use super::identity::{Binding, flow_node_subject, persist_binding};
+use super::library::{AgentId, ResolvedAgent};
+use super::mcp::composed_launch_config;
 use super::messages::DiscussResponse;
-use super::plugins::{self, PrimaryAgentSelection};
+use super::plugins::{self, LaunchContext, PrimaryAgentSelection};
 use super::session::{
     PendingElicitationCancel, SESSION_WORKER_JWT_EXPIRATION, SessionWorkerFailure, WorkerSessionParams,
     ensure_agents_workspace_dir, initialize_request, issue_worker_jwt, load_session_request, revoke_worker_jti,
-    run as run_session_worker,
+    run as run_session_worker, worker_subject,
 };
 use super::storage::{
-    DiscussSessionRow, ElicitationPersistenceInput, LoadedSessionRefresh, delete_discuss_session,
-    list_recent_discuss_sessions, load_discuss_agent_config, load_discuss_chat_turns_window, load_discuss_session,
-    load_discuss_subagents, load_discuss_team_installation, merge_refresh_discuss_session, present_acp_session_id,
+    DiscussSessionRow, LoadedSessionRefresh, delete_discuss_session, list_recent_discuss_sessions,
+    load_discuss_agent_config, load_discuss_chat_turns_window, load_discuss_session, load_discuss_subagents,
+    load_discuss_team_installation, merge_refresh_discuss_session, next_usage_ordinal, present_acp_session_id,
     provider_updated_at_ms, rename_discuss_session, update_session_launch_config, update_session_launch_context,
     update_session_setup_kind, upsert_discuss_agent_config,
 };
-use super::supervisor::{CallbackRouter, ProviderSupervisor, ProviderSupervisorResources};
+use super::supervisor::{
+    CallbackRouteRegistry, CallbackRouter, ProviderSupervisor, ProviderSupervisorResources, SharedMcpRegistrations,
+};
 use super::types::{
-    AcpProvider, ConfigSettings, DiscussChatTurnRecord, DiscussConfigOption, DiscussElicitationAnswer, DiscussError,
-    DiscussMemberOverrides, DiscussPermissionOption, DiscussSessionId, DiscussSessionInfo, DiscussSessionSetup,
-    DiscussStreamEvent, ElicitationRequestId, InspectorBinding, PendingElicitation, PermissionRequestId,
+    AcpProvider, ConfigSettings, DiscussChatTurnRecord, DiscussConfigOption, DiscussError, DiscussMemberOverrides,
+    DiscussSessionId, DiscussSessionInfo, DiscussSessionSetup, DiscussStreamEvent, LaunchLimitation,
     SessionLaunchConfig, TaskSessionStarted, WorkerCommand, WorkerEntry,
 };
+
+struct SessionLaunchPreparation {
+    launch_server: McpServer,
+    launch_meta: Option<Meta>,
+    launch_limitations: Vec<LaunchLimitation>,
+    effective_config: Option<SessionLaunchConfig>,
+    assigned_agent_name: Option<String>,
+    setup_settings: ConfigSettings,
+    persisted_setup_kind: Option<&'static str>,
+    primary_agent: Option<ResolvedAgent>,
+    isolated_configured: bool,
+    agent: AcpAgent,
+}
+
+struct SessionWorkerInputs<'a> {
+    discuss_session_id: DiscussSessionId,
+    key: &'a str,
+    assigned_agent_name: Option<String>,
+    agent: AcpAgent,
+    launch_config: Option<SessionLaunchConfig>,
+    launch_meta: Option<Meta>,
+    launch_limitations: Vec<LaunchLimitation>,
+    launch_server: McpServer,
+    session_name: String,
+    primary_agent: Option<ResolvedAgent>,
+    reconnect_acp_session_id: Option<SessionId>,
+    persisted_config_options: Vec<DiscussConfigOption>,
+    session_settings: ConfigSettings,
+    restored_persisted_transcript: bool,
+    next_turn_position: i64,
+    next_usage_ordinal: i64,
+    session_cwd: Option<PathBuf>,
+    application_mcp_enabled: bool,
+    flow_mcp_endpoints: Option<Vec<BusMcpEndpoint>>,
+    node_token: Option<Jwt>,
+    agent_defaults: ConfigSettings,
+    announce_desktop_association: bool,
+    transient_connectivity: bool,
+    callback_router: Arc<Mutex<CallbackRouter>>,
+    callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
+    shared_connection: Option<ConnectionTo<Agent>>,
+    shared_mcp_capabilities: Option<(bool, bool)>,
+    system_prompt_supported: bool,
+    shared_mcp_registrations: Option<SharedMcpRegistrations>,
+}
 
 impl Actor {
     fn ensure_provider_accepts_session(&self, key: &str, transient_connectivity: bool) -> Result<(), DiscussError> {
@@ -102,6 +148,7 @@ impl Actor {
             return Err(DiscussError::ShuttingDown);
         }
         let TaskSessionStart {
+            node_execution_id,
             launch_config,
             provider_name,
             agent_name,
@@ -113,8 +160,10 @@ impl Actor {
             node_token,
             flow_mcp_endpoints,
         } = options;
-        validate_user_turn(&prompt)?;
+        validate_user_turn(&prompt, &[])?;
         let session_id = DiscussSessionId::new();
+        let subject = flow_node_subject(node_execution_id);
+        let assigned_agent = (!agent_name.is_empty()).then_some(agent_name.as_str());
         tracing::debug!(
             %session_id,
             provider = %provider_name,
@@ -147,11 +196,26 @@ impl Actor {
                 transient_connectivity: false,
                 session_cwd: Some(session_cwd),
                 application_mcp_enabled: Some(application_mcp_enabled),
-                node_token: Some(node_token),
+                node_token: Some(node_token.clone()),
                 flow_mcp_endpoints,
             },
         )
         .await?;
+        if let Err(error) = persist_binding(
+            &self.persistence,
+            Binding {
+                token: &node_token,
+                subject: &subject,
+                session_id,
+                provider: assigned_agent.map(|_| provider_name.as_str()),
+                agent: assigned_agent,
+                node_id: Some(node_execution_id),
+            },
+        )
+        .await
+        {
+            tracing::warn!(%session_id, %error, "Failed to persist task session identity binding");
+        }
         let entry = self
             .worker_registry
             .get(&session_id)
@@ -252,35 +316,13 @@ impl Actor {
             persisted_config_options,
             mut session_settings,
             restored_setup,
-        ) = if transient_connectivity {
-            (false, 0, Vec::new(), ConfigSettings::new(), None)
-        } else if reconnect_acp_session_id.is_some() {
-            let conn = self.persistence.acquire_connection().await?;
-            let turns = load_discuss_chat_turns_window(&conn, &discuss_session_id.to_string()).await?;
-            let row = load_discuss_session(&conn, &discuss_session_id.to_string()).await?;
-            let next_position = turns.last().map(|turn| turn.position + 1).unwrap_or(0);
-            let persisted_config_options = row
-                .as_ref()
-                .and_then(|row| row.latest_config_options_json.as_deref())
-                .map(config_options_from_json)
-                .transpose()?
-                .unwrap_or_default();
-            let session_settings = row
-                .as_ref()
-                .and_then(|row| row.config_settings_json.as_deref())
-                .map(config_settings_from_json)
-                .transpose()?
-                .unwrap_or_default();
-            (
-                !turns.is_empty(),
-                next_position,
-                persisted_config_options,
-                session_settings,
-                row.as_ref().and_then(Self::restored_team_setup),
+        ) = self
+            .load_session_restore_state(
+                discuss_session_id,
+                transient_connectivity,
+                reconnect_acp_session_id.is_some(),
             )
-        } else {
-            (false, 0, Vec::new(), ConfigSettings::new(), None)
-        };
+            .await?;
         // Resolve the restored setup before choosing the launch: a root-materialized Team
         // needs an isolated launch configured against its restored session root, even when
         // the caller supplied no launch config.
@@ -289,49 +331,36 @@ impl Actor {
         } else {
             setup
         };
-        let plugin = plugins::for_agent(key);
-        let mut launch_server = plugin.launch_server(agent_spec.server());
-        let root_default_config = SessionLaunchConfig::default();
-        let launch_workspace = Self::launch_workspace(setup.as_ref(), session_cwd.as_ref(), &self.agents_workspace)?;
-        let restores_team_at_root = matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. }));
-        let persisted_setup_kind = Self::setup_kind_for(setup.as_ref());
-        let (assigned_agent_name, setup_settings) = self.resolve_session_setup(key, setup).await?;
-        let primary_agent = assigned_agent_name
-            .as_deref()
-            .map(|leader_id| {
-                let agent_id = AgentId::try_from(leader_id.to_string()).map_err(|error| {
-                    DiscussError::WorkspaceInvalidAssetId {
-                        asset_id: leader_id.to_string(),
-                        violation: error.to_string(),
-                    }
-                })?;
-                plugins::resolve_agent(self.library, &agent_id)
-            })
-            .transpose()?;
-        let launch_inputs = match launch_config.as_ref() {
-            Some(config) => Some((config, launch_workspace)),
-            None if restores_team_at_root => Some((&root_default_config, launch_workspace)),
-            None => None,
-        };
-        let mut isolated_configured = if let Some((config, workspace)) = launch_inputs {
-            launch_server = plugin.configured_launch_server(&launch_server, workspace, config)?;
-            true
-        } else {
-            false
-        };
-        // A launch-argument selection names the Agent per process, so the session needs its own.
-        if let Some(agent) = primary_agent
-            && let PrimaryAgentSelection::LaunchArguments(arguments) = plugin.primary_agent_selection(agent)
-        {
-            let McpServer::Stdio(server) = &mut launch_server else {
-                return Err(DiscussError::Validation {
-                    message: "Launch-argument Agent selection requires a stdio ACP server".to_string(),
-                });
-            };
-            server.args.extend(arguments);
-            isolated_configured = true;
-        }
-        let agent = Self::acp_agent_from_server(&launch_server)?;
+        let composed_config = composed_launch_config(
+            &self.persistence,
+            self.mcp_domains,
+            key,
+            setup.as_ref(),
+            discuss_session_id,
+            launch_config.as_ref(),
+        )
+        .await?;
+        let SessionLaunchPreparation {
+            launch_server,
+            assigned_agent_name,
+            setup_settings,
+            persisted_setup_kind,
+            primary_agent,
+            isolated_configured,
+            agent,
+            launch_meta,
+            launch_limitations,
+            effective_config,
+        } = self
+            .prepare_session_launch(
+                discuss_session_id,
+                key,
+                agent_spec.server(),
+                setup,
+                session_cwd.as_ref(),
+                (composed_config.as_ref(), launch_config.is_some()),
+            )
+            .await?;
         let (
             callback_router,
             callback_routes,
@@ -375,6 +404,7 @@ impl Actor {
             });
         let configured_defaults = config_settings_from_value(agent_spec.default_session_config());
         let conn = self.persistence.acquire_connection().await?;
+        let next_usage_ordinal = next_usage_ordinal(&conn, &discuss_session_id.to_string()).await?;
         let agent_defaults = if transient_connectivity {
             configured_defaults
         } else {
@@ -418,10 +448,77 @@ impl Actor {
         }
         let application_mcp_enabled =
             requested_application_mcp_enabled.unwrap_or_else(|| agent_spec.application_mcp_enabled());
+        self.start_session_worker(SessionWorkerInputs {
+            discuss_session_id,
+            key,
+            assigned_agent_name,
+            agent,
+            launch_config: effective_config,
+            launch_meta,
+            launch_limitations,
+            launch_server,
+            session_name,
+            primary_agent,
+            reconnect_acp_session_id,
+            persisted_config_options,
+            session_settings,
+            restored_persisted_transcript,
+            next_turn_position,
+            next_usage_ordinal,
+            session_cwd,
+            application_mcp_enabled,
+            flow_mcp_endpoints,
+            node_token,
+            agent_defaults,
+            announce_desktop_association,
+            transient_connectivity,
+            callback_router,
+            callback_routes,
+            shared_connection,
+            shared_mcp_capabilities,
+            system_prompt_supported,
+            shared_mcp_registrations,
+        })
+        .await
+    }
+
+    async fn start_session_worker(&mut self, inputs: SessionWorkerInputs<'_>) -> Result<DiscussResponse, DiscussError> {
+        let SessionWorkerInputs {
+            discuss_session_id,
+            key,
+            assigned_agent_name,
+            agent,
+            launch_config,
+            launch_meta,
+            launch_limitations,
+            launch_server,
+            session_name,
+            primary_agent,
+            reconnect_acp_session_id,
+            persisted_config_options,
+            session_settings,
+            restored_persisted_transcript,
+            next_turn_position,
+            next_usage_ordinal,
+            session_cwd,
+            application_mcp_enabled,
+            flow_mcp_endpoints,
+            node_token,
+            agent_defaults,
+            announce_desktop_association,
+            transient_connectivity,
+            callback_router,
+            callback_routes,
+            shared_connection,
+            shared_mcp_capabilities,
+            system_prompt_supported,
+            shared_mcp_registrations,
+        } = inputs;
         let stream_tx = self.stream_tx.clone();
         let broadcast_tx = self.broadcast_tx.clone();
         let persistence = self.persistence.clone();
         let capabilities_update_tx = self.capabilities_update_tx.clone();
+        let activity_update_tx = self.activity_update_tx.clone();
         let worker_ready_tx = self.worker_ready_tx.clone();
         let pending_permission_tx = self.pending_permission_tx.clone();
         let pending_permission_cancel_tx = self.pending_permission_cancel_tx.clone();
@@ -434,7 +531,30 @@ impl Actor {
         let (worker_jwt, worker_jti) = if let Some(node_token) = node_token {
             (node_token, None)
         } else {
-            let worker_auth = issue_worker_jwt(self.auth_service.as_ref(), SESSION_WORKER_JWT_EXPIRATION).await?;
+            let worker_auth = issue_worker_jwt(
+                self.auth_service.as_ref(),
+                discuss_session_id,
+                SESSION_WORKER_JWT_EXPIRATION,
+            )
+            .await?;
+            let subject = worker_subject(discuss_session_id);
+            if !transient_connectivity
+                && let Err(error) = persist_binding(
+                    &self.persistence,
+                    Binding {
+                        token: &worker_auth.token,
+                        subject: &subject,
+                        session_id: discuss_session_id,
+                        provider: assigned_agent_name.as_ref().map(|_| key),
+                        agent: assigned_agent_name.as_deref(),
+                        node_id: None,
+                    },
+                )
+                .await
+            {
+                revoke_worker_jti(self.auth_service.as_ref(), Some(worker_auth.jti), "identity binding").await;
+                return Err(error);
+            }
             (worker_auth.token, Some(worker_auth.jti))
         };
         let root_context = self.root_context.clone();
@@ -455,6 +575,7 @@ impl Actor {
             reconnect = reconnect_acp_session_id.is_some(),
             restored_persisted_transcript,
             next_turn_position,
+            next_usage_ordinal,
             "spawning session worker"
         );
 
@@ -463,6 +584,8 @@ impl Actor {
         let pending_elicitation_cancel_tx_for_failure = self.pending_elicitation_cancel_tx.clone();
         let worker_params = WorkerSessionParams {
             launch_config,
+            launch_meta,
+            launch_limitations,
             stream_tx,
             discuss_session_id,
             auth_launch_server: launch_server,
@@ -474,6 +597,8 @@ impl Actor {
             session_settings,
             restored_persisted_transcript,
             next_turn_position,
+            next_usage_ordinal,
+            price_index: self.price_index.clone(),
             agents_workspace,
             application_mcp_enabled,
             bus_service,
@@ -485,6 +610,7 @@ impl Actor {
             persistence,
             worker_command_rx,
             capabilities_update_tx,
+            activity_update_tx,
             worker_ready_tx,
             agent_defaults,
             pending_permission_tx,
@@ -520,6 +646,7 @@ impl Actor {
                 worker_jti,
                 command_tx: worker_command_tx,
                 join_handle,
+                active_turn: false,
                 acp_session_id: None,
                 desktop_association_requested: announce_desktop_association,
             },
@@ -532,6 +659,133 @@ impl Actor {
         }
 
         Ok(DiscussResponse::Success)
+    }
+
+    async fn prepare_session_launch(
+        &self,
+        discuss_session_id: DiscussSessionId,
+        key: &str,
+        server: &McpServer,
+        setup: Option<DiscussSessionSetup>,
+        session_cwd: Option<&PathBuf>,
+        (launch_config, explicit_config): (Option<&SessionLaunchConfig>, bool),
+    ) -> Result<SessionLaunchPreparation, DiscussError> {
+        let plugin = plugins::for_agent(key);
+        let mut launch_server = plugin.launch_server(server);
+        if let Some(provider) = self.agents.get(key) {
+            plugins::apply_managed_launch_env(plugin, &mut launch_server, provider.managed_document())?;
+        }
+        let root_default_config = SessionLaunchConfig::default();
+        let launch_workspace = Self::launch_workspace(setup.as_ref(), session_cwd, &self.agents_workspace)?;
+        if let Some(DiscussSessionSetup::TeamAtRoot { leader_id }) = setup.as_ref() {
+            self.materialize_custom_team_at_root(key, launch_workspace, leader_id)
+                .await?;
+        }
+        let restores_team_at_root = matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. }));
+        let persisted_setup_kind = Self::setup_kind_for(setup.as_ref());
+        let (assigned_agent_name, setup_settings) = self.resolve_session_setup(key, setup).await?;
+        let primary_agent = if let Some(leader_id) = assigned_agent_name.as_deref() {
+            let agent_id =
+                AgentId::try_from(leader_id.to_string()).map_err(|error| DiscussError::WorkspaceInvalidAssetId {
+                    asset_id: leader_id.to_string(),
+                    violation: error.to_string(),
+                })?;
+            Some(self.resolve_agent(&agent_id).await?)
+        } else {
+            None
+        };
+        let launch_inputs = match launch_config {
+            Some(config) => Some((config, launch_workspace)),
+            None if restores_team_at_root => Some((&root_default_config, launch_workspace)),
+            None => None,
+        };
+        let prepared = if let Some((config, _)) = launch_inputs {
+            plugin.launch_preparation(&LaunchContext::new(&self.agents_workspace, discuss_session_id), config)?
+        } else {
+            Default::default()
+        };
+        let effective_config = launch_inputs.map(|(config, _)| config.clone());
+        let mut isolated_configured = if let Some((config, workspace)) = launch_inputs {
+            let configured = plugin.configured_launch_server(&launch_server, workspace, config)?;
+            let isolated =
+                explicit_config || plugin.uses_mcp_launch_env() || configured != launch_server || restores_team_at_root;
+            launch_server = configured;
+            isolated
+        } else {
+            false
+        };
+        // A launch-argument selection names the Agent per process, so the session needs its own.
+        if let Some(agent) = &primary_agent
+            && let PrimaryAgentSelection::LaunchArguments(arguments) =
+                plugin.primary_agent_selection(&agent.selection_view())
+        {
+            let McpServer::Stdio(server) = &mut launch_server else {
+                return Err(DiscussError::Validation {
+                    message: "Launch-argument Agent selection requires a stdio ACP server".to_string(),
+                });
+            };
+            server.args.extend(arguments);
+            isolated_configured = true;
+        }
+        let agent = Self::acp_agent_from_server(&launch_server)?;
+        Ok(SessionLaunchPreparation {
+            launch_server,
+            assigned_agent_name,
+            setup_settings,
+            persisted_setup_kind,
+            primary_agent,
+            isolated_configured,
+            agent,
+            launch_meta: prepared.meta,
+            launch_limitations: prepared.limitations,
+            effective_config,
+        })
+    }
+
+    async fn load_session_restore_state(
+        &self,
+        discuss_session_id: DiscussSessionId,
+        transient_connectivity: bool,
+        reconnect: bool,
+    ) -> Result<
+        (
+            bool,
+            i64,
+            Vec<DiscussConfigOption>,
+            ConfigSettings,
+            Option<DiscussSessionSetup>,
+        ),
+        DiscussError,
+    > {
+        Ok(if transient_connectivity {
+            (false, 0, Vec::new(), ConfigSettings::new(), None)
+        } else if reconnect {
+            let conn = self.persistence.acquire_connection().await?;
+            let turns = load_discuss_chat_turns_window(&conn, &discuss_session_id.to_string()).await?;
+            let row = load_discuss_session(&conn, &discuss_session_id.to_string()).await?;
+            let next_position = turns.last().map(|turn| turn.position + 1).unwrap_or(0);
+            let persisted_config_options = row
+                .as_ref()
+                .and_then(|row| row.latest_config_options_json.as_deref())
+                .map(config_options_from_json)
+                .transpose()?
+                .unwrap_or_default();
+            let session_settings = row
+                .as_ref()
+                .and_then(|row| row.config_settings_json.as_deref())
+                .map(config_settings_from_json)
+                .transpose()?
+                .unwrap_or_default();
+            (
+                !turns.is_empty(),
+                next_position,
+                persisted_config_options,
+                session_settings,
+                row.as_ref().and_then(Self::restored_team_setup),
+            )
+        } else {
+            (false, 0, Vec::new(), ConfigSettings::new(), None)
+        })
     }
 
     /// Workspace a launch is configured against. A root-materialized Team must launch from its
@@ -550,21 +804,6 @@ impl Actor {
         }
     }
 
-    /// Setup kind persisted beside the anchor; only the root-materialized Team needs restoring.
-    fn setup_kind_for(setup: Option<&DiscussSessionSetup>) -> Option<&'static str> {
-        matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. })).then_some("team_at_root")
-    }
-
-    /// Rebuild the Team setup from an anchor row, preserving the root-materialized variant.
-    fn restored_team_setup(row: &DiscussSessionRow) -> Option<DiscussSessionSetup> {
-        let leader_id = row.team_leader_id.clone()?;
-        Some(if row.session_setup_kind.as_deref() == Some("team_at_root") {
-            DiscussSessionSetup::TeamAtRoot { leader_id }
-        } else {
-            DiscussSessionSetup::Team { leader_id }
-        })
-    }
-
     pub(super) async fn resolve_session_setup(
         &self,
         provider_name: &str,
@@ -573,6 +812,10 @@ impl Actor {
         match setup {
             None => Ok((None, ConfigSettings::new())),
             Some(DiscussSessionSetup::Provider { config_overrides }) => Ok((None, config_overrides)),
+            Some(DiscussSessionSetup::Agent { agent_id }) => {
+                self.resolve_standalone_agent_setup(provider_name, agent_id)
+                    .await
+            }
             Some(DiscussSessionSetup::TeamAtRoot { leader_id }) => Ok((Some(leader_id), ConfigSettings::new())),
             Some(DiscussSessionSetup::Team { leader_id }) => {
                 let conn = self.persistence.acquire_connection().await?;
@@ -668,6 +911,11 @@ impl Actor {
             .iter()
             .filter_map(|row| {
                 Some(DiscussSessionInfo {
+                    launch_limitations: row.launch_limitations.clone(),
+                    active_turn: DiscussSessionId::from_str(&row.discuss_session_id)
+                        .ok()
+                        .and_then(|id| self.worker_registry.get(&id))
+                        .is_some_and(|entry| !entry.join_handle.is_finished() && entry.active_turn),
                     is_task_session: row.is_task_session,
                     team_leader_id: row.team_leader_id.clone(),
                     discuss_session_id: DiscussSessionId::from_str(&row.discuss_session_id).ok()?,
@@ -763,8 +1011,16 @@ impl Actor {
         &mut self,
         discuss_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
-        let conn = self.persistence.acquire_connection().await?;
-        delete_discuss_session(&conn, &discuss_session_id.to_string()).await?;
+        let mut conn = self.persistence.acquire_connection().await?;
+        let tx = conn.transaction().await?;
+        super::mcp::clear_mcp_scope(
+            &tx,
+            super::types::CustomMcpScope::Session,
+            &discuss_session_id.to_string(),
+        )
+        .await?;
+        delete_discuss_session(&tx, &discuss_session_id.to_string()).await?;
+        tx.commit().await?;
 
         if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
             let _ = entry.command_tx.send(WorkerCommand::Stop).await;
@@ -906,6 +1162,11 @@ impl Actor {
         }
 
         let session = DiscussSessionInfo {
+            launch_limitations: row.launch_limitations,
+            active_turn: self
+                .worker_registry
+                .get(&discuss_session_id)
+                .is_some_and(|entry| !entry.join_handle.is_finished() && entry.active_turn),
             is_task_session: row.is_task_session,
             team_leader_id: row.team_leader_id,
             discuss_session_id: DiscussSessionId::from_str(&row.discuss_session_id).map_err(|_| {
@@ -1065,444 +1326,6 @@ impl Actor {
         rename_discuss_session(&conn, discuss_session_id, title).await?;
         Ok(DiscussResponse::Success)
     }
-
-    // ── New control request handlers ──────────────────────────────────────
-
-    /// Send a user turn to a live session worker.
-    pub(super) async fn handle_send_user_turn(
-        &mut self,
-        discuss_session_id: DiscussSessionId,
-        text: String,
-    ) -> Result<DiscussResponse, DiscussError> {
-        if !self.server_running {
-            return Err(DiscussError::ShuttingDown);
-        }
-        validate_user_turn(&text)?;
-        let entry = self
-            .worker_registry
-            .get(&discuss_session_id)
-            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
-        if !self
-            .provider_supervisors
-            .get(&entry.agent_name)
-            .is_some_and(ProviderSupervisor::accepts_work)
-        {
-            return Err(DiscussError::ProviderNotRunning {
-                provider_name: entry.agent_name.clone(),
-            });
-        }
-        let command_tx = entry.command_tx.clone();
-        let (reply, reply_rx) = oneshot::channel();
-        command_tx
-            .send(WorkerCommand::SendUserTurn { text, reply })
-            .await
-            .map_err(|error| channel_send_error("handle_send_user_turn.worker_command", error.to_string()))?;
-        let result = reply_rx.await.map_err(|_| DiscussError::OneshotReply)?;
-        result?;
-        Ok(DiscussResponse::Success)
-    }
-
-    /// Answer a pending permission request.
-    ///
-    /// Validates session ownership, liveness, uniqueness, and that the selected
-    /// option was actually offered before atomically removing and resolving the
-    /// pending entry. An invalid option does NOT consume the pending entry.
-    pub(super) async fn handle_answer_permission(
-        &mut self,
-        discuss_session_id: DiscussSessionId,
-        permission_request_id: PermissionRequestId,
-        option: DiscussPermissionOption,
-    ) -> Result<DiscussResponse, DiscussError> {
-        if !self.server_running {
-            return Err(DiscussError::ShuttingDown);
-        }
-        let key = (discuss_session_id, permission_request_id);
-
-        // Validate the option against the offered options before removing
-        // the pending entry. An invalid option must NOT consume the entry.
-        if let DiscussPermissionOption::Select { ref option_id } = option {
-            let pending = self
-                .pending_permissions
-                .get(&key)
-                .ok_or(DiscussError::PermissionNotFound {
-                    discuss_session_id,
-                    permission_request_id: permission_request_id.to_string(),
-                })?;
-            let selected_option_id = PermissionOptionId::new(option_id.clone());
-            if !pending
-                .offered_option_ids
-                .iter()
-                .any(|id| id == &selected_option_id)
-            {
-                return Err(DiscussError::InvalidOption {
-                    option_id: option_id.clone(),
-                });
-            }
-        }
-
-        // Atomically remove and resolve.
-        let pending = self
-            .pending_permissions
-            .remove(&key)
-            .ok_or(DiscussError::PermissionNotFound {
-                discuss_session_id,
-                permission_request_id: permission_request_id.to_string(),
-            })?;
-
-        let _ = pending.responder_tx.send(option);
-        Ok(DiscussResponse::Success)
-    }
-
-    /// Answer a pending elicitation request.
-    ///
-    /// Validation happens before removal so malformed accepted content leaves
-    /// the pending responder available for correction and resubmission.
-    pub(super) async fn handle_answer_elicitation(
-        &mut self,
-        discuss_session_id: DiscussSessionId,
-        elicitation_request_id: ElicitationRequestId,
-        answer: DiscussElicitationAnswer,
-    ) -> Result<DiscussResponse, DiscussError> {
-        if !self.server_running {
-            return Err(DiscussError::ShuttingDown);
-        }
-        let key = (discuss_session_id, elicitation_request_id);
-        let pending = self
-            .pending_elicitations
-            .get(&key)
-            .ok_or(DiscussError::ElicitationRequestNotPending {
-                discuss_session_id,
-                elicitation_request_id,
-            })?;
-
-        if let DiscussElicitationAnswer::Accept { content } = &answer {
-            validate_elicitation_content(&pending.classification, content)?;
-        }
-
-        let pending = self
-            .pending_elicitations
-            .remove(&key)
-            .ok_or(DiscussError::ElicitationAlreadyAnswered {
-                discuss_session_id,
-                elicitation_request_id,
-            })?;
-        self.persist_elicitation_turn(discuss_session_id, elicitation_request_id, &pending, &answer);
-        let _ = pending.responder_tx.send(answer);
-        Ok(DiscussResponse::Success)
-    }
-
-    /// Cancel one pending elicitation request.
-    pub(super) async fn handle_cancel_elicitation(
-        &mut self,
-        discuss_session_id: DiscussSessionId,
-        elicitation_request_id: ElicitationRequestId,
-    ) -> Result<DiscussResponse, DiscussError> {
-        if !self.server_running {
-            return Err(DiscussError::ShuttingDown);
-        }
-        self.cancel_pending_elicitation_entry(discuss_session_id, elicitation_request_id);
-        Ok(DiscussResponse::Success)
-    }
-
-    /// Cancel the active turn for a session.
-    pub(super) async fn handle_cancel_turn(
-        &mut self,
-        discuss_session_id: DiscussSessionId,
-    ) -> Result<DiscussResponse, DiscussError> {
-        self.cancel_pending_permissions_for_session(&discuss_session_id);
-        self.cancel_pending_elicitations_for_session(&discuss_session_id);
-
-        if !self.server_running {
-            return Err(DiscussError::ShuttingDown);
-        }
-        let Some(entry) = self.worker_registry.get(&discuss_session_id) else {
-            return Ok(DiscussResponse::Success);
-        };
-        let command_tx = entry.command_tx.clone();
-        let (reply, reply_rx) = oneshot::channel();
-        if command_tx
-            .send(WorkerCommand::CancelTurn { reply })
-            .await
-            .is_err()
-        {
-            self.recover_cancel_turn_worker(
-                discuss_session_id,
-                channel_send_error("handle_cancel_turn.worker_command", "worker command channel closed"),
-            )
-            .await;
-            return Ok(DiscussResponse::Success);
-        }
-        match tokio::time::timeout(CANCEL_TURN_DEADLINE, reply_rx).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => return Err(error),
-            Ok(Err(_)) => {
-                self.recover_cancel_turn_worker(discuss_session_id, DiscussError::OneshotReply)
-                    .await;
-            }
-            Err(_) => {
-                self.recover_cancel_turn_worker(
-                    discuss_session_id,
-                    DiscussError::WorkerStopTimeout { discuss_session_id },
-                )
-                .await;
-            }
-        }
-
-        Ok(DiscussResponse::Success)
-    }
-
-    /// Cancel and close a session.
-    pub(super) async fn handle_cancel_session(
-        &mut self,
-        discuss_session_id: DiscussSessionId,
-    ) -> Result<DiscussResponse, DiscussError> {
-        if !self.server_running {
-            return Err(DiscussError::ShuttingDown);
-        }
-        let cancel_result = if self.worker_registry.contains_key(&discuss_session_id) {
-            self.handle_cancel_turn(discuss_session_id)
-                .await
-                .map(|_| ())
-        } else {
-            Ok(())
-        };
-        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
-            let _ = entry.command_tx.send(WorkerCommand::Stop).await;
-            revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "session cancellation").await;
-        }
-        self.worker_capabilities.remove(&discuss_session_id);
-
-        self.cancel_pending_permissions_for_session(&discuss_session_id);
-        self.cancel_pending_elicitations_for_session(&discuss_session_id);
-
-        cancel_result?;
-        Ok(DiscussResponse::Success)
-    }
-
-    pub(super) async fn handle_reserve_inspector(
-        &mut self,
-        parent_session_id: DiscussSessionId,
-        child_session_id: String,
-    ) -> Result<DiscussResponse, DiscussError> {
-        let parent = self
-            .worker_registry
-            .get(&parent_session_id)
-            .ok_or(DiscussError::SessionNotFound {
-                discuss_session_id: parent_session_id,
-            })?;
-        let provider_name = parent.agent_name.clone();
-        if !self
-            .provider_supervisors
-            .get(&provider_name)
-            .is_some_and(ProviderSupervisor::accepts_work)
-        {
-            return Err(DiscussError::ProviderNotRunning { provider_name });
-        }
-        let plugin = plugins::for_agent(&provider_name);
-        if !plugin.supports_child_session_load() {
-            return Err(DiscussError::InspectorUnavailable { provider_name });
-        }
-        let viewer_session_id = DiscussSessionId::new();
-        let binding = InspectorBinding {
-            viewer_session_id,
-            parent_session_id,
-            child_session_id: child_session_id.clone(),
-        };
-        self.inspector_bindings
-            .insert(viewer_session_id, binding.clone());
-        Ok(DiscussResponse::ReserveInspector { binding })
-    }
-
-    pub(super) async fn handle_start_inspector(
-        &mut self,
-        viewer_session_id: DiscussSessionId,
-    ) -> Result<DiscussResponse, DiscussError> {
-        let binding = self
-            .inspector_bindings
-            .get(&viewer_session_id)
-            .cloned()
-            .ok_or(DiscussError::SessionNotFound {
-                discuss_session_id: viewer_session_id,
-            })?;
-        let parent = self
-            .worker_registry
-            .get(&binding.parent_session_id)
-            .ok_or(DiscussError::SessionNotFound {
-                discuss_session_id: binding.parent_session_id,
-            })?;
-        if !self
-            .provider_supervisors
-            .get(&parent.agent_name)
-            .is_some_and(ProviderSupervisor::accepts_work)
-        {
-            return Err(DiscussError::ProviderNotRunning {
-                provider_name: parent.agent_name.clone(),
-            });
-        }
-        let (reply, reply_rx) = oneshot::channel();
-        parent
-            .command_tx
-            .clone()
-            .send(WorkerCommand::AttachInspector {
-                viewer_session_id,
-                child_session_id: SessionId::from(binding.child_session_id),
-                reply,
-            })
-            .await
-            .map_err(|error| channel_send_error("handle_start_inspector.worker_command", error.to_string()))?;
-        reply_rx.await.map_err(|_| DiscussError::OneshotReply)??;
-        Ok(DiscussResponse::Success)
-    }
-
-    pub(super) async fn handle_dispose_inspector(
-        &mut self,
-        viewer_session_id: DiscussSessionId,
-    ) -> Result<DiscussResponse, DiscussError> {
-        let Some(binding) = self.inspector_bindings.remove(&viewer_session_id) else {
-            return Err(DiscussError::SessionNotFound {
-                discuss_session_id: viewer_session_id,
-            });
-        };
-        self.disposing_inspectors.insert(binding.viewer_session_id);
-        self.cancel_pending_permissions_for_session(&viewer_session_id);
-        self.cancel_pending_elicitations_for_session(&viewer_session_id);
-        self.worker_capabilities.remove(&viewer_session_id);
-        let detach_result = if let Some(parent) = self.worker_registry.get(&binding.parent_session_id) {
-            let (reply, reply_rx) = oneshot::channel();
-            let send_result = parent
-                .command_tx
-                .clone()
-                .send(WorkerCommand::DisposeInspector {
-                    viewer_session_id,
-                    reply,
-                })
-                .await
-                .map_err(|error| channel_send_error("handle_dispose_inspector.worker_command", error.to_string()));
-            match send_result {
-                Ok(()) => reply_rx
-                    .await
-                    .map_err(|_| DiscussError::OneshotReply)
-                    .and_then(|result| result),
-                Err(error) => Err(error),
-            }
-        } else {
-            Ok(())
-        };
-        self.disposing_inspectors.remove(&binding.viewer_session_id);
-        detach_result?;
-        Ok(DiscussResponse::Success)
-    }
-    /// Remove a cancellation worker that can no longer acknowledge commands and
-    /// publish the same terminal failure path used by normal worker failures.
-    async fn recover_cancel_turn_worker(&mut self, discuss_session_id: DiscussSessionId, error: DiscussError) {
-        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
-            entry.join_handle.abort();
-            revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "cancel-turn recovery").await;
-        }
-        self.worker_capabilities.remove(&discuss_session_id);
-        self.cancel_pending_permissions_for_session(&discuss_session_id);
-
-        if let Err(send_error) = self
-            .stream_tx
-            .send(DiscussStreamEvent::SessionFailed {
-                discuss_session_id,
-                error,
-                terminal_auth_methods: Vec::new(),
-            })
-            .await
-        {
-            tracing::warn!(
-                target: "application_acp",
-                ?send_error,
-                "cancellation worker recovery could not reach the desktop bridge"
-            );
-        }
-    }
-
-    /// Cancel all pending permissions for a given session.
-    pub(super) fn cancel_pending_permissions_for_session(&mut self, discuss_session_id: &DiscussSessionId) {
-        let keys_to_remove: Vec<_> = self
-            .pending_permissions
-            .keys()
-            .filter(|(sid, _)| sid == discuss_session_id)
-            .cloned()
-            .collect();
-        for key in keys_to_remove {
-            if let Some(perm) = self.pending_permissions.remove(&key) {
-                let _ = perm.responder_tx.send(DiscussPermissionOption::Cancel);
-            }
-        }
-    }
-
-    fn cancel_pending_elicitation_entry(
-        &mut self,
-        discuss_session_id: DiscussSessionId,
-        elicitation_request_id: ElicitationRequestId,
-    ) {
-        let key = (discuss_session_id, elicitation_request_id);
-        if let Some(pending) = self.pending_elicitations.remove(&key) {
-            self.persist_cancelled_elicitation(discuss_session_id, elicitation_request_id, &pending);
-            let _ = pending.responder_tx.send(DiscussElicitationAnswer::Cancel);
-        }
-    }
-
-    fn persist_elicitation_turn(
-        &self,
-        discuss_session_id: DiscussSessionId,
-        elicitation_request_id: ElicitationRequestId,
-        pending: &PendingElicitation,
-        answer: &DiscussElicitationAnswer,
-    ) {
-        let persistence = self.persistence.clone();
-        let pending = ElicitationPersistenceInput {
-            position: pending.position,
-            message: pending.raw_request.message.clone(),
-        };
-        let session_id = discuss_session_id.to_string();
-        let request_id = elicitation_request_id.to_string();
-        let answer = answer.clone();
-        tokio::spawn(async move {
-            if let Err(error) =
-                persist_elicitation_turn_inner(&persistence, &session_id, &request_id, pending, answer).await
-            {
-                tracing::warn!(?error, "Discuss worker: failed to persist elicitation turn");
-            }
-        });
-    }
-
-    pub(super) fn persist_cancelled_elicitation(
-        &self,
-        discuss_session_id: DiscussSessionId,
-        elicitation_request_id: ElicitationRequestId,
-        pending: &PendingElicitation,
-    ) {
-        self.persist_elicitation_turn(
-            discuss_session_id,
-            elicitation_request_id,
-            pending,
-            &DiscussElicitationAnswer::Cancel,
-        );
-    }
-
-    /// Cancel all pending elicitations for a session.
-    pub(super) fn cancel_pending_elicitations_for_session(&mut self, discuss_session_id: &DiscussSessionId) {
-        let keys_to_remove: Vec<_> = self
-            .pending_elicitations
-            .keys()
-            .filter(|(sid, _)| sid == discuss_session_id)
-            .cloned()
-            .collect();
-        for (session_id, request_id) in keys_to_remove {
-            self.cancel_pending_elicitation_entry(session_id, request_id);
-        }
-    }
-
-    pub(super) fn cancel_pending_elicitations_for_session_all(&mut self) {
-        let keys_to_remove: Vec<_> = self.pending_elicitations.keys().cloned().collect();
-        for (session_id, request_id) in keys_to_remove {
-            self.cancel_pending_elicitation_entry(session_id, request_id);
-        }
-    }
 }
 
 #[expect(
@@ -1659,6 +1482,7 @@ mod team_at_root_setup_tests {
             session_cwd_json: None,
             session_mcp_enabled: None,
             session_launch_config_json: None,
+            launch_limitations: Vec::new(),
             session_setup_kind: setup_kind.map(str::to_string),
             team_leader_id: team_leader_id.map(str::to_string),
             discuss_session_id: "00000000-0000-0000-0000-000000000001".to_string(),

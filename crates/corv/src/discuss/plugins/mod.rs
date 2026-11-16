@@ -6,25 +6,59 @@
 mod antigravity;
 mod claude;
 mod codex;
+mod files;
 mod grok;
+mod launch;
 mod opencode;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use agent_client_protocol::v1::schema::{
     McpServer, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions,
 };
 
+use super::assets::markdown_metadata;
 use super::library::{
-    AgentDefinition, AgentId, AssetLibrary, SkillBundleFile, SkillDefinition, SkillId, TeamDefinition,
+    AgentDefinition, AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
+    SkillBundleFile, SkillDefinition, SkillId, TeamDefinition,
 };
 use super::types::{
     DiscussConfigOption, DiscussConfigOptionValue, DiscussError, DiscussMemberOverrides, DiscussUtilityPayload,
-    SessionLaunchConfig,
+    LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, LaunchPermissionOutcome, SessionLaunchConfig,
 };
+use super::usage::{DiscussUsageEvidence, UsageCaptureEvent, capture_standard_usage};
+use files::{RenderedFile, write_rendered_files};
+pub(super) use launch::{LaunchContext, LaunchPreparation, LaunchSelections, intersect_rules, merge_metadata};
+
+/// Input category bit, shared by guaranteed and incomplete category masks.
+pub(super) const BILLING_INPUT: u8 = 1 << 0;
+/// Output token category.
+pub(super) const BILLING_OUTPUT: u8 = 1 << 1;
+/// Thought token category (included in output for billing).
+pub(super) const BILLING_THOUGHT: u8 = 1 << 2;
+/// Cache-read token category.
+pub(super) const BILLING_CACHED_READ: u8 = 1 << 3;
+/// Cache-write token category.
+pub(super) const BILLING_CACHED_WRITE: u8 = 1 << 4;
+/// Total token category.
+pub(super) const BILLING_TOTAL: u8 = 1 << 5;
+
+/// Verified category requirements and cache treatment for pricing.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct BillingCategorySemantics {
+    pub guaranteed_categories: u8,
+    pub input_includes_cache: Option<bool>,
+}
+
+impl BillingCategorySemantics {
+    /// Whether a provider has declared its input/cache billing relationship.
+    pub(super) fn declared(self) -> bool {
+        self.input_includes_cache.is_some()
+    }
+}
 
 use antigravity::{ANTIGRAVITY_PLUGIN_NAME, PLUGIN as ANTIGRAVITY_AGENT_PLUGIN};
 use claude::{CLAUDE_PLUGIN_NAME, PLUGIN as CLAUDE_AGENT_PLUGIN};
@@ -38,6 +72,28 @@ use opencode::{OPENCODE_PLUGIN_NAME, OpenCodeCaptureState, PLUGIN as OPENCODE_AG
 /// present only when a Team member has an explicit, non-default override.
 pub type ConfigSettings = BTreeMap<String, String>;
 
+pub(super) fn append_installed_instructions(
+    plugin: &dyn DiscussAgentPlugin,
+    root: &Path,
+    path: &Path,
+    instructions: &str,
+    agent: bool,
+) -> Result<(), DiscussError> {
+    let path = root.join(path);
+    let capture_error = |error: std::io::Error| DiscussError::WorkspaceIo {
+        plugin: plugin.workspace_label().to_owned(),
+        path: path.to_string_lossy().into_owned(),
+        message: error.to_string(),
+    };
+    let rendered = std::fs::read_to_string(&path).map_err(&capture_error)?;
+    let contents = if agent {
+        plugin.append_agent_instructions(&rendered, instructions)?
+    } else {
+        format!("{rendered}\n\n{instructions}")
+    };
+    std::fs::write(&path, contents).map_err(capture_error)
+}
+
 static DEFAULT_PLUGIN: DefaultAgentPlugin = DefaultAgentPlugin;
 
 const DEFAULT_PLUGIN_NAME: &str = "default";
@@ -45,6 +101,74 @@ const DEFAULT_AGENTS_DIRECTORY: &str = ".agents/agents";
 const DEFAULT_SKILLS_DIRECTORY: &str = ".agents/skills";
 
 struct DefaultAgentPlugin;
+
+/// Provider-owned configuration and its validation boundary.
+pub enum ManagedConfig {
+    WorkspaceFile {
+        plugin: &'static str,
+        path: &'static str,
+        default: fn() -> Result<String, DiscussError>,
+        validate: fn(&str) -> Result<(), DiscussError>,
+    },
+    LaunchEnv {
+        env_name: &'static str,
+        default: fn() -> Result<String, DiscussError>,
+        validate: fn(&str) -> Result<(), DiscussError>,
+    },
+}
+
+impl ManagedConfig {
+    pub(super) fn document(&self, document: Option<&str>) -> Result<String, DiscussError> {
+        let (default, validate) = match self {
+            Self::WorkspaceFile { default, validate, .. } | Self::LaunchEnv { default, validate, .. } => {
+                (default, validate)
+            }
+        };
+        let document = match document {
+            Some(document) => document.to_owned(),
+            None => default()?,
+        };
+        validate(&document)?;
+        Ok(document)
+    }
+}
+
+pub(super) fn apply_managed_launch_env(
+    plugin: &dyn DiscussAgentPlugin,
+    server: &mut McpServer,
+    document: Option<&str>,
+) -> Result<(), DiscussError> {
+    if let Some(config @ ManagedConfig::LaunchEnv { .. }) = plugin.managed_config() {
+        let value = config.document(document).or_else(|error| match error {
+            DiscussError::ManagedConfigValidation { .. } => config.document(None),
+            error => Err(error),
+        })?;
+        if let ManagedConfig::LaunchEnv { env_name, .. } = config
+            && let McpServer::Stdio(server) = server
+        {
+            server.env.retain(|entry| entry.name != env_name);
+            server
+                .env
+                .push(agent_client_protocol::v1::schema::EnvVariable::new(env_name, value));
+        }
+    }
+    Ok(())
+}
+
+fn json_object(plugin: &str, document: &str) -> Result<serde_json::Value, DiscussError> {
+    let value: serde_json::Value =
+        serde_json::from_str(document).map_err(|error| DiscussError::ManagedConfigValidation {
+            plugin: plugin.to_owned(),
+            reason: error.to_string(),
+        })?;
+    if !value.is_object() {
+        return Err(DiscussError::ManagedConfigValidation {
+            plugin: plugin.to_owned(),
+            reason: "expected a JSON object".to_owned(),
+        });
+    }
+    Ok(value)
+}
 
 /// Mutable, worker-local state used only by plugins whose utility payloads
 /// arrive over multiple ACP updates.
@@ -117,9 +241,21 @@ impl DiscussAgentPlugin for DefaultAgentPlugin {
         "plugin.default"
     }
 
-    fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
+    fn render_agent(
+        &self,
+        library: AssetLibrary,
+        agent_id: &AgentId,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<Vec<RenderedFile>, DiscussError> {
         let agent = resolve_agent(library, agent_id)?;
-        install_agent_file(root, agent, None)
+        Ok(vec![render_agent_file(
+            &AgentSelectionView::from_builtin(agent),
+            member_settings,
+        )?])
+    }
+
+    fn workspace_label(&self) -> &'static str {
+        DEFAULT_PLUGIN_NAME
     }
 
     fn destroy_agent(&self, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
@@ -128,44 +264,8 @@ impl DiscussAgentPlugin for DefaultAgentPlugin {
         remove_file(DEFAULT_PLUGIN_NAME, root, &relative_path)
     }
 
-    fn install_team_member(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        agent_id: &AgentId,
-        member_settings: Option<&ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        let agent = resolve_agent(library, agent_id)?;
-        install_agent_file(root, agent, member_settings)
-    }
-
-    fn install_team_with_member_overrides(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        team: &TeamDefinition,
-        member_settings: &BTreeMap<AgentId, ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        install_team_member(library, self, root, &team.leader, member_settings.get(&team.leader))?;
-        for follower in &team.followers {
-            install_team_member(library, self, root, follower, member_settings.get(follower))?;
-        }
-        for skill_id in &team.skills {
-            let skill = resolve_skill(library, skill_id)?;
-            self.install_skill(root, skill)?;
-        }
-        Ok(())
-    }
-
-    fn install_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
-        for file in &skill.bundle {
-            let relative_path = Path::new(DEFAULT_SKILLS_DIRECTORY)
-                .join(skill.id.normalized_destination())
-                .join(file.relative_path);
-            let contents = render_skill_file(DEFAULT_PLUGIN_NAME, &relative_path, skill, file)?;
-            write_file(DEFAULT_PLUGIN_NAME, root, &relative_path, &contents)?;
-        }
-        Ok(())
+    fn render_skill(&self, skill: &SkillDefinition) -> Result<Vec<RenderedFile>, DiscussError> {
+        Self::render_portable_skill(skill)
     }
 
     fn destroy_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
@@ -179,8 +279,21 @@ impl DiscussAgentPlugin for DefaultAgentPlugin {
     }
 }
 
-pub fn install_default_skill(root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
-    DEFAULT_PLUGIN.install_skill(root, skill)
+impl DefaultAgentPlugin {
+    pub(super) fn render_portable_skill(skill: &SkillDefinition) -> Result<Vec<RenderedFile>, DiscussError> {
+        let mut files = Vec::new();
+        for file in &skill.bundle {
+            let relative_path = Path::new(DEFAULT_SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(file.relative_path);
+            let contents = render_skill_file(DEFAULT_PLUGIN_NAME, &relative_path, skill, file)?;
+            files.push(RenderedFile {
+                relative_path,
+                contents,
+            });
+        }
+        Ok(files)
+    }
 }
 
 pub fn destroy_default_skill(root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
@@ -193,13 +306,31 @@ pub fn render_skill_file(
     skill: &SkillDefinition,
     file: &SkillBundleFile,
 ) -> Result<String, DiscussError> {
-    if file.relative_path != "SKILL.md" {
-        return Ok(file.contents.to_string());
+    render_skill_contents(
+        plugin_name,
+        relative_path,
+        &skill.id,
+        skill.description,
+        file.relative_path,
+        file.contents,
+    )
+}
+
+fn render_skill_contents(
+    plugin_name: &str,
+    relative_path: &Path,
+    id: &SkillId,
+    description: &str,
+    file_path: &str,
+    contents: &str,
+) -> Result<String, DiscussError> {
+    if file_path != "SKILL.md" {
+        return Ok(contents.to_string());
     }
 
     let yaml = yaml_serde::to_string(&SkillFrontmatter {
-        name: skill.id.normalized_destination(),
-        description: skill.description,
+        name: id.normalized_destination(),
+        description,
     })
     .map_err(|source| DiscussError::WorkspaceSerialize {
         plugin: plugin_name.to_string(),
@@ -208,14 +339,13 @@ pub fn render_skill_file(
         message: source.to_string(),
     })?;
 
-    Ok(format!("---\n{yaml}---\n\n{}", file.contents))
+    Ok(format!("---\n{yaml}---\n\n{contents}"))
 }
 
-fn install_agent_file(
-    root: &Path,
-    agent: &AgentDefinition,
+fn render_agent_file(
+    agent: &AgentSelectionView<'_>,
     member_settings: Option<&ConfigSettings>,
-) -> Result<(), DiscussError> {
+) -> Result<RenderedFile, DiscussError> {
     let relative_path = Path::new(DEFAULT_AGENTS_DIRECTORY).join(format!("{}.md", agent.id.normalized_destination()));
     let yaml = yaml_serde::to_string(&DefaultAgentFrontmatter {
         name: agent.id.as_ref(),
@@ -228,12 +358,10 @@ fn install_agent_file(
         format: "yaml".to_string(),
         message: source.to_string(),
     })?;
-    write_file(
-        DEFAULT_PLUGIN_NAME,
-        root,
-        &relative_path,
-        &format!("---\n{yaml}---\n\n{}", agent.body),
-    )
+    Ok(RenderedFile {
+        relative_path,
+        contents: format!("---\n{yaml}---\n\n{}", agent.body),
+    })
 }
 
 /// Resolve an installed provider to its plugin. Unknown/custom providers use
@@ -263,6 +391,20 @@ pub(super) fn default_workspace_copy_source(provider_name: &str) -> Option<&'sta
 
 /// Provider-neutral contract used by the Discuss actor.
 pub trait DiscussAgentPlugin: Sync {
+    /// Capture standard ACP usage, with provider-specific extensions as overrides.
+    fn capture_usage_evidence(&self, event: &UsageCaptureEvent<'_>) -> Option<DiscussUsageEvidence> {
+        capture_standard_usage(event)
+    }
+
+    /// Return source-verified billing rules, or no declared semantics.
+    fn billing_semantics(&self) -> BillingCategorySemantics {
+        BillingCategorySemantics::default()
+    }
+
+    /// Return the provider's exact models.dev identifier, if known.
+    fn models_dev_provider_id(&self) -> Option<&'static str> {
+        None
+    }
     /// Declares the Provider's connection ownership model.
     ///
     /// Unverified Providers default to isolated connections; implementations
@@ -329,6 +471,11 @@ pub trait DiscussAgentPlugin: Sync {
         server.clone()
     }
 
+    /// Whether custom MCP descriptors are translated into the launch environment.
+    fn uses_mcp_launch_env(&self) -> bool {
+        false
+    }
+
     /// Return an isolated launch when a Team requires workspace-local assets.
     fn team_launch_server(&self, _server: &McpServer, _workspace: &Path) -> Result<Option<McpServer>, DiscussError> {
         Ok(None)
@@ -337,19 +484,57 @@ pub trait DiscussAgentPlugin: Sync {
     /// Apply explicitly supplied session configuration to a private process.
     fn configured_launch_server(
         &self,
-        _server: &McpServer,
+        server: &McpServer,
         _workspace: &Path,
         _config: &SessionLaunchConfig,
     ) -> Result<McpServer, DiscussError> {
-        Err(DiscussError::Validation {
-            message: "Provider does not support session launch configuration".to_string(),
+        Ok(server.clone())
+    }
+
+    /// Prepare session metadata and disclose settings that remain inherited.
+    fn launch_preparation(
+        &self,
+        _context: &LaunchContext,
+        config: &SessionLaunchConfig,
+    ) -> Result<LaunchPreparation, DiscussError> {
+        let mut limitations = Vec::new();
+        if let Some(rules) = intersect_rules(&config.rule_sources) {
+            for rule in rules.rules {
+                limitations.push(LaunchLimitation {
+                    subject: LaunchLimitationSubject::Permission {
+                        operation: rule.operation,
+                        requested: rule.effect,
+                        actual: LaunchPermissionOutcome::Inherited,
+                    },
+                    reason: LaunchLimitationReason::InheritedUnverifiedConfiguration,
+                });
+            }
+        }
+        for index in 0..config.plugin_references.len() {
+            limitations.push(LaunchLimitation {
+                subject: LaunchLimitationSubject::PluginReference { index },
+                reason: LaunchLimitationReason::UnsupportedPluginReference,
+            });
+        }
+        Ok(LaunchPreparation {
+            meta: None,
+            limitations,
         })
+    }
+
+    /// Select settings after the final provider options are advertised.
+    fn launch_option_selections(
+        &self,
+        _config: &SessionLaunchConfig,
+        _options: &[DiscussConfigOption],
+    ) -> LaunchSelections {
+        LaunchSelections::default()
     }
 
     /// Choose how this Provider selects an installed Agent as a session's primary agent.
     ///
     /// Unverified Providers use the standard ACP session system prompt.
-    fn primary_agent_selection(&self, agent: &AgentDefinition) -> PrimaryAgentSelection {
+    fn primary_agent_selection(&self, agent: &AgentSelectionView<'_>) -> PrimaryAgentSelection {
         let _ = agent;
         PrimaryAgentSelection::SystemPrompt
     }
@@ -370,18 +555,88 @@ pub trait DiscussAgentPlugin: Sync {
         "plugin.default"
     }
 
+    /// Workspace-relative path of the installed agent file.
+    fn installed_agent_path(&self, id: &AgentId) -> PathBuf {
+        Path::new(DEFAULT_AGENTS_DIRECTORY).join(format!("{}.md", id.normalized_destination()))
+    }
+
+    /// Workspace-relative path of the installed skill's instructions file.
+    fn installed_skill_path(&self, id: &SkillId) -> PathBuf {
+        Path::new(DEFAULT_SKILLS_DIRECTORY)
+            .join(id.normalized_destination())
+            .join("SKILL.md")
+    }
+
+    /// Append instructions to a freshly rendered agent file.
+    fn append_agent_instructions(&self, rendered: &str, instructions: &str) -> Result<String, DiscussError> {
+        Ok(format!("{rendered}\n\n{instructions}"))
+    }
+
+    /// Describe the Provider's managed configuration, if supported.
+    fn managed_config(&self) -> Option<ManagedConfig> {
+        None
+    }
+
     /// Materialize this Provider's shared configuration in the Agent workspace.
-    fn install_config(&self, _root: &Path) -> Result<(), DiscussError> {
+    fn install_config(&self, root: &Path, document: Option<&str>) -> Result<(), DiscussError> {
+        match self.managed_config() {
+            Some(ManagedConfig::WorkspaceFile {
+                plugin,
+                path,
+                default,
+                validate,
+            }) => {
+                let document = match document {
+                    Some(document) => document.to_owned(),
+                    None => default()?,
+                };
+                validate(&document)?;
+                write_rendered_files(
+                    plugin,
+                    root,
+                    &[RenderedFile {
+                        relative_path: Path::new(path).to_path_buf(),
+                        contents: document,
+                    }],
+                )?;
+            }
+            Some(ManagedConfig::LaunchEnv {
+                env_name: _,
+                default,
+                validate,
+            }) => {
+                let document = match document {
+                    Some(document) => document.to_owned(),
+                    None => default()?,
+                };
+                validate(&document)?;
+            }
+            None => {}
+        }
         Ok(())
     }
 
     /// Remove this Provider's shared configuration from the Agent workspace.
-    fn remove_config(&self, _root: &Path) -> Result<(), DiscussError> {
+    fn remove_config(&self, root: &Path) -> Result<(), DiscussError> {
+        if let Some(ManagedConfig::WorkspaceFile { plugin, path, .. }) = self.managed_config() {
+            remove_file(plugin, root, Path::new(path))?;
+        }
         Ok(())
     }
 
-    /// Materialize one canonical Agent in this provider's workspace.
-    fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError>;
+    /// Render one canonical agent without writing it.
+    fn render_agent(
+        &self,
+        library: AssetLibrary,
+        agent_id: &AgentId,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<Vec<RenderedFile>, DiscussError>;
+
+    /// Render one complete skill bundle without writing it.
+    fn render_skill(&self, skill: &SkillDefinition) -> Result<Vec<RenderedFile>, DiscussError>;
+
+    /// Label used for workspace I/O failures.
+    fn workspace_label(&self) -> &'static str;
 
     /// Remove one canonical Agent from this provider's workspace.
     fn destroy_agent(&self, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError>;
@@ -390,24 +645,39 @@ pub trait DiscussAgentPlugin: Sync {
     fn install_team_with_member_overrides(
         &self,
         library: AssetLibrary,
-        _root: &Path,
+        root: &Path,
         team: &TeamDefinition,
         member_settings: &BTreeMap<AgentId, ConfigSettings>,
-    ) -> Result<(), DiscussError>;
+    ) -> Result<(), DiscussError> {
+        let mut files = Vec::new();
+        for id in std::iter::once(&team.leader).chain(&team.followers) {
+            let settings = member_settings
+                .get(id)
+                .filter(|settings| !settings.is_empty());
+            files.extend(self.render_agent(library, id, settings)?);
+        }
+        for id in &team.skills {
+            files.extend(self.render_skill(resolve_skill(library, id)?)?);
+        }
+        write_rendered_files(self.workspace_label(), root, &files)
+    }
 
     /// Materialize one Team member through the Team-only configuration path.
     ///
-    /// Empty settings mean Default and must remain config-free. Concrete
-    /// plugins override this method to render non-empty actor-resolved
-    /// settings in their native Agent format.
+    /// Empty settings mean Default and must remain config-free.
     fn install_team_member(
         &self,
         library: AssetLibrary,
         root: &Path,
         agent_id: &AgentId,
-        _member_settings: Option<&ConfigSettings>,
+        member_settings: Option<&ConfigSettings>,
     ) -> Result<(), DiscussError> {
-        self.install_agent(library, root, agent_id)
+        let settings = member_settings.filter(|settings| !settings.is_empty());
+        write_rendered_files(
+            self.workspace_label(),
+            root,
+            &self.render_agent(library, agent_id, settings)?,
+        )
     }
 
     /// Remove a canonical Team while retaining assets shared by another Team.
@@ -437,10 +707,62 @@ pub trait DiscussAgentPlugin: Sync {
     }
 
     /// Materialize one canonical Skill bundle.
-    fn install_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError>;
+    fn install_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
+        write_rendered_files(self.workspace_label(), root, &self.render_skill(skill)?)
+    }
 
     /// Remove one canonical Skill bundle.
     fn destroy_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError>;
+
+    /// Materialize an owned agent using the default workspace layout.
+    fn install_custom_agent(
+        &self,
+        root: &Path,
+        agent: &CustomAgentDefinition,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<(), DiscussError> {
+        let file = render_agent_file(&AgentSelectionView::from_custom(agent), member_settings)?;
+        write_rendered_files(DEFAULT_PLUGIN_NAME, root, &[file])
+    }
+
+    /// Materialize an owned skill using the default workspace layout.
+    fn install_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        let mut files = Vec::new();
+        for file in &skill.bundle {
+            let path = Path::new(DEFAULT_SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            let body = if file.relative_path == "SKILL.md" {
+                markdown_metadata(&file.contents)?.2
+            } else {
+                &file.contents
+            };
+            let contents = render_skill_contents(
+                DEFAULT_PLUGIN_NAME,
+                &path,
+                &skill.id,
+                &skill.description,
+                &file.relative_path,
+                body,
+            )?;
+            files.push(RenderedFile {
+                relative_path: path,
+                contents,
+            });
+        }
+        write_rendered_files(DEFAULT_PLUGIN_NAME, root, &files)
+    }
+
+    /// Remove an owned skill using the default workspace layout.
+    fn destroy_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        for file in &skill.bundle {
+            let path = Path::new(DEFAULT_SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            remove_file(DEFAULT_PLUGIN_NAME, root, &path)?;
+        }
+        Ok(())
+    }
 
     /// Normalize initial provider configuration into the canonical menu.
     fn initial_config_options(
@@ -546,17 +868,6 @@ pub trait DiscussAgentPlugin: Sync {
     }
 }
 
-fn install_team_member(
-    library: AssetLibrary,
-    plugin: &dyn DiscussAgentPlugin,
-    root: &Path,
-    agent_id: &AgentId,
-    member_settings: Option<&ConfigSettings>,
-) -> Result<(), DiscussError> {
-    let member_settings = member_settings.filter(|settings| !settings.is_empty());
-    plugin.install_team_member(library, root, agent_id, member_settings)
-}
-
 pub fn member_settings_for_team(
     overrides: DiscussMemberOverrides,
 ) -> Result<BTreeMap<AgentId, ConfigSettings>, DiscussError> {
@@ -616,22 +927,6 @@ pub fn resolve_skill(library: AssetLibrary, skill_id: &SkillId) -> Result<&'stat
         })
 }
 
-fn write_file(plugin: &str, root: &Path, relative_path: &Path, contents: &str) -> Result<(), DiscussError> {
-    let path = root.join(relative_path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| DiscussError::WorkspaceIo {
-            plugin: plugin.to_string(),
-            path: path.to_string_lossy().into_owned(),
-            message: error.to_string(),
-        })?;
-    }
-    std::fs::write(&path, contents).map_err(|error| DiscussError::WorkspaceIo {
-        plugin: plugin.to_string(),
-        path: path.to_string_lossy().into_owned(),
-        message: error.to_string(),
-    })
-}
-
 fn remove_file(plugin: &str, root: &Path, relative_path: &Path) -> Result<(), DiscussError> {
     let path = root.join(relative_path);
     match std::fs::remove_file(&path) {
@@ -664,30 +959,30 @@ mod tests {
     fn every_plugin_owns_its_primary_agent_selection() {
         let agent = test_library::library().agents_for().next().expect("agent");
         assert_eq!(
-            for_agent(ANTIGRAVITY_PLUGIN_NAME).primary_agent_selection(agent),
+            for_agent(ANTIGRAVITY_PLUGIN_NAME).primary_agent_selection(&AgentSelectionView::from_builtin(agent)),
             PrimaryAgentSelection::LaunchArguments(vec!["--agent".to_string(), agent.id.to_string()])
         );
         assert_eq!(
-            for_agent(CLAUDE_PLUGIN_NAME).primary_agent_selection(agent),
+            for_agent(CLAUDE_PLUGIN_NAME).primary_agent_selection(&AgentSelectionView::from_builtin(agent)),
             PrimaryAgentSelection::ConfigOption("agent")
         );
         assert_eq!(
-            for_agent(CODEX_PLUGIN_NAME).primary_agent_selection(agent),
+            for_agent(CODEX_PLUGIN_NAME).primary_agent_selection(&AgentSelectionView::from_builtin(agent)),
             PrimaryAgentSelection::SystemPrompt
         );
         assert_eq!(
-            for_agent(GROK_PLUGIN_NAME).primary_agent_selection(agent),
+            for_agent(GROK_PLUGIN_NAME).primary_agent_selection(&AgentSelectionView::from_builtin(agent)),
             PrimaryAgentSelection::SessionMeta(serde_json::Map::from_iter([(
                 "rules".to_string(),
                 serde_json::Value::String(agent.body.to_string()),
             )]))
         );
         assert_eq!(
-            for_agent(OPENCODE_PLUGIN_NAME).primary_agent_selection(agent),
+            for_agent(OPENCODE_PLUGIN_NAME).primary_agent_selection(&AgentSelectionView::from_builtin(agent)),
             PrimaryAgentSelection::ConfigOption("mode")
         );
         assert_eq!(
-            for_agent("custom-acp").primary_agent_selection(agent),
+            for_agent("custom-acp").primary_agent_selection(&AgentSelectionView::from_builtin(agent)),
             PrimaryAgentSelection::SystemPrompt
         );
     }
@@ -778,7 +1073,7 @@ mod tests {
         let plugin = for_agent("custom-provider");
 
         plugin
-            .install_config(root.path())
+            .install_config(root.path(), None)
             .expect("default install config");
         plugin
             .remove_config(root.path())
@@ -817,7 +1112,7 @@ mod tests {
         fs::write(&command_path, "peer command").expect("command file");
 
         DEFAULT_PLUGIN
-            .install_agent(library, directory.path(), &target.id)
+            .install_team_member(library, directory.path(), &target.id, None)
             .expect("install succeeds");
         let rendered = fs::read_to_string(&target_path).expect("target file exists");
         assert!(rendered.starts_with("---\n"));
@@ -833,7 +1128,7 @@ mod tests {
 
         fs::write(&target_path, "stale target").expect("stale target");
         DEFAULT_PLUGIN
-            .install_agent(library, directory.path(), &target.id)
+            .install_team_member(library, directory.path(), &target.id, None)
             .expect("overwrite succeeds");
         assert_ne!(
             fs::read_to_string(&target_path).expect("target remains"),

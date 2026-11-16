@@ -1,0 +1,2 @@
+UPDATE discuss_usage_turns SET provider_name = ?3, model_id = ?4, turn_started_at_ms = ?5, turn_completed_at_ms = ?6, end_to_end_ms = ?7, completion_kind = ?8, stop_reason = ?9, context_used_tokens = ?10, context_window_tokens = ?11, harness_cost_amount = ?12, harness_cost_currency = ?13, harness_cost_kind = ?14, usage_is_incomplete = ?15, cost_is_partial = ?16, evidence_source = ?17, evidence_json = ?18, created_at_ms = ?19
+WHERE discuss_session_id = ?1 AND turn_ordinal = ?2;

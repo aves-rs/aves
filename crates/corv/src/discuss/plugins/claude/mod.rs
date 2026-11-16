@@ -3,11 +3,19 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::super::library::{AgentDefinition, AgentId, AssetLibrary, SkillDefinition, TeamDefinition};
-use super::super::types::DiscussError;
+use super::super::library::{
+    AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
+};
+use super::super::types::{
+    DiscussError, Effect, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, Operation,
+    SessionLaunchConfig,
+};
+use super::files::{RenderedFile, write_rendered_files};
+use super::launch;
 use super::{
-    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PrimaryAgentSelection, render_skill_file, resolve_agent,
-    resolve_skill,
+    BILLING_INPUT, BILLING_OUTPUT, BILLING_TOTAL, BillingCategorySemantics, ConfigSettings, ConnectionStrategy,
+    DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig, PrimaryAgentSelection, render_skill_file,
+    resolve_agent,
 };
 
 pub const CLAUDE_PLUGIN_NAME: &str = "claude-acp";
@@ -30,14 +38,121 @@ struct AgentFrontmatter<'a> {
     settings: BTreeMap<String, String>,
 }
 
-struct RenderedFile {
-    path: PathBuf,
-    contents: String,
+#[derive(Default, Serialize)]
+struct Permissions {
+    allow: Vec<&'static str>,
+    ask: Vec<&'static str>,
+    deny: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct Settings {
+    permissions: Permissions,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeOptions<'a> {
+    settings: &'a Path,
+    disallowed_tools: &'a [&'static str],
+}
+
+#[derive(Serialize)]
+struct ClaudeCode<'a> {
+    options: ClaudeOptions<'a>,
 }
 
 impl DiscussAgentPlugin for ClaudePlugin {
+    fn managed_config(&self) -> Option<ManagedConfig> {
+        Some(ManagedConfig::WorkspaceFile {
+            plugin: CLAUDE_PLUGIN_NAME,
+            path: ".claude/settings.json",
+            default: || Ok("{}".to_owned()),
+            validate: |document| super::json_object(CLAUDE_PLUGIN_NAME, document).map(|_| ()),
+        })
+    }
+    fn billing_semantics(&self) -> BillingCategorySemantics {
+        BillingCategorySemantics {
+            guaranteed_categories: BILLING_INPUT | BILLING_OUTPUT | BILLING_TOTAL,
+            input_includes_cache: Some(false),
+        }
+    }
+
+    fn models_dev_provider_id(&self) -> Option<&'static str> {
+        Some("anthropic")
+    }
+
     fn connection_strategy(&self) -> ConnectionStrategy {
         ConnectionStrategy::Shared
+    }
+
+    fn launch_preparation(
+        &self,
+        context: &LaunchContext,
+        config: &SessionLaunchConfig,
+    ) -> Result<LaunchPreparation, DiscussError> {
+        launch::validate_supplied_inputs(config)?;
+        let limitations = config
+            .plugin_references
+            .iter()
+            .enumerate()
+            .map(|(index, _)| LaunchLimitation {
+                subject: LaunchLimitationSubject::PluginReference { index },
+                reason: LaunchLimitationReason::UnsupportedPluginReference,
+            })
+            .collect();
+        let Some(rules) = launch::intersect_rules(&config.rule_sources) else {
+            return Ok(LaunchPreparation {
+                meta: None,
+                limitations,
+            });
+        };
+        let mut permissions = Permissions::default();
+        for rule in rules.rules {
+            let tools: &[&str] = match rule.operation {
+                Operation::Read => &["Read", "Glob", "Grep"],
+                Operation::Write => &["Edit", "Write", "NotebookEdit"],
+                Operation::Execute => &["Bash", "PowerShell"],
+            };
+            match rule.effect {
+                Effect::Allow => &mut permissions.allow,
+                Effect::Ask => &mut permissions.ask,
+                Effect::Deny => &mut permissions.deny,
+            }
+            .extend_from_slice(tools);
+        }
+        let settings_path = context.settings_root.join("settings.json");
+        let serialize_error = |error: serde_json::Error| DiscussError::WorkspaceSerialize {
+            plugin: CLAUDE_PLUGIN_NAME.to_owned(),
+            path: settings_path.to_string_lossy().into_owned(),
+            format: "json".to_owned(),
+            message: error.to_string(),
+        };
+        let options = ClaudeCode {
+            options: ClaudeOptions {
+                settings: &settings_path,
+                disallowed_tools: &permissions.deny,
+            },
+        };
+        let value = serde_json::to_value(options).map_err(serialize_error)?;
+        let contents = serde_json::to_string(&Settings { permissions }).map_err(serialize_error)?;
+        std::fs::create_dir_all(&context.settings_root).map_err(|error| DiscussError::WorkspaceIo {
+            plugin: CLAUDE_PLUGIN_NAME.to_owned(),
+            path: context.settings_root.to_string_lossy().into_owned(),
+            message: error.to_string(),
+        })?;
+        write_rendered_files(
+            CLAUDE_PLUGIN_NAME,
+            &context.settings_root,
+            &[RenderedFile {
+                relative_path: PathBuf::from("settings.json"),
+                contents,
+            }],
+        )?;
+        Ok(LaunchPreparation {
+            meta: Some([(String::from("claudeCode"), value)].into_iter().collect()),
+            limitations,
+        })
     }
 
     fn agent_scope_key(&self) -> &'static str {
@@ -49,14 +164,25 @@ impl DiscussAgentPlugin for ClaudePlugin {
     }
 
     /// claude-agent-acp lists `.claude/agents` in its `agent` option and runs the main thread as the selection.
-    fn primary_agent_selection(&self, _agent: &AgentDefinition) -> PrimaryAgentSelection {
+    fn primary_agent_selection(&self, _agent: &AgentSelectionView<'_>) -> PrimaryAgentSelection {
         PrimaryAgentSelection::ConfigOption(AGENT_CONFIG_ID)
     }
 
-    fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
+    fn workspace_label(&self) -> &'static str {
+        CLAUDE_PLUGIN_NAME
+    }
+
+    fn render_agent(
+        &self,
+        library: AssetLibrary,
+        agent_id: &AgentId,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<Vec<RenderedFile>, DiscussError> {
         let agent = resolve_agent(library, agent_id)?;
-        let file = render_agent(agent, None)?;
-        super::write_file(CLAUDE_PLUGIN_NAME, root, &file.path, &file.contents)
+        Ok(vec![render_agent(
+            &AgentSelectionView::from_builtin(agent),
+            member_settings,
+        )?])
     }
 
     fn destroy_agent(&self, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
@@ -64,45 +190,76 @@ impl DiscussAgentPlugin for ClaudePlugin {
         super::remove_file(CLAUDE_PLUGIN_NAME, root, &relative_path)
     }
 
-    fn install_team_with_member_overrides(
+    fn installed_agent_path(&self, id: &AgentId) -> PathBuf {
+        Path::new(AGENTS_DIRECTORY).join(format!("{}.md", id.normalized_destination()))
+    }
+
+    fn installed_skill_path(&self, id: &SkillId) -> PathBuf {
+        Path::new(SKILLS_DIRECTORY)
+            .join(id.normalized_destination())
+            .join("SKILL.md")
+    }
+
+    fn install_custom_agent(
         &self,
-        library: AssetLibrary,
         root: &Path,
-        team: &TeamDefinition,
-        member_settings: &BTreeMap<AgentId, ConfigSettings>,
+        agent: &CustomAgentDefinition,
+        member_settings: Option<&ConfigSettings>,
     ) -> Result<(), DiscussError> {
-        self.install_team_member(library, root, &team.leader, member_settings.get(&team.leader))?;
-        for follower in &team.followers {
-            self.install_team_member(library, root, follower, member_settings.get(follower))?;
+        let file = render_agent(&AgentSelectionView::from_custom(agent), member_settings)?;
+        write_rendered_files(CLAUDE_PLUGIN_NAME, root, &[file])
+    }
+
+    fn install_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        let mut files = Vec::new();
+        for file in &skill.bundle {
+            let path = Path::new(SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            let body = if file.relative_path == "SKILL.md" {
+                super::markdown_metadata(&file.contents)?.2
+            } else {
+                &file.contents
+            };
+            let contents = super::render_skill_contents(
+                CLAUDE_PLUGIN_NAME,
+                &path,
+                &skill.id,
+                &skill.description,
+                &file.relative_path,
+                body,
+            )?;
+            files.push(RenderedFile {
+                relative_path: path,
+                contents,
+            });
         }
-        for skill_id in &team.skills {
-            let skill = resolve_skill(library, skill_id)?;
-            self.install_skill(root, skill)?;
+        write_rendered_files(CLAUDE_PLUGIN_NAME, root, &files)
+    }
+
+    fn destroy_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        for file in &skill.bundle {
+            let path = Path::new(SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            super::remove_file(CLAUDE_PLUGIN_NAME, root, &path)?;
         }
         Ok(())
     }
 
-    fn install_team_member(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        agent_id: &AgentId,
-        member_settings: Option<&ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        let agent = resolve_agent(library, agent_id)?;
-        let file = render_agent(agent, member_settings)?;
-        super::write_file(CLAUDE_PLUGIN_NAME, root, &file.path, &file.contents)
-    }
-
-    fn install_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
+    fn render_skill(&self, skill: &SkillDefinition) -> Result<Vec<RenderedFile>, DiscussError> {
+        let mut files = Vec::new();
         for file in &skill.bundle {
             let relative_path = Path::new(SKILLS_DIRECTORY)
                 .join(skill.id.normalized_destination())
                 .join(file.relative_path);
             let contents = render_skill_file(CLAUDE_PLUGIN_NAME, &relative_path, skill, file)?;
-            super::write_file(CLAUDE_PLUGIN_NAME, root, &relative_path, &contents)?;
+            files.push(RenderedFile {
+                relative_path,
+                contents,
+            });
         }
-        Ok(())
+        Ok(files)
     }
 
     fn destroy_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
@@ -117,7 +274,7 @@ impl DiscussAgentPlugin for ClaudePlugin {
 }
 
 fn render_agent(
-    agent: &AgentDefinition,
+    agent: &AgentSelectionView<'_>,
     member_settings: Option<&ConfigSettings>,
 ) -> Result<RenderedFile, DiscussError> {
     let path = PathBuf::from(AGENTS_DIRECTORY).join(format!("{}.md", agent.id.normalized_destination()));
@@ -140,7 +297,7 @@ fn render_markdown<T: Serialize>(path: &Path, frontmatter: &T, body: &str) -> Re
         message: source.to_string(),
     })?;
     Ok(RenderedFile {
-        path: path.to_path_buf(),
+        relative_path: path.to_path_buf(),
         contents: format!("---\n{yaml}---\n\n{body}"),
     })
 }
@@ -148,9 +305,136 @@ fn render_markdown<T: Serialize>(path: &Path, frontmatter: &T, body: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::super::super::test_library;
+    use super::super::super::types::{DiscussSessionId, Rule, RuleSet};
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn each_effect_maps_every_operation_group() {
+        let directory = tempdir().expect("workspace");
+        let context = LaunchContext::new(directory.path(), DiscussSessionId::new());
+        let tools = serde_json::json!([
+            "Read",
+            "Glob",
+            "Grep",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Bash",
+            "PowerShell"
+        ]);
+        for (effect, field) in [(Effect::Allow, "allow"), (Effect::Ask, "ask"), (Effect::Deny, "deny")] {
+            let config = SessionLaunchConfig {
+                rule_sources: vec![RuleSet {
+                    rules: [Operation::Read, Operation::Write, Operation::Execute]
+                        .into_iter()
+                        .map(|operation| Rule { operation, effect })
+                        .collect(),
+                }],
+                ..Default::default()
+            };
+            PLUGIN
+                .launch_preparation(&context, &config)
+                .expect("prepare");
+            let settings: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(context.settings_root.join("settings.json")).expect("settings"),
+            )
+            .expect("json");
+            assert_eq!(settings["permissions"][field], tools);
+        }
+    }
+
+    #[test]
+    fn permissions_map_effects_and_denied_tools_to_session_settings() {
+        let directory = tempdir().expect("workspace");
+        let context = LaunchContext::new(directory.path(), DiscussSessionId::new());
+        let config = SessionLaunchConfig {
+            rule_sources: vec![RuleSet {
+                rules: vec![
+                    Rule {
+                        operation: Operation::Read,
+                        effect: Effect::Allow,
+                    },
+                    Rule {
+                        operation: Operation::Write,
+                        effect: Effect::Ask,
+                    },
+                    Rule {
+                        operation: Operation::Execute,
+                        effect: Effect::Deny,
+                    },
+                ],
+            }],
+            plugin_references: vec!["opaque".into(), "other".into()],
+            ..Default::default()
+        };
+        let result = PLUGIN
+            .launch_preparation(&context, &config)
+            .expect("prepare");
+        let path = context.settings_root.join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("settings")).expect("json");
+        assert_eq!(
+            settings,
+            serde_json::json!({"permissions": {
+                "allow": ["Read", "Glob", "Grep"],
+                "ask": ["Edit", "Write", "NotebookEdit"],
+                "deny": ["Bash", "PowerShell"]
+            }})
+        );
+        let meta = result.meta.expect("metadata");
+        assert_eq!(
+            meta["claudeCode"]["options"],
+            serde_json::json!({
+                "settings": path, "disallowedTools": ["Bash", "PowerShell"]
+            })
+        );
+        assert_eq!(result.limitations.len(), 2);
+        for (index, limitation) in result.limitations.iter().enumerate() {
+            assert_eq!(limitation.subject, LaunchLimitationSubject::PluginReference { index });
+            assert_eq!(limitation.reason, LaunchLimitationReason::UnsupportedPluginReference);
+        }
+        assert!(!directory.path().join("settings.json").exists());
+        assert!(!directory.path().join(".claude/settings.json").exists());
+        assert_eq!(PLUGIN.connection_strategy(), ConnectionStrategy::Shared);
+    }
+
+    #[test]
+    fn no_sources_inherit_but_assigned_empty_source_denies_all() {
+        let directory = tempdir().expect("workspace");
+        let context = LaunchContext::new(directory.path(), DiscussSessionId::new());
+        let result = PLUGIN
+            .launch_preparation(&context, &SessionLaunchConfig::default())
+            .expect("prepare");
+        assert!(result.meta.is_none());
+        assert!(!context.settings_root.exists());
+        let config = SessionLaunchConfig {
+            rule_sources: vec![RuleSet::default()],
+            ..Default::default()
+        };
+        let result = PLUGIN
+            .launch_preparation(&context, &config)
+            .expect("prepare");
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context.settings_root.join("settings.json")).expect("settings"))
+                .expect("json");
+        let denied = serde_json::json!([
+            "Read",
+            "Glob",
+            "Grep",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Bash",
+            "PowerShell"
+        ]);
+        assert_eq!(settings["permissions"]["deny"], denied);
+        assert_eq!(
+            result.meta.expect("metadata")["claudeCode"]["options"]["disallowedTools"],
+            denied
+        );
+    }
 
     #[test]
     fn install_is_idempotent_and_destroy_is_absent_noop() {
@@ -171,7 +455,7 @@ mod tests {
         fs::write(&skill_path, "peer skill").expect("skill file");
         fs::write(&command_path, "peer command").expect("command file");
         PLUGIN
-            .install_agent(library, directory.path(), &agent.id)
+            .install_team_member(library, directory.path(), &agent.id, None)
             .expect("install succeeds");
         let first = fs::read(
             directory
@@ -193,7 +477,7 @@ mod tests {
         )
         .expect("stale target");
         PLUGIN
-            .install_agent(library, directory.path(), &agent.id)
+            .install_team_member(library, directory.path(), &agent.id, None)
             .expect("repeat install succeeds");
         let second = fs::read(
             directory

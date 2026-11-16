@@ -1,0 +1,3 @@
+INSERT INTO discuss_usage_turns (discuss_session_id, turn_ordinal, provider_name, model_id, turn_started_at_ms, turn_completed_at_ms, end_to_end_ms, completion_kind, stop_reason, context_used_tokens, context_window_tokens, harness_cost_amount, harness_cost_currency, harness_cost_kind, usage_is_incomplete, cost_is_partial, evidence_source, evidence_json, created_at_ms)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+ON CONFLICT(discuss_session_id, turn_ordinal) DO NOTHING;

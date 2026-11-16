@@ -1,0 +1,1 @@
+SELECT provider, account_key, fetched_at_ms, observed_at_ms, stale_since_ms, error_class, entry_json, created_at_ms FROM discuss_allowance_observations WHERE observed_at_ms >= ?1 AND observed_at_ms <= ?2 ORDER BY observed_at_ms, id;

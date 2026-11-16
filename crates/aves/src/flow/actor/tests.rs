@@ -21,9 +21,10 @@ use crate::bus::BusRpcContext;
 use crate::migrations::flows::MIGRATIONS as FLOWS_MIGRATIONS;
 use crate::runtime::ServiceReader;
 use crate::tasks::{
-    CancelScriptExecutionInput, ScriptNodeCompletion, ScriptNodeOutputs, ScriptNodeTickResult, ScriptNodeTickedOutput,
-    StartRuntimeInput, StartScriptInput, StartedOutput, StopRuntimeInput, SuccessOutput as TasksSuccessOutput,
-    TasksError, TasksLifecycleSudoService, TickScriptInput,
+    CancelScriptExecutionInput, CancelShellExecutionInput, ScriptNodeCompletion, ScriptNodeOutputs,
+    ScriptNodeTickResult, ScriptNodeTickedOutput, ShellNodeCancelledOutput, ShellNodeFailure, ShellNodeTickResult,
+    ShellNodeTickedOutput, StartRuntimeInput, StartScriptInput, StartShellInput, StartedOutput, StopRuntimeInput,
+    SuccessOutput as TasksSuccessOutput, TasksError, TasksLifecycleSudoService, TickScriptInput, TickShellInput,
 };
 use crate::utils::database::{MigrationRunner, connect_database};
 
@@ -416,6 +417,26 @@ fn script_registration(tasks: Arc<dyn TasksLifecycleSudoService>) -> NodeKindReg
 
 #[async_trait]
 impl TasksLifecycleSudoService for TestTasks {
+    async fn start_shell(&self, input: StartShellInput) -> Result<StartedOutput, TasksError> {
+        Ok(StartedOutput {
+            correlation: input.correlation,
+        })
+    }
+
+    async fn tick_shell(&self, input: TickShellInput) -> Result<ShellNodeTickedOutput, TasksError> {
+        Ok(ShellNodeTickedOutput {
+            correlation: input.correlation,
+            result: ShellNodeTickResult::Running,
+        })
+    }
+
+    async fn cancel_shell_execution(
+        &self,
+        input: CancelShellExecutionInput,
+    ) -> Result<ShellNodeCancelledOutput, TasksError> {
+        Ok(cancelled_shell(input))
+    }
+
     async fn start_script(&self, input: StartScriptInput) -> Result<StartedOutput, TasksError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         *self.last_source.lock().unwrap() = Some(input.source);
@@ -460,6 +481,26 @@ impl TasksLifecycleSudoService for TestTasks {
 
 #[async_trait]
 impl TasksLifecycleSudoService for SequenceTasks {
+    async fn start_shell(&self, input: StartShellInput) -> Result<StartedOutput, TasksError> {
+        Ok(StartedOutput {
+            correlation: input.correlation,
+        })
+    }
+
+    async fn tick_shell(&self, input: TickShellInput) -> Result<ShellNodeTickedOutput, TasksError> {
+        Ok(ShellNodeTickedOutput {
+            correlation: input.correlation,
+            result: ShellNodeTickResult::Running,
+        })
+    }
+
+    async fn cancel_shell_execution(
+        &self,
+        input: CancelShellExecutionInput,
+    ) -> Result<ShellNodeCancelledOutput, TasksError> {
+        Ok(cancelled_shell(input))
+    }
+
     async fn start_script(&self, input: StartScriptInput) -> Result<StartedOutput, TasksError> {
         let start_number = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
         let shared_file = input.workspace_path.join("first-node.txt");
@@ -505,6 +546,24 @@ impl TasksLifecycleSudoService for SequenceTasks {
 
     async fn stop_runtime(&self, _input: StopRuntimeInput) -> Result<TasksSuccessOutput, TasksError> {
         Ok(TasksSuccessOutput {})
+    }
+}
+
+fn cancelled_shell(input: CancelShellExecutionInput) -> ShellNodeCancelledOutput {
+    ShellNodeCancelledOutput {
+        node_execution_id: input.node_execution_id,
+        result: ShellNodeTickResult::Failed {
+            failure: ShellNodeFailure {
+                error: TasksError::ShellCancelled,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_dropped_bytes: 0,
+                stderr_dropped_bytes: 0,
+                stdout_abandoned_tail: false,
+                stderr_abandoned_tail: false,
+            },
+        },
     }
 }
 

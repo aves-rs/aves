@@ -429,26 +429,28 @@ fn config_preference_selection_follows_provider_order_and_attempt_tracking() {
 }
 
 #[test]
-fn agent_node_config_selects_assigned_agent_mode_before_non_mode_preferences() {
-    let mut mode = config_option("agent", "Default", &["Default", "chief-of-staff"]);
+fn primary_agent_option_selects_plugin_named_option_before_other_preferences() {
+    let mut mode = config_option("mode", "auto", &["default", "auto"]);
     mode.category = "mode".to_string();
+    let agent = config_option("agent", "default", &["default", "chief-of-staff"]);
     let model = config_option("model", "large", &["large", "small"]);
-    let provider_options = vec![mode, model];
-    let preferences = ConfigSettings::from([
-        ("agent".to_string(), "Default".to_string()),
+    let provider_options = vec![mode, agent, model];
+    let mut preferences = ConfigSettings::from([
+        ("agent".to_string(), "default".to_string()),
         ("model".to_string(), "small".to_string()),
     ]);
 
-    let mode_selection = assigned_agent_mode_selection(&provider_options, "chief-of-staff").expect("assigned mode");
+    let selection =
+        primary_agent_option_selection(&provider_options, "agent", "chief-of-staff").expect("agent selection");
     assert_eq!(
-        mode_selection,
+        selection,
         ConfigPreferenceSelection {
             config_id: "agent".to_string(),
             value: "chief-of-staff".to_string(),
         }
     );
 
-    let preferences = without_mode_preferences(&preferences, &provider_options, &mode_selection.config_id);
+    preferences.remove(&selection.config_id);
     let mut reconciler = ConfigPreferenceReconciler::new(&preferences, provider_options);
     assert_eq!(
         reconciler.next(),
@@ -461,11 +463,15 @@ fn agent_node_config_selects_assigned_agent_mode_before_non_mode_preferences() {
 }
 
 #[test]
-fn agent_node_config_rejects_missing_assigned_agent_mode() {
-    let mut mode = config_option("agent", "Default", &["Default", "Sonya"]);
+fn primary_agent_option_rejects_unadvertised_agent_or_option() {
+    let mut mode = config_option("mode", "build", &["build", "chief-of-staff"]);
     mode.category = "mode".to_string();
 
-    assert_eq!(assigned_agent_mode_selection(&[mode], "unknown-agent"), None);
+    assert_eq!(
+        primary_agent_option_selection(std::slice::from_ref(&mode), "mode", "unknown-agent"),
+        None
+    );
+    assert_eq!(primary_agent_option_selection(&[mode], "agent", "chief-of-staff"), None);
 }
 
 #[test]

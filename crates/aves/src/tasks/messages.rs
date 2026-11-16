@@ -8,7 +8,7 @@ use crate::auth::Jwt;
 use crate::bus::{BusIngress, BusRpcContext};
 use crate::flow::{LifecycleCorrelation, NodeExecutionId};
 
-use super::types::{ScriptNodeTickResult, TasksError};
+use super::types::{ScriptNodeTickResult, ShellNodeTickResult, TasksError};
 
 pub struct TasksRequest {
     pub payload: TasksRequestPayload,
@@ -21,10 +21,6 @@ pub enum TasksRequestPayload {
     /// Starts the tasks runtime.
     #[privileged(reason = "Tasks runtime lifecycle is owned by Aves")]
     StartRuntime,
-
-    /// Stops the tasks runtime.
-    #[privileged(reason = "Tasks runtime lifecycle is owned by Aves")]
-    StopRuntime,
 
     /// Starts a script node execution.
     #[privileged(reason = "ScriptNode lifecycle is admitted only from Aves Flow")]
@@ -54,6 +50,33 @@ pub enum TasksRequestPayload {
     /// Cancels a script node execution.
     #[privileged(reason = "ScriptNode lifecycle is admitted only from Aves Flow")]
     CancelScriptExecution { node_execution_id: NodeExecutionId },
+
+    /// Starts a shell node execution.
+    #[privileged(reason = "ShellNode lifecycle is admitted only from Aves Flow")]
+    StartShell {
+        correlation: LifecycleCorrelation,
+        interpreter: String,
+        commands: Vec<String>,
+        cwd: PathBuf,
+        /// Configured execution timeout in seconds; zero selects the Tasks default.
+        timeout_secs: u64,
+        input: Value,
+    },
+
+    /// Ticks a shell node execution.
+    #[privileged(reason = "ShellNode lifecycle is admitted only from Aves Flow")]
+    TickShell {
+        correlation: LifecycleCorrelation,
+        input: Value,
+    },
+
+    /// Cancels a shell node execution and returns its terminal snapshot.
+    #[privileged(reason = "ShellNode lifecycle is admitted only from Aves Flow")]
+    CancelShellExecution { node_execution_id: NodeExecutionId },
+
+    /// Stops the tasks runtime.
+    #[privileged(reason = "Tasks runtime lifecycle is owned by Aves")]
+    StopRuntime,
 }
 
 #[aves::bus_responses]
@@ -65,6 +88,20 @@ pub enum TasksResponse {
     ScriptNodeTicked {
         correlation: LifecycleCorrelation,
         result: ScriptNodeTickResult,
+    },
+    ShellNodeTicked {
+        correlation: LifecycleCorrelation,
+        result: ShellNodeTickResult,
+    },
+    /// Terminal snapshot after cancellation; `Running` is never returned.
+    ///
+    /// A completed success is replayed. Failures retain their typed error,
+    /// known exit code, captured output, and truncation or abandoned-tail markers.
+    /// A lost runner exceeding the supervision deadline instead returns
+    /// `Err(TasksError::ShellStopCleanupFailed { .. })` to the caller.
+    ShellNodeCancelled {
+        node_execution_id: NodeExecutionId,
+        result: ShellNodeTickResult,
     },
     Success,
     Error {

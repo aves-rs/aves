@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn response_timeout_render_keeps_actor_response_await_and_service_module() {
+    fn response_timeout_render_tracks_timed_replies_and_keeps_service_module() {
         let services = SudoServices::parse_tokens(parse_sudo_test_tokens(
             r#"marker ActionDomain; request ActionRequestPayload => ActionResponse error = ActionError transport = SharedInfraError target = "action"; response_timeout { predicate = ActionRequestPayload::is_side_effecting, duration = ACTION_RESPONSE_TIMEOUT }; pub service ActionInternalSudoService { AttributedMutation => OrderExecuted, EvictConnectorCache => Ack, } outbound ActionOrderEvent => ActionBroadcast { event => OrderExecuted { event }, }"#,
         ))
@@ -136,8 +136,9 @@ mod tests {
 
         assert!(rendered.contains("pub trait ActionInternalSudoService"));
         assert!(rendered.contains("pub(crate) struct ActionInternalSudoServiceImpl"));
-        assert!(rendered.contains("let side_effecting = (ActionRequestPayload::is_side_effecting)"));
-        assert!(rendered.contains("actor_response\n                .await"));
+        assert!(rendered.contains("if (ActionRequestPayload::is_side_effecting)(&request.payload)"));
+        assert!(rendered.contains("pending: ::aves::__private::FuturesUnordered<PendingReply>"));
+        assert!(rendered.contains("pending.push("));
     }
 
     #[test]
@@ -153,9 +154,9 @@ mod tests {
         assert!(generated.contains("ActionRequestPayload::is_side_effecting"));
         assert!(!generated.contains("ActionRequestPayload : : is_side_effecting"));
         assert!(generated.contains(
-            "OneshotReplyTimeout { target_domain: \"action\".to_string(), operation: \"handler.actor_response\".to_string(), timeout: format!(\"{:?}\", ACTION_RESPONSE_TIMEOUT) }))?"
+            "OneshotReplyTimeout { target_domain: \"action\".to_string(), operation: \"handler.actor_response\".to_string(), timeout: format!(\"{:?}\", ACTION_RESPONSE_TIMEOUT) })),"
         ));
-        assert!(!generated.contains("timeout: format!(\"{:?}\", ACTION_RESPONSE_TIMEOUT) }.into())?"));
+        assert!(!generated.contains("timeout: format!(\"{:?}\", ACTION_RESPONSE_TIMEOUT) }.into())"));
 
         TokenStream2::from_str(&generated).unwrap_or_else(|error| {
             panic!("exact Action domain generation produced invalid Rust tokens: {error}\n{generated}")
@@ -389,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn response_timeout_renders_parseable_awaited_side_effecting_branch() {
+    fn response_timeout_renders_parseable_untimed_side_effecting_branch() {
         let services = SudoServices::parse_tokens(parse_sudo_test_tokens(
             r#"marker ActionDomain; request ActionRequestPayload => ActionResponse error = ActionError transport = SharedInfraError target = "action"; response_timeout { predicate = ActionRequestPayload::is_side_effecting, duration = ACTION_RESPONSE_TIMEOUT }; pub service ActionInternalSudoService { AttributedMutation => OrderExecuted, EvictConnectorCache => Ack, } inbound TestBroadcast => Option<ActionRequestPayload> { TestBroadcast::Enclave(event) => action_request_from_enclave_broadcast(event), } outbound ActionOrderEvent => ActionBroadcast { event => OrderExecuted { event }, }"#,
         ))
@@ -399,8 +400,9 @@ mod tests {
         syn::parse_file(&rendered)
             .unwrap_or_else(|error| panic!("the Action timeout output should be valid Rust: {error}\n{rendered}"));
         let normalized = normalize_tokens(&rendered);
-        assert!(normalized.contains("ifside_effecting{actor_response.await"));
+        assert!(normalized.contains("if(ActionRequestPayload::is_side_effecting)(&request.payload){ifletErr(error)=actor_tasks.send(request).await"));
         assert!(normalized.contains("timeout(ACTION_RESPONSE_TIMEOUT,actor_response).await"));
+        assert!(normalized.contains("ifself.pending.len()<::aves::utils::buffers::DEFAULT_BUFFER_SIZE"));
     }
 
     #[test]
@@ -651,7 +653,7 @@ mod tests {
 
         let normalized = normalize_tokens(&rendered);
         assert!(normalized.contains(&normalize_tokens(
-            "if let Err(error) = (crate::example::authorize)(&request.payload, &projection) { let _ = request.reply_to.send(Err(error)); return; } let _ = forward_request(actor_tasks, request).await;"
+            "if let Err(error) = (crate::example::authorize)(&request.payload, &projection) { let _ = request.reply_to.send(Err(error)); return; } forward_request(actor_tasks, request).await;"
         )));
         assert!(
             normalized
@@ -675,7 +677,7 @@ mod tests {
         let normalized = normalize_tokens(&rendered);
 
         assert!(normalized.contains(&normalize_tokens(
-            "let _ = check_authenticated_subject_and_capabilities(&projection); let _ = forward_request(actor_tasks, request).await;"
+            "let _ = check_authenticated_subject_and_capabilities(&projection); forward_request(actor_tasks, request).await;"
         )));
         assert!(!normalized.contains("request.reply_to.send(Err(error))"));
     }

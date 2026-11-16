@@ -29,6 +29,13 @@ pub use bus::{
     RequestOperationDescriptor, RequestOperationKind, RpcClosedOutput, RpcOpenedOutput, SetPeerConnectivityInput,
     TransportBindings,
 };
+/// Items generated domain handlers reference; not a public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use futures_util::StreamExt;
+    pub use futures_util::stream::FuturesUnordered;
+}
+
 pub use runtime::{
     ConstructionFacade, ConstructionInputs, DomainCallbacks, DomainDescriptor, DomainDescriptorFactory, DomainFuture,
     DomainProviderMetadata, GeneratedCallError, ResponseProjectionError, Runtime, RuntimeOptions, ServicePublisher,

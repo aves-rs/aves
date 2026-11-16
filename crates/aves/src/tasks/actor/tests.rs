@@ -1,15 +1,19 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tempfile::tempdir;
 use uuid::Uuid;
 
 use crate::auth::Jwt;
-use crate::bus::BusIngress;
+use crate::bus::{BusIngress, EventBus};
 use crate::flow::{FlowExecutionId, FlowId, FlowNodeId, LifecycleCorrelation, NodeExecutionId, NodeKind};
 
 use super::super::client::generated_guest_rpc_factory;
-use super::super::messages::TasksRequestPayload;
+use super::super::domain::{
+    TasksDomain, TasksGeneratedHandler, TasksLifecycleSudoService, TasksLifecycleSudoServiceImpl,
+};
+use super::super::messages::{StartRuntimeInput, TasksBroadcast, TasksRequestPayload, TasksResponse};
 use super::super::types::{ScriptNodeCompletion, ScriptNodeOutputs};
 use super::*;
 
@@ -637,4 +641,51 @@ fn script_node_completion_round_trips_the_generic_shape() {
             .outputs,
         completion.outputs
     );
+}
+
+/// The generated handler forwards the next request while an earlier reply is still outstanding.
+#[tokio::test]
+async fn generated_handler_serves_requests_while_a_reply_is_outstanding() {
+    let mut bus = EventBus::<TasksBroadcast>::new();
+    let channels = bus.register::<TasksDomain, TasksRequest, TasksBroadcast>();
+    let (actor_tasks, mut actor_requests) = mpsc::channel(4);
+    let (service, service_requests) = TasksLifecycleSudoServiceImpl::channel(4);
+    tokio::spawn(
+        TasksGeneratedHandler::new(
+            channels.requests_rx,
+            actor_tasks,
+            channels.broadcasts_tx,
+            service_requests,
+        )
+        .run(),
+    );
+
+    let first = tokio::spawn({
+        let service = service.clone();
+        async move { service.start_runtime(StartRuntimeInput {}).await }
+    });
+    let held = actor_requests
+        .recv()
+        .await
+        .expect("first request reaches the actor");
+
+    let second = tokio::spawn({
+        let service = service.clone();
+        async move { service.start_runtime(StartRuntimeInput {}).await }
+    });
+    let answered = tokio::time::timeout(Duration::from_secs(1), actor_requests.recv())
+        .await
+        .expect("second request is forwarded while the first reply is outstanding")
+        .expect("second request reaches the actor");
+    answered
+        .reply_to
+        .send(Ok(TasksResponse::Success))
+        .expect("second caller is waiting");
+    assert!(second.await.expect("second call task").is_ok());
+    assert!(!first.is_finished());
+
+    held.reply_to
+        .send(Ok(TasksResponse::Success))
+        .expect("first caller is waiting");
+    assert!(first.await.expect("first call task").is_ok());
 }

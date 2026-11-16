@@ -230,11 +230,28 @@ Cancellation uses privileged lifecycle requests.
 Do not assume cancelling can undo effects already accepted by an external system.
 Inspect [Aves Flow](https://docs.rs/aves/0.5.0/aves/flow/index.html) for workspace contracts.
 
+### Track usage, spend, and allowance
+
+Corv records token counts, calculated spend, and provider allowance snapshots for every turn, in the Discuss database.
+Read them through `discuss.getTokenUsageReport`, `discuss.getSpendReport`, `discuss.getAllowanceReport`, and `discuss.getCurrentAllowance`.
+Group by session, provider, model, or a UTC hour, day, week, or month.
+Rows carry coverage counters, so a partial sum is never presented as a complete one.
+Accounted turns are the terminal ones: a forced Provider or server stop can lose the turn in progress.
+Configure the retention window with `accounting_retention_days`; the default is 90 days and `0` disables pruning.
+
+### Define custom agents, skills, and MCP servers
+
+Create custom agents and skills locally, or import them from a URL, and compose user-defined Teams from any built-in or custom members.
+Corv caches imported content under `config_dir/discuss_cache` and materializes it through the same Provider layouts as built-in assets.
+Append instructions to an installed agent or skill; one physical file carries one instruction set even when Providers share it.
+Register custom MCP servers and assign them to a Provider, a Team, or a session; composition is additive and rejects duplicate names.
+URL imports and custom MCP mutations are privileged operations; reads and local CRUD are public.
+
 ### Configure storage and lifecycle
 
 Persist Provider settings under the Aves Config section `discuss`.
-Configure `agents`, `agents_workspace`, and `subagent_retention_limit` through that section.
-The default workspace is `config_dir/discuss`; default subagent retention is ten records.
+Configure `agents`, `agents_workspace`, `subagent_retention_limit`, and `accounting_retention_days` through that section.
+The default workspace is `config_dir/discuss`; default subagent retention is ten records; default accounting retention is 90 days.
 
 Keep Discuss state in `config_dir/discuss.db`.
 Corv maintains session metadata, bounded transcripts, Provider configuration, Team installations, and subagent records.

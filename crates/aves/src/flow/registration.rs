@@ -364,7 +364,7 @@ impl WorkspacePreparation {
 
 /// Flow-owned registry of host lifecycle contracts.
 #[derive(Clone, Default)]
-pub(super) struct FlowNodeRegistry {
+pub struct FlowNodeRegistry {
     registrations: Arc<HashMap<NodeKind, NodeKindRegistration>>,
 }
 
@@ -388,13 +388,14 @@ impl FlowNodeRegistry {
     }
 
     /// Resolves a persisted kind without silently dropping malformed dispatch.
-    pub(super) fn get(&self, kind: &NodeKind) -> Result<&NodeKindRegistration, FlowRegistrationError> {
+    pub fn get(&self, kind: &NodeKind) -> Result<&NodeKindRegistration, FlowRegistrationError> {
         self.registrations
             .get(kind)
             .ok_or_else(|| FlowRegistrationError::Unregistered(kind.clone()))
     }
 
-    pub(super) fn iter(&self) -> impl Iterator<Item = &NodeKindRegistration> {
+    /// Iterates over registered node kinds.
+    pub fn iter(&self) -> impl Iterator<Item = &NodeKindRegistration> {
         self.registrations.values()
     }
 }

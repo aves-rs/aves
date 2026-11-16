@@ -48,7 +48,7 @@ impl TryFrom<String> for ContentHash {
 
 impl ContentHash {
     /// Returns the validated hash's original textual representation.
-    pub(super) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -293,7 +293,7 @@ impl FlowNode {
     }
 
     /// Returns the node's borrowed immutable code and state inputs.
-    pub(super) fn data_space(&self) -> &NodeDataSpace {
+    pub fn data_space(&self) -> &NodeDataSpace {
         &self.data_space
     }
 }

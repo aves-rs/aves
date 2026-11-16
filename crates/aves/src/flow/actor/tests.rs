@@ -1,5 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,8 +28,7 @@ use crate::tasks::{
 use crate::utils::database::{MigrationRunner, connect_database};
 
 use super::super::database::FlowStore;
-use super::super::default_workspace::{DefaultWorkspace, seed_workspace_seeds};
-use super::super::fixtures::NativeDocsFixture;
+use super::super::fixtures::{NativeDocsFixture, recording_workspace_hook};
 use super::super::hook::{
     FlowAppCheckpointContext, FlowAppCheckpointFuture, FlowAppCheckpointResult, FlowAppHookContext, FlowAppHookError,
     FlowAppHookFuture, FlowAppLandingContext, FlowAppRestoreContext, FlowAppRestoreFuture, FlowAppTakeoffContext,
@@ -41,14 +39,14 @@ use super::super::{
     BoundOutputs, CancellationDisposition, FlowAuthorityState, FlowBootOptions, FlowExecutionSnapshot,
     FlowInvocationKind, FlowRegistrationError, FlowTimestamp, NodeKind, NodeKindDescriptor, NodeKindRegistration,
     NodeLifecycleContext, NodeLifecycleDispatchError, NodeLifecycleResult, OwnerLifecycleResult, SideEffectDisposition,
-    WorkspaceError, WorkspacePreparation, WorkspaceSeed,
+    WorkspacePreparation, WorkspaceSeed,
 };
 use super::*;
 
 #[tokio::test]
 async fn boot_opens_root_database_and_applies_all_registered_migrations() {
     let directory = tempfile::tempdir().unwrap();
-    let options = FlowBootOptions::open(directory.path().to_path_buf())
+    let options = FlowBootOptions::open(directory.path().to_path_buf(), Arc::new(recording_workspace_hook))
         .await
         .unwrap();
     assert!(directory.path().join("flows.db").is_file());
@@ -94,126 +92,6 @@ fn readiness_preserves_every_durable_commit_gate() {
     assert_eq!(encoded["blobsComplete"], true);
     assert_eq!(encoded["inactive"], true);
     assert!(encoded["failure"].is_null());
-}
-
-fn copy_sources(root: &Path, paths: &[&str]) -> Vec<WorkspaceSeed> {
-    vec![WorkspaceSeed {
-        source_root: root.to_path_buf(),
-        relative_paths: paths
-            .iter()
-            .map(|path| (*path).to_owned())
-            .collect::<BTreeSet<_>>(),
-    }]
-}
-
-#[test]
-fn provider_sources_union_overwrites_inputs_and_skips_missing_entries() {
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("agents");
-    let target = directory.path().join("execution");
-    std::fs::create_dir_all(source.join(".agents/agents")).unwrap();
-    std::fs::create_dir_all(target.join(".agents/agents")).unwrap();
-    std::fs::write(source.join(".agents/agents/persona.md"), "selected").unwrap();
-    std::fs::write(target.join(".agents/agents/persona.md"), "input").unwrap();
-    let sources = copy_sources(&source, &[".agents", "missing"]);
-
-    seed_workspace_seeds(&sources, &target).unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(target.join(".agents/agents/persona.md")).unwrap(),
-        "selected"
-    );
-    assert!(!target.join("missing").exists());
-}
-
-#[test]
-fn invalid_provider_paths_never_copy_the_workspace_root() {
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("agents");
-    let target = directory.path().join("execution");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(source.join("secret"), "unselected").unwrap();
-
-    for invalid in ["", ".", "./", "../escape", "/absolute"] {
-        let sources = copy_sources(&source, &[invalid]);
-        assert!(matches!(
-            seed_workspace_seeds(&sources, &target),
-            Err(WorkspaceError::PathEscapesRoot { .. })
-        ));
-        assert!(!target.join("secret").exists());
-    }
-}
-
-#[test]
-fn destination_write_failure_is_a_typed_workspace_error() {
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("agents");
-    let target = directory.path().join("execution");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(source.join("selected"), "provider content").unwrap();
-    std::fs::create_dir(target.join("selected")).unwrap();
-
-    let error = seed_workspace_seeds(&copy_sources(&source, &["selected"]), &target).unwrap_err();
-
-    assert!(matches!(error, WorkspaceError::Io { path, .. } if path == target.join("selected")));
-}
-
-#[cfg(unix)]
-#[test]
-fn source_links_at_selected_intermediate_leaf_and_nested_entries_are_skipped() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("agents");
-    let target = directory.path().join("execution");
-    let outside = directory.path().join("outside");
-    std::fs::create_dir_all(source.join("managed")).unwrap();
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::create_dir_all(&outside).unwrap();
-    std::fs::write(outside.join("secret"), "outside").unwrap();
-    std::fs::write(source.join("managed/normal"), "inside").unwrap();
-    symlink(&outside, source.join("link")).unwrap();
-    symlink(outside.join("secret"), source.join("managed/nested-link")).unwrap();
-
-    seed_workspace_seeds(&copy_sources(&source, &["link/secret", "link", "managed"]), &target).unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(target.join("managed/normal")).unwrap(),
-        "inside"
-    );
-    assert!(!target.join("link").exists());
-    assert!(!target.join("managed/nested-link").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn destination_leaf_link_is_replaced_but_intermediate_link_is_rejected() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("agents");
-    let target = directory.path().join("execution");
-    let outside = directory.path().join("outside");
-    std::fs::create_dir_all(source.join("nested")).unwrap();
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::create_dir_all(&outside).unwrap();
-    std::fs::write(source.join("selected"), "safe").unwrap();
-    std::fs::write(source.join("nested/file"), "safe").unwrap();
-    std::fs::write(outside.join("file"), "original").unwrap();
-    symlink(outside.join("file"), target.join("selected")).unwrap();
-
-    seed_workspace_seeds(&copy_sources(&source, &["selected"]), &target).unwrap();
-    assert_eq!(std::fs::read_to_string(target.join("selected")).unwrap(), "safe");
-    assert_eq!(std::fs::read_to_string(outside.join("file")).unwrap(), "original");
-    symlink(&outside, target.join("nested")).unwrap();
-
-    assert!(matches!(
-        seed_workspace_seeds(&copy_sources(&source, &["nested/file"]), &target),
-        Err(WorkspaceError::SymbolicLink { .. })
-    ));
-    assert_eq!(std::fs::read_to_string(outside.join("file")).unwrap(), "original");
 }
 
 struct TestAuth;
@@ -567,8 +445,6 @@ fn cancelled_shell(input: CancelShellExecutionInput) -> ShellNodeCancelledOutput
     }
 }
 
-struct TestWorkspaceSource;
-
 #[derive(Clone)]
 enum HookCall {
     Checkpoint(FlowAppCheckpointContext),
@@ -851,20 +727,10 @@ impl super::super::mobility::FlowMobilityService for RejectingMobilityService {
     }
 }
 
-impl super::super::types::FlowWorkspaceSourceService for TestWorkspaceSource {
-    fn resolve_known_directory(
-        &self,
-        _relative_identity: &str,
-    ) -> Result<PathBuf, super::super::types::FlowWorkspaceSourceError> {
-        Err(super::super::types::FlowWorkspaceSourceError::BackendUnavailable)
-    }
-}
-
 impl Actor {
     fn install_workspace(&mut self, hook: Arc<RecordingWorkspaceHook>) {
         *hook.fallback_root.lock().unwrap() = self.database_path.with_extension("");
         self.workspace_hook = hook;
-        self.application_workspace = true;
     }
 
     async fn execution_root(&self, execution_id: FlowExecutionId) -> PathBuf {
@@ -1124,10 +990,12 @@ async fn echo_actor_with_sync(
     native_fixture: NativeDocsFixture,
     sync_reader: ServiceReader<dyn MachinePeerService>,
 ) -> Actor {
-    let options = FlowBootOptions::open(path.to_path_buf()).await.unwrap();
+    let options = FlowBootOptions::open(path.to_path_buf(), Arc::new(recording_workspace_hook))
+        .await
+        .unwrap();
     let (_, rx) = mpsc::channel(16);
     let (broadcast_tx, _) = mpsc::channel(16);
-    let local_services = native_fixture.sync_services();
+    let _native_fixture = native_fixture;
     let mut node_registrations = options.node_registrations;
     node_registrations.push(echo_registration(recorder));
     if include_script {
@@ -1143,19 +1011,8 @@ async fn echo_actor_with_sync(
         registry.register(registration).unwrap();
     }
     let node_registry = Arc::new(registry);
-    let workspace_hook = Arc::new(
-        DefaultWorkspace::new(
-            options.data_root.clone(),
-            &local_services,
-            node_registry.clone(),
-            ServiceReader::from_published_test_service(Arc::new(TestWorkspaceSource)),
-            FlowStore::new(options.database.clone()),
-            ExecutionSnapshotStore::new(options.database.clone()),
-        )
-        .await
-        .unwrap()
-        .with_native_fixture(native_fixture),
-    );
+    let workspace_hook = Arc::new(RecordingWorkspaceHook::default());
+    *workspace_hook.fallback_root.lock().unwrap() = options.data_root.clone();
     Actor::new(
         rx,
         ActorDependencies {
@@ -1168,9 +1025,8 @@ async fn echo_actor_with_sync(
             node_registry,
             bus_context: BusRpcContext::unavailable(),
             workspace_hook,
-            application_workspace: false,
             sync_services: sync_reader,
-            mobility_service: Arc::new(RejectingMobilityService),
+            mobility_service: Some(Arc::new(RejectingMobilityService)),
             retention_completed_runs: 10,
         },
     )
@@ -1317,62 +1173,8 @@ fn sequence_definition(flow_id: FlowId) -> FlowDefinition {
     }
 }
 
-fn agent_definition(flow_id: FlowId, root: super::super::ast::ContentAddressedRoot) -> FlowDefinition {
-    let graph = serde_json::json!({
-        "version": 1,
-        "root": {
-            "type": "Leaf",
-            "node": {
-                "node_kind": "AgentNode",
-                "id": Uuid::new_v4(),
-                "label": "agent",
-                "constraints": { "runtime": {}, "capabilities": [] },
-                "data_space": { "code_paths": [], "state_paths": [] },
-                "inputs": [],
-                "outputs": [],
-                "configuration": {
-                    "providerName": "test-provider",
-                    "agentName": "test-agent",
-                    "prompt": "Inspect the workspace.",
-                    "maxTurns": null,
-                    "maxToolCalls": null,
-                    "maxDuration": null,
-                    "configOverrides": {},
-                    "applicationMcpEnabled": false,
-                    "workspace": root
-                }
-            }
-        }
-    });
-    FlowDefinition {
-        flow_id,
-        name: "agent-flow".to_owned(),
-        revision: 1,
-        graph: serde_json::from_value(graph).unwrap(),
-        blackboard_defaults: serde_json::json!({}),
-        editor_metadata: serde_json::json!({}),
-        automatic_enabled: true,
-        workspace_mappings: Vec::new(),
-    }
-}
-
 async fn actor_for(path: &std::path::Path, tasks: Arc<TestTasks>) -> (Actor, mpsc::Sender<FlowRequest>) {
     actor_for_with_agent_and_retention(path, tasks, None, Vec::new(), 10).await
-}
-
-async fn actor_for_with_agent(
-    path: &std::path::Path,
-    tasks: Arc<dyn TasksLifecycleSudoService>,
-    agent: Arc<TestAgent>,
-) -> (Actor, mpsc::Sender<FlowRequest>) {
-    actor_for_with_agent_and_retention(
-        path,
-        tasks,
-        Some(agent),
-        copy_sources(&path.join("agents"), &[".agents"]),
-        10,
-    )
-    .await
 }
 
 async fn actor_for_with_agent_and_retention(
@@ -1399,7 +1201,7 @@ async fn actor_for_with_broadcasts(
     mpsc::Sender<FlowRequest>,
     mpsc::Receiver<super::super::messages::FlowBroadcast>,
 ) {
-    let options = super::super::types::FlowBootOptions::open(path.to_path_buf())
+    let options = super::super::types::FlowBootOptions::open(path.to_path_buf(), Arc::new(recording_workspace_hook))
         .await
         .unwrap();
     let (tx, rx) = mpsc::channel(16);
@@ -1420,19 +1222,8 @@ async fn actor_for_with_broadcasts(
         registry.register(registration).unwrap();
     }
     let node_registry = Arc::new(registry);
-    let workspace_hook = Arc::new(
-        DefaultWorkspace::new(
-            options.data_root.clone(),
-            &sync_services,
-            node_registry.clone(),
-            ServiceReader::from_published_test_service(Arc::new(TestWorkspaceSource)),
-            FlowStore::new(options.database.clone()),
-            ExecutionSnapshotStore::new(options.database.clone()),
-        )
-        .await
-        .unwrap()
-        .with_native_fixture(native_fixture),
-    );
+    let workspace_hook = Arc::new(RecordingWorkspaceHook::default());
+    *workspace_hook.fallback_root.lock().unwrap() = options.data_root.clone();
     let actor = Actor::new(
         rx,
         ActorDependencies {
@@ -1445,9 +1236,8 @@ async fn actor_for_with_broadcasts(
             node_registry,
             bus_context: BusRpcContext::unavailable(),
             workspace_hook,
-            application_workspace: false,
             sync_services: ServiceReader::from_published_test_service(Arc::new(sync_services)),
-            mobility_service,
+            mobility_service: Some(mobility_service),
             retention_completed_runs,
         },
     )
@@ -2064,125 +1854,6 @@ async fn app_checkpoint_error_fails_start() {
 }
 
 #[tokio::test]
-async fn selected_workspace_is_reused_for_independent_operations() {
-    let dir = tempfile::tempdir().unwrap();
-    let tasks = Arc::new(TestTasks {
-        starts: AtomicUsize::new(0),
-        fail_tick: false,
-        last_source: Mutex::new(None),
-    });
-    let (mut actor, _) = actor_for(dir.path(), tasks).await;
-    assert!(!dir.path().join("flows/executions").exists());
-    let source = dir.path().join("input.txt");
-    std::fs::write(&source, "input").unwrap();
-    actor
-        .import_workspace(source.to_string_lossy().into_owned())
-        .await
-        .unwrap();
-    let selected = actor.workspace_hook.clone();
-    let source = dir.path().join("input.txt");
-    actor
-        .import_workspace(source.to_string_lossy().into_owned())
-        .await
-        .unwrap();
-    assert!(Arc::ptr_eq(&selected, &actor.workspace_hook));
-    actor.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn flow_without_app_workspace_hook_keeps_normal_start_and_terminal_behavior() {
-    let dir = tempfile::tempdir().unwrap();
-    let tasks = Arc::new(TestTasks {
-        starts: AtomicUsize::new(0),
-        fail_tick: false,
-        last_source: Mutex::new(None),
-    });
-    let (mut actor, _) = actor_for(dir.path(), tasks.clone()).await;
-    actor.running = true;
-    let flow_id = FlowId(Uuid::new_v4());
-    actor.create_flow(definition(flow_id, 1)).await.unwrap();
-    let execution_id = start_flow(&mut actor, flow_id).await;
-    assert_eq!(tasks.starts.load(Ordering::SeqCst), 1); // The ScriptNode start is dispatched through Tasks.
-    assert!(actor.execution.contains_key(&execution_id));
-    assert!(
-        actor
-            .store
-            .load_execution_document_optional(execution_id)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        actor
-            .execution_root(execution_id)
-            .await
-            .join("workflow/trigger.json")
-            .is_file()
-    );
-    let durable = actor
-        .snapshot_store
-        .load_all()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|item| item.execution.execution_id == execution_id)
-        .unwrap();
-    assert!(durable.workspace_checkpoint.is_some());
-    assert!(!durable.workspace_entries.is_empty());
-    let root = actor.execution_root(execution_id).await;
-    std::fs::write(root.join("empty.txt"), b"").unwrap();
-    std::fs::remove_file(root.join("workflow/trigger.json")).unwrap();
-    let completion = actor.completion_rx.recv().await.unwrap();
-    actor.handle_dispatch_result(completion).await.unwrap();
-    assert!(
-        actor
-            .terminal_executions
-            .iter()
-            .any(|run| run.execution_id == execution_id && run.status == FlowExecutionStatus::Succeeded)
-    );
-    let terminal = actor
-        .snapshot_store
-        .load_all()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|item| item.execution.execution_id == execution_id)
-        .unwrap();
-    assert!(terminal.workspace_checkpoint.is_some());
-    assert!(!terminal.workspace_entries.is_empty());
-    let empty_hash = super::super::ast::ContentHash::try_from(iroh_blobs::Hash::EMPTY.to_string()).unwrap();
-    assert_eq!(terminal.workspace_entries.get("empty.txt"), Some(&empty_hash));
-    assert!(
-        !terminal
-            .workspace_entries
-            .contains_key("workflow/trigger.json")
-    );
-    actor
-        .cleanup_terminal_execution(execution_id)
-        .await
-        .unwrap();
-    assert!(!root.exists());
-    assert!(
-        actor
-            .store
-            .load_execution_document_optional(execution_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        actor
-            .snapshot_store
-            .load_all()
-            .await
-            .unwrap()
-            .iter()
-            .all(|item| item.execution.execution_id != execution_id)
-    );
-    actor.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn app_checkpoint_result_is_persisted_at_start_and_transition() {
     let dir = tempfile::tempdir().unwrap();
     let (mut actor, _) = actor_for(
@@ -2283,12 +1954,6 @@ async fn app_owned_restart_restores_selected_root_without_native_workspace() {
         .unwrap();
     assert_eq!(snapshot.workspace_checkpoint, checkpoint.workspace_checkpoint);
     assert_eq!(snapshot.workspace_entries, checkpoint.workspace_entries);
-    actor.application_workspace = false;
-    assert!(matches!(
-        actor.restore_execution(&snapshot).await,
-        Err(FlowError::AppWorkspaceUnavailable { execution_id: id }) if id == execution_id
-    ));
-    actor.application_workspace = true;
     let (restored_id, restored) = actor.restore_execution(&snapshot).await.unwrap();
     assert_eq!(restored_id, execution_id);
     let root = dir.path().join("custom-root");
@@ -2541,202 +2206,6 @@ async fn await_trigger_start(actor: &mut Actor, background_task_count: usize, tr
     })
     .await
     .expect("scheduled Flow owner start must complete promptly");
-}
-
-#[tokio::test]
-async fn imported_workspace_source_reaches_normal_script_owner_and_snapshots_roots() {
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("source");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("script.ts"), "export const known = 'workspace';").unwrap();
-    let tasks = Arc::new(TestTasks {
-        starts: AtomicUsize::new(0),
-        fail_tick: false,
-        last_source: std::sync::Mutex::new(None),
-    });
-    let (mut actor, _) = actor_for(directory.path(), tasks.clone()).await;
-    actor.running = true;
-
-    let (reply_to, reply_rx) = oneshot::channel();
-    actor
-        .handle_message(FlowRequest {
-            payload: FlowRequestPayload::ImportWorkspace {
-                source_path: source.to_string_lossy().into_owned(),
-            },
-            reply_to,
-        })
-        .await;
-    let FlowResponse::WorkspaceImported { root } = reply_rx.await.unwrap().unwrap() else {
-        panic!("workspace import response")
-    };
-    let flow_id = FlowId(Uuid::new_v4());
-    let mut flow = definition(flow_id, 1);
-    let super::super::graph::GraphNode::Leaf { node } = &mut flow.graph.root else {
-        panic!("script leaf")
-    };
-    let node = node.as_mut();
-    if node.node_kind != NodeKind::parse("ScriptNode").unwrap() {
-        panic!("script node")
-    }
-    let mut configuration: super::super::ast::ScriptNodeConfig =
-        serde_json::from_value(node.configuration.clone()).unwrap();
-    configuration.source_root = Some(root.clone());
-    node.inputs.clear();
-    node.configuration = serde_json::to_value(configuration).unwrap();
-    node.data_space.code_paths = vec![super::super::ast::ContentAddressedPath {
-        root: root.clone(),
-        path: "script.ts".to_owned(),
-    }];
-    flow.blackboard_defaults = serde_json::json!({});
-    actor.create_flow(flow).await.unwrap();
-
-    let execution_id = start_flow(&mut actor, flow_id).await;
-    assert_eq!(
-        tasks.last_source.lock().unwrap().as_deref(),
-        Some("export const known = 'workspace';")
-    );
-    let snapshot = actor
-        .snapshot_store
-        .load_all()
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(snapshot.code_roots, vec![root]);
-    assert!(snapshot.state_roots.is_empty());
-    assert!(
-        directory
-            .path()
-            .join("flows")
-            .join("executions")
-            .join(execution_id.to_string())
-            .join("code")
-            .exists()
-    );
-
-    let completion = actor.completion_rx.recv().await.unwrap();
-    actor.handle_dispatch_result(completion).await.unwrap();
-    let execution_root = directory
-        .path()
-        .join("flows")
-        .join("executions")
-        .join(execution_id.to_string());
-    assert!(
-        execution_root.exists(),
-        "retained terminal execution root should remain inspectable"
-    );
-    assert_eq!(
-        std::fs::read_to_string(execution_root.join("code").join("script.ts")).unwrap(),
-        "export const known = 'workspace';"
-    );
-    actor.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn imported_workspace_materializes_agent_owner_cwd_with_known_file() {
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("source");
-    let agents = directory.path().join("agents");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::create_dir_all(agents.join(".agents")).unwrap();
-    std::fs::write(agents.join(".agents/persona.md"), "provider asset").unwrap();
-    std::fs::write(source.join("known.txt"), "agent workspace contents").unwrap();
-    let agent = Arc::new(TestAgent {
-        starts: AtomicUsize::new(0),
-        observed_workspaces: std::sync::Mutex::new(Vec::new()),
-    });
-    let tasks = Arc::new(TestTasks {
-        starts: AtomicUsize::new(0),
-        fail_tick: false,
-        last_source: std::sync::Mutex::new(None),
-    });
-    let (mut actor, _) = actor_for_with_agent(directory.path(), tasks, agent.clone()).await;
-    actor.running = true;
-
-    let (reply_to, reply_rx) = oneshot::channel();
-    actor
-        .handle_message(FlowRequest {
-            payload: FlowRequestPayload::ImportWorkspace {
-                source_path: source.to_string_lossy().into_owned(),
-            },
-            reply_to,
-        })
-        .await;
-    let FlowResponse::WorkspaceImported { root } = reply_rx.await.unwrap().unwrap() else {
-        panic!("workspace import response");
-    };
-    let flow_id = FlowId(Uuid::new_v4());
-    actor
-        .create_flow(agent_definition(flow_id, root.clone()))
-        .await
-        .unwrap();
-
-    let execution_id = start_flow(&mut actor, flow_id).await;
-
-    assert_eq!(agent.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        agent.observed_workspaces.lock().unwrap().as_slice(),
-        &[(
-            directory
-                .path()
-                .join("flows")
-                .join("executions")
-                .join(execution_id.to_string()),
-            "agent workspace contents".to_owned(),
-        )]
-    );
-    let snapshot = actor
-        .snapshot_store
-        .load_all()
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(snapshot.code_roots, vec![root]);
-    assert!(snapshot.state_roots.is_empty());
-    assert!(
-        snapshot
-            .workspace_entries
-            .contains_key(".agents/persona.md")
-    );
-    assert_eq!(
-        std::fs::read_to_string(
-            actor
-                .execution_root(execution_id)
-                .await
-                .join(".agents/persona.md")
-        )
-        .unwrap(),
-        "provider asset"
-    );
-
-    let completion = actor.completion_rx.recv().await.unwrap();
-    actor.handle_dispatch_result(completion).await.unwrap();
-    std::fs::write(agents.join(".agents/persona.md"), "changed after checkpoint").unwrap();
-    snapshot
-        .workspace_checkpoint
-        .as_ref()
-        .expect("initial workspace checkpoint");
-    actor.restore_execution(&snapshot).await.unwrap();
-    assert_eq!(
-        std::fs::read_to_string(
-            actor
-                .execution_root(execution_id)
-                .await
-                .join(".agents/persona.md")
-        )
-        .unwrap(),
-        "provider asset"
-    );
-    assert!(
-        directory
-            .path()
-            .join("flows")
-            .join("executions")
-            .join(execution_id.to_string())
-            .exists()
-    );
-    actor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -3513,85 +2982,6 @@ async fn start_rejects_unregistered_kind_before_dispatch() {
     ));
     assert_eq!(tasks.starts.load(Ordering::SeqCst), 0);
     actor.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn flow_runs_locally_and_resolves_machine_peer_services_in_either_order() {
-    // No Machine, Machine after Flow, and Machine before Flow.
-    for publication in [None, Some(false), Some(true)] {
-        let directory = tempfile::tempdir().unwrap();
-        let fixture = NativeDocsFixture::open(directory.path()).await;
-        let services = fixture.sync_services();
-        let (reader, publisher) = ServiceReader::<dyn MachinePeerService>::test_slot();
-        if publication == Some(true) {
-            assert!(publisher.publish(Arc::new(services.clone())).is_ok());
-        }
-        let recorder = Arc::new(Mutex::new(Vec::new()));
-        let mut actor = echo_actor_with_sync(directory.path(), recorder.clone(), false, fixture, reader).await;
-        assert!(!actor.peer_sync_available);
-        if publication == Some(false) {
-            assert!(publisher.publish(Arc::new(services.clone())).is_ok());
-        }
-        actor.start_runtime().await.unwrap();
-        assert_eq!(actor.peer_sync_available, publication.is_some());
-        let flow_id = FlowId(Uuid::new_v4());
-        actor.create_flow(echo_definition(flow_id)).await.unwrap();
-        let input = directory.path().join("input.txt");
-        std::fs::write(&input, "local workspace").unwrap();
-        let root = actor.workspace_hook.import_path(input).await.unwrap();
-        let contents = actor
-            .workspace_hook
-            .read_script_source(ScriptSourceLocation::Stored { root }, "input.txt".to_owned())
-            .await
-            .unwrap();
-        assert_eq!(contents, "local workspace");
-
-        if publication.is_none() {
-            assert!(matches!(
-                actor.synchronize_flow(flow_id).await,
-                Err(FlowError::Workspace(WorkspaceError::ProviderUnavailable))
-            ));
-        }
-        let execution_id = start_flow(&mut actor, flow_id).await;
-        let completion = actor.completion_rx.recv().await.unwrap();
-        actor.handle_dispatch_result(completion).await.unwrap();
-        assert_eq!(*recorder.lock().unwrap(), ["start", "tick"]);
-        assert!(
-            actor
-                .snapshot_store
-                .load_all()
-                .await
-                .unwrap()
-                .iter()
-                .any(|snapshot| {
-                    snapshot.execution.execution_id == execution_id && snapshot.workspace_checkpoint.is_some()
-                })
-        );
-
-        if publication.is_some() {
-            assert!(actor.require_peer_service().is_ok());
-            actor
-                .select_mobility_destination(
-                    flow_id,
-                    vec![super::super::types::FlowMobilityDestination {
-                        peer_key: iroh::SecretKey::from_bytes(&[42; 32]).public().into(),
-                    }],
-                )
-                .await
-                .unwrap();
-            assert!(matches!(
-                actor.synchronize_flow(flow_id).await,
-                Err(FlowError::MobilityPeer { .. })
-            ));
-        } else {
-            assert!(publisher.publish(Arc::new(services)).is_ok());
-            assert!(matches!(
-                actor.synchronize_flow(flow_id).await,
-                Err(FlowError::Workspace(WorkspaceError::ProviderUnavailable))
-            ));
-        }
-        actor.shutdown().await.unwrap();
-    }
 }
 
 #[tokio::test]

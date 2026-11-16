@@ -1,5 +1,6 @@
 use std::fs::create_dir_all;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use iroh::{Endpoint, SecretKey, endpoint::presets, protocol::Router};
 use iroh_blobs::{BlobsProtocol, api::Store as BlobsStore, protocol::ALPN as BLOBS_ALPN, store::fs::FsStore};
@@ -7,6 +8,43 @@ use iroh_docs::{api::DocsApi, net::ALPN as DOCS_ALPN, protocol::Docs};
 use iroh_gossip::net::{GOSSIP_ALPN, Gossip};
 
 use crate::machine::{MachinePeerServices, PeerConnectivity};
+
+use super::hook::{
+    FlowAppHookContext, FlowAppHookFuture, FlowAppLandingContext, FlowAppTakeoffContext, FlowAppTakeoffFuture,
+    FlowAppTakeoffResult, FlowAppWorkspaceHook, FlowWorkspaceHookBoot, FlowWorkspaceHookFuture,
+};
+
+#[derive(Default)]
+struct RecordingWorkspaceHook {
+    calls: Mutex<Vec<FlowAppHookContext>>,
+}
+
+impl FlowAppWorkspaceHook for RecordingWorkspaceHook {
+    fn takeoff(&self, context: FlowAppTakeoffContext) -> FlowAppTakeoffFuture<'_> {
+        self.calls.lock().unwrap().push(context.execution.clone());
+        Box::pin(async move {
+            std::fs::create_dir_all(&context.execution.execution_root)?;
+            Ok(FlowAppTakeoffResult {
+                execution_root: context.execution.execution_root,
+                imported_workspace_root: None,
+            })
+        })
+    }
+
+    fn landing(&self, context: FlowAppLandingContext) -> FlowAppHookFuture<'_> {
+        self.calls.lock().unwrap().push(context.execution);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn release_artifacts(&self, context: FlowAppHookContext) -> FlowAppHookFuture<'_> {
+        self.calls.lock().unwrap().push(context);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+pub(super) fn recording_workspace_hook(_boot: FlowWorkspaceHookBoot) -> FlowWorkspaceHookFuture {
+    Box::pin(async { Arc::new(RecordingWorkspaceHook::default()) as Arc<dyn FlowAppWorkspaceHook> })
+}
 
 pub(super) struct NativeDocsFixture {
     _endpoint: Endpoint,

@@ -42,21 +42,22 @@ The Bus ALPN carries `RemoteOperationRequest { qualified_operation, input, jwt }
 
 ## Flow app workspace hook
 
-Flow exposes an opt-in `FlowAppWorkspaceHook` through `FlowBootOptions.app_workspace_hook`. With no hook set, Flow's behaviour is unchanged — the embedding application opts in by supplying an implementation.
+Flow requires an application-owned workspace. `FlowBootOptions.workspace_hook` is a required `FlowWorkspaceHookFactory`, and `FlowBootOptions::open(config_dir, workspace_hook)` takes it. Aves ships no default workspace implementation and never runs one alongside an application hook.
 
-- **Steps and defaults.** `takeoff`, `checkpoint`, `restore`, `landing`, `release_artifacts`. Application `checkpoint` defaults to an empty capture; `restore` defaults to a no-op. The other three are required.
-- **Context.** `FlowAppHookContext` carries execution id, flow id, definition revision, proposed execution root and invocation kind. `FlowAppLandingContext` adds terminal status and node correlations for `landing`.
+- **Construction.** `handle.rs` assembles the node registry, then calls the factory once with `FlowWorkspaceHookBoot` (data root, database, node registry, workspace source service, bus context) before the actor is constructed. One hook serves the whole Flow domain; the factory may capture application state.
+- **Steps and defaults.** `takeoff`, `landing` and `release_artifacts` are required. `checkpoint` defaults to an empty capture, `restore` and `execution_root` to the context root, `recoverable` to `Ok(true)`, artifact projection, `shutdown` and `checkpoint_committed` to `Ok(())`; import, download and script source fail with `WorkspaceError::ProviderUnavailable`.
+- **Context.** `FlowAppHookContext` carries execution id, flow id, definition revision, execution root and invocation kind. `FlowAppLandingContext` adds terminal status and node correlations for `landing`.
+- **Application-facing visibility.** `ContentHash::as_str()` and `MachineIssuerId::public_key()` are public so an application hook can persist and read back the path-to-hash projection it returns from `checkpoint` and can identify a mobility transfer source. No other visibility is widened for applications.
 - **Call-site guarantees.**
-  - `takeoff` is the workspace preparation boundary before the first tick: the application returns `FlowAppTakeoffResult`, or Flow's default prepares inputs, seeds and a native document. An application takeoff failure fails Start with a typed error. Application takeoff must clean up its own failed preparation.
-  - Application takeoff may return a root without a native document. Recovery, later checkpoint roots, landing and cleanup are not yet adapted to application-selected roots.
-  - `checkpoint` runs at start and at every transition. Application captures provide an optional native root and path-to-hash projection directly; without a hook Flow captures its own checkpoint.
-  - `restore` runs at restart, after Flow re-materializes its fresh inputs. For an app-owned execution, Flow first rewrites `workflow/trigger.json` from the saved pulse.
-  - `landing` runs after the durable terminal snapshot and before terminal history, for every outcome. Abort takes no checkpoint and its reply is not terminal; the landing callback is the handoff. A landing failure is logged and does not block terminalization.
-  - `release_artifacts` runs at retention cleanup after a replay of `landing`, followed by directory deletion. Cleanup replays carry no correlations; implementations must handle repeated calls. A hook failure keeps the cleanup anchor for retry without suppressing the new run's terminal broadcasts.
-- **Tests.** `flow/actor/tests.rs` exercises the hook through a `RecordingWorkspaceHook`; the no-hook default is covered by `flow_without_app_workspace_hook_keeps_normal_start_and_terminal_behavior`.
+  - `takeoff` is the workspace preparation boundary before the first tick: the application returns `FlowAppTakeoffResult` with the dispatch root and an optional imported root. A takeoff failure fails Start with `FlowError::AppWorkspaceTakeoff`, and the application must clean up its own failed preparation. A takeoff root needs no native document.
+  - `checkpoint` runs at start and at every transition, before the snapshot is durable; the application returns an optional checkpoint root and path-to-hash projection. `checkpoint_committed` follows once the snapshot is saved.
+  - `restore` runs at restart and selects the root used for node dispatch.
+  - `landing` runs after the durable terminal snapshot and before the terminal broadcasts, for every outcome. An abort takes no checkpoint; the durable aborted snapshot is followed by `landing`, which is the handoff. A landing failure is logged and does not block terminalization.
+  - `release_artifacts` runs at retention cleanup after a replay of `landing`, followed by the execution record's deletion. Cleanup replays carry no correlations; implementations must handle repeated calls. A hook failure keeps the cleanup anchor for retry without suppressing the new run's terminal broadcasts.
+- **Tests.** `flow/actor/tests.rs` exercises the hook through a `RecordingWorkspaceHook`: takeoff ordering and context, takeoff failure, landing failure, landing statuses, and retention cleanup replaying `landing` before `release_artifacts`.
 
 ## References and tests
 
-Start at [engineering navigation](../../docs/navigation.md). See [Flow Execution Workspace](../../docs/concepts/flow-execution-workspace.md), [Pluggable Flow Nodes](../../docs/architecture/aves/pluggable-flow-nodes.md), [Using Shell Nodes](../../docs/guides/using-shell-nodes.md), and [Iroh Peer Runtime](../../docs/architecture/aves/iroh-peer-runtime.md).
+Start at [engineering navigation](../../docs/navigation.md). See [Flow Execution Workspace](../../docs/concepts/flow-execution-workspace.md), [Flow Workspace Trait](../../docs/concepts/flow-workspace-trait.md), [Pluggable Flow Nodes](../../docs/architecture/aves/pluggable-flow-nodes.md), [Using Shell Nodes](../../docs/guides/using-shell-nodes.md), and [Iroh Peer Runtime](../../docs/architecture/aves/iroh-peer-runtime.md).
 
 Run `direnv exec . cargo test --package aves` from the repository root. Downstream crate tests use Aves's existing `test-support` feature; never widen production APIs for fixtures.

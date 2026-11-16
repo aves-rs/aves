@@ -64,7 +64,7 @@ pub(super) struct ActorDependencies {
     /// Late-bound peer services published by Machine.
     pub(super) sync_services: ServiceReader<dyn MachinePeerService>,
     /// Prepared mobility implementation.
-    pub(super) mobility_service: Arc<dyn FlowMobilityService>,
+    pub(super) mobility_service: Option<Arc<dyn FlowMobilityService>>,
     /// The bus context for the Flow actor.
     pub(super) bus_context: BusRpcContext,
     /// The broadcast channel for Flow events.
@@ -78,8 +78,6 @@ pub(super) struct ActorDependencies {
     pub(super) node_registry: Arc<FlowNodeRegistry>,
     /// Complete workspace implementation selected before actor construction.
     pub(super) workspace_hook: Arc<dyn FlowAppWorkspaceHook>,
-    /// Persisted ownership identity of newly prepared workspaces.
-    pub(super) application_workspace: bool,
     /// The retention completed runs for the Flow actor.
     pub(super) retention_completed_runs: u32,
 }
@@ -98,7 +96,6 @@ pub(super) struct Actor {
     pub(super) mcp_ports: FlowMcpPorts,
     /// Complete workspace implementation supplied during construction.
     pub(super) workspace_hook: Arc<dyn FlowAppWorkspaceHook>,
-    application_workspace: bool,
     /// The flow definitions for the Flow actor.
     pub(super) definitions: HashMap<FlowId, FlowDefinition>,
     /// The lifecycle adapter for the Flow actor.
@@ -109,7 +106,7 @@ pub(super) struct Actor {
     /// The node registry for the Flow actor.
     pub(super) node_registry: Arc<FlowNodeRegistry>,
     /// The mobility service for the Flow actor.
-    pub(super) mobility_service: Arc<dyn FlowMobilityService>,
+    pub(super) mobility_service: Option<Arc<dyn FlowMobilityService>>,
     /// The mobility coordinator for the Flow actor.
     pub(super) mobility: MobilityCoordinator,
     /// The triggers for the Flow actor.
@@ -160,7 +157,6 @@ impl Actor {
             database_path,
             node_registry,
             workspace_hook,
-            application_workspace,
             sync_services,
             mobility_service,
             retention_completed_runs,
@@ -190,7 +186,6 @@ impl Actor {
                 mcp_ports: mcp_ports.clone(),
             },
             workspace_hook,
-            application_workspace,
             definitions,
             mobility,
             mobility_service,
@@ -217,11 +212,6 @@ impl Actor {
 
         let mut durable_snapshots = Vec::new();
         for snapshot in actor.snapshot_store.load_all().await? {
-            if snapshot.workspace.is_application() != actor.application_workspace {
-                return Err(FlowError::AppWorkspaceUnavailable {
-                    execution_id: snapshot.execution.execution_id,
-                });
-            }
             let context = FlowAppHookContext {
                 execution_id: snapshot.execution.execution_id,
                 flow_id: snapshot.execution.flow_id,
@@ -434,7 +424,7 @@ impl Actor {
             return Ok(FlowResponse::RuntimeStarted);
         }
 
-        self.peer_sync_available = self.sync_services.get().is_some();
+        self.peer_sync_available = self.mobility_service.is_some() && self.sync_services.get().is_some();
 
         let execution_ids = self.execution.keys().copied().collect::<Vec<_>>();
         let mut recovered_dispatches = Vec::new();
@@ -606,14 +596,8 @@ impl Actor {
             .map_err(|source| FlowError::AppWorkspaceTakeoff { source })?;
         let execution_root = prepared.execution_root;
         let imported_workspace_root = prepared.imported_workspace_root;
-        let workspace = if self.application_workspace {
-            WorkspaceProvenance::Application {
-                root: execution_root.clone(),
-            }
-        } else {
-            WorkspaceProvenance::Native {
-                root: execution_root.clone(),
-            }
+        let workspace = WorkspaceProvenance::Native {
+            root: execution_root.clone(),
         };
         let mut tick_loop = FlowTickLoop::compile(
             &graph,
@@ -984,9 +968,6 @@ impl Actor {
         snapshot: &ExecutionSnapshot,
     ) -> Result<(FlowExecutionId, ExecutionState), FlowError> {
         let id = snapshot.execution.execution_id;
-        if snapshot.workspace.is_application() != self.application_workspace {
-            return Err(FlowError::AppWorkspaceUnavailable { execution_id: id });
-        }
         let definition = self
             .store
             .load_definition_revision(snapshot.execution.flow_id, snapshot.execution.revision)
@@ -1010,11 +991,7 @@ impl Actor {
             })
             .await
             .map_err(|source| FlowError::AppWorkspaceRestore { source })?;
-        let workspace = if snapshot.workspace.is_application() {
-            WorkspaceProvenance::Application { root: root.clone() }
-        } else {
-            WorkspaceProvenance::Native { root: root.clone() }
-        };
+        let workspace = WorkspaceProvenance::Native { root: root.clone() };
         let mut restored = snapshot.clone();
         restored.workspace = workspace.clone();
         self.snapshot_store.save(&restored).await?;

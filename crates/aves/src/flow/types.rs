@@ -3,8 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::io::Error as IoError;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, ParseError, Utc};
 use croner::errors::CronError;
@@ -31,8 +30,7 @@ use crate::utils::database::{DatabaseError, MigrationRunner, maintain_database, 
 use super::ast::{ContentAddressedRoot, ContentHash, FlowNode};
 use super::database::FlowStore;
 use super::graph::FlowGraphAst;
-use super::hook::FlowAppHookError;
-use super::hook::FlowAppWorkspaceHook;
+use super::hook::{FlowAppHookError, FlowWorkspaceHookFactory};
 use super::messages::{FlowResponse, LifecycleCorrelation};
 use super::registration::{
     FlowNodeRegistry, NodeKind, NodeKindRegistration, NodeRegistrationSupply, WorkspacePreparationError,
@@ -72,13 +70,13 @@ pub struct FlowBootOptions {
     pub node_registration_supply: NodeRegistrationSupply,
     /// Maximum number of completed executions retained per Flow.
     pub retention_completed_runs: u32,
-    /// Optional application-owned workspace lifecycle integration.
-    pub app_workspace_hook: Option<Arc<dyn FlowAppWorkspaceHook>>,
+    /// Factory for the required application-owned workspace lifecycle integration.
+    pub workspace_hook: FlowWorkspaceHookFactory,
 }
 
 impl FlowBootOptions {
-    /// Opens and migrates `config_dir/flows.db`, with workspace data under `config_dir/flows`.
-    pub async fn open(config_dir: PathBuf) -> Result<Self, FlowError> {
+    /// Opens and migrates the Flow database with the supplied workspace factory.
+    pub async fn open(config_dir: PathBuf, workspace_hook: FlowWorkspaceHookFactory) -> Result<Self, FlowError> {
         if config_dir.as_os_str().is_empty() {
             return Err(FlowError::EmptyDataRoot);
         }
@@ -100,7 +98,7 @@ impl FlowBootOptions {
             node_registrations: Vec::new(),
             node_registration_supply: NodeRegistrationSupply::default(),
             retention_completed_runs: DEFAULT_RETENTION_COMPLETED_RUNS,
-            app_workspace_hook: None,
+            workspace_hook,
         })
     }
 
@@ -157,6 +155,62 @@ pub struct FlowWorkspaceMapping {
     pub destination: String,
     /// Terminal source projection policy for a mapped workspace.
     pub mode: FlowWorkspaceMappingMode,
+}
+
+/// Validates mapping destinations and rejects overlaps.
+pub fn validate_mappings(mappings: &[FlowWorkspaceMapping]) -> Result<(), WorkspaceError> {
+    let mut destinations: Vec<PathBuf> = Vec::new();
+    for mapping in mappings {
+        let destination = mapping_destination(&mapping.destination)?;
+        for previous in &destinations {
+            if destination.starts_with(previous) || previous.starts_with(&destination) {
+                return Err(WorkspaceError::OverlappingMappings {
+                    first: previous.display().to_string(),
+                    second: destination.display().to_string(),
+                });
+            }
+        }
+        destinations.push(destination);
+    }
+    Ok(())
+}
+
+/// Validates and normalizes a nonempty relative path.
+pub fn checked_relative(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => result.push(part),
+            _ => {
+                return Err(WorkspaceError::PathEscapesRoot {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+    }
+    (!result.as_os_str().is_empty())
+        .then_some(result)
+        .ok_or_else(|| WorkspaceError::PathEscapesRoot {
+            path: path.to_path_buf(),
+        })
+}
+
+/// Validates a workspace mapping destination, allowing the root.
+pub fn mapping_destination(destination: &str) -> Result<PathBuf, WorkspaceError> {
+    if destination.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    if destination.trim() != destination
+        || destination.contains(['\\', ':', '\0'])
+        || destination
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(WorkspaceError::PathEscapesRoot {
+            path: PathBuf::from(destination),
+        });
+    }
+    checked_relative(Path::new(destination))
 }
 
 /// Terminal source projection policy for a mapped workspace.
@@ -218,7 +272,8 @@ pub enum FlowExecutionStatus {
 }
 
 impl FlowExecutionStatus {
-    pub(super) fn is_terminal(&self) -> bool {
+    /// Returns whether the execution has succeeded, failed, or been aborted.
+    pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Aborted)
     }
 }
@@ -936,7 +991,7 @@ pub enum WorkspaceError {
 
 impl WorkspaceError {
     /// Constructs a workspace filesystem error while deferring path ownership conversion.
-    pub(super) fn io(path: impl Into<PathBuf>, source: IoError) -> Self {
+    pub fn io(path: impl Into<PathBuf>, source: IoError) -> Self {
         Self::Io {
             path: path.into(),
             source,
@@ -944,7 +999,7 @@ impl WorkspaceError {
     }
 
     /// Constructs a workspace blob error while preserving its boxed source.
-    pub(super) fn blob(source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
+    pub fn blob(source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
         Self::Blob { source: source.into() }
     }
 }

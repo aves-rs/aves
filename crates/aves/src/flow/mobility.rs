@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     pin::Pin,
 };
@@ -169,6 +169,8 @@ impl Actor {
             .ok_or(FlowError::MobilityDestinationNotSelected)?;
         let acknowledgement = self
             .mobility_service
+            .as_deref()
+            .ok_or(WorkspaceError::ProviderUnavailable)?
             .import_snapshot(destination.clone(), snapshot)
             .await?;
         self.store
@@ -204,10 +206,10 @@ impl Actor {
             });
         };
         let mut documents_complete = true;
-        for execution in &snapshot.executions {
+        for reference in &snapshot.native_references {
             if self
                 .store
-                .load_execution_document_optional(execution.execution.execution_id)
+                .load_execution_document_optional(reference.execution_id)
                 .await?
                 .is_none()
             {
@@ -215,8 +217,16 @@ impl Actor {
                 break;
             }
         }
-        let history_complete =
-            snapshot.validate_selected_flow().is_ok() && snapshot.native_references.len() == snapshot.executions.len();
+        let execution_ids: HashSet<_> = snapshot
+            .executions
+            .iter()
+            .map(|execution| execution.execution.execution_id)
+            .collect();
+        let mut referenced_ids = HashSet::new();
+        let history_complete = snapshot.validate_selected_flow().is_ok()
+            && snapshot.native_references.iter().all(|reference| {
+                execution_ids.contains(&reference.execution_id) && referenced_ids.insert(reference.execution_id)
+            });
         let destination_committed = matches!(
             authority,
             FlowAuthorityState::InactiveCommitted | FlowAuthorityState::Active
@@ -250,14 +260,6 @@ impl Actor {
             .ok_or(FlowError::DefinitionNotFound)?;
         let triggers = self.store.list_triggers(flow_id).await?;
         let executions = self.snapshot_store.load_for_flow(flow_id).await?;
-        if let Some(execution) = executions
-            .iter()
-            .find(|execution| execution.workspace.is_application())
-        {
-            return Err(FlowError::AppWorkspaceMobilityUnsupported {
-                execution_id: execution.execution.execution_id,
-            });
-        }
         let mut snapshot = FlowMobilitySnapshot {
             flow_id,
             definition,
@@ -392,15 +394,23 @@ impl RuntimeFlowMobilityService {
 
 /// Native execution document and immutable blob references for one Flow execution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Type, schemars::JsonSchema)]
-pub(super) struct FlowExecutionNativeReferences {
-    pub(super) execution_id: FlowExecutionId,
-    pub(super) document_namespace_id: String,
-    pub(super) document_author_id: String,
-    pub(super) code_roots: Vec<ContentAddressedRoot>,
-    pub(super) state_roots: Vec<ContentAddressedRoot>,
-    pub(super) workspace_checkpoint: Option<ContentAddressedRoot>,
-    pub(super) workspace_entries: BTreeMap<String, ContentHash>,
-    pub(super) imported_workspace_root: Option<ContentAddressedRoot>,
+pub struct FlowExecutionNativeReferences {
+    /// Execution owning these references.
+    pub execution_id: FlowExecutionId,
+    /// Native document namespace identity.
+    pub document_namespace_id: String,
+    /// Native document author identity.
+    pub document_author_id: String,
+    /// Immutable code content roots.
+    pub code_roots: Vec<ContentAddressedRoot>,
+    /// Immutable state content roots.
+    pub state_roots: Vec<ContentAddressedRoot>,
+    /// Immutable workspace checkpoint, if captured.
+    pub workspace_checkpoint: Option<ContentAddressedRoot>,
+    /// Document projection of workspace paths to hashes.
+    pub workspace_entries: BTreeMap<String, ContentHash>,
+    /// Imported mapped workspace root, if present.
+    pub imported_workspace_root: Option<ContentAddressedRoot>,
 }
 
 /// Durable ownership and transfer position for one Flow.
@@ -453,16 +463,19 @@ impl FlowAuthorityState {
 /// One complete, selected-Flow durability unit for mobility transfer.
 #[derive(Clone, Debug, Deserialize, Serialize, Type, schemars::JsonSchema)]
 pub struct FlowMobilitySnapshot {
-    pub(super) flow_id: FlowId,
+    /// Identity of the selected Flow.
+    pub flow_id: FlowId,
     pub(super) definition: FlowDefinition,
     pub(super) triggers: Vec<FlowTriggerRecord>,
-    pub(super) executions: Vec<ExecutionSnapshot>,
-    pub(super) native_references: Vec<FlowExecutionNativeReferences>,
+    /// Retained execution recovery units.
+    pub executions: Vec<ExecutionSnapshot>,
+    /// Native content references associated with retained executions.
+    pub native_references: Vec<FlowExecutionNativeReferences>,
 }
 
 impl FlowMobilitySnapshot {
     /// Rejects a transfer unit that contains a definition or execution from another Flow.
-    pub(super) fn validate_selected_flow(&self) -> Result<(), FlowId> {
+    pub fn validate_selected_flow(&self) -> Result<(), FlowId> {
         (self.definition.flow_id == self.flow_id
             && self
                 .executions

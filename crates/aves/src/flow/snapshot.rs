@@ -40,10 +40,6 @@ impl WorkspaceProvenance {
             Self::Native { root } | Self::Application { root } => root.clone(),
         }
     }
-
-    pub(super) fn is_application(&self) -> bool {
-        matches!(self, Self::Application { .. })
-    }
 }
 
 /// The complete Flow-owned state written as one recovery unit.
@@ -52,20 +48,23 @@ impl WorkspaceProvenance {
 /// snapshot can therefore be safely persisted and used to reconstruct a new
 /// in-memory execution after a process restart.
 #[derive(Clone, Debug, Deserialize, Serialize, Type, schemars::JsonSchema)]
-pub(super) struct ExecutionSnapshot {
-    pub(super) execution: FlowExecutionSnapshot,
+pub struct ExecutionSnapshot {
+    /// Observer-visible execution state.
+    pub execution: FlowExecutionSnapshot,
     pub(super) blackboard: BTreeMap<String, Value>,
-    pub(super) code_roots: Vec<ContentAddressedRoot>,
-    pub(super) state_roots: Vec<ContentAddressedRoot>,
+    /// Immutable code content roots.
+    pub code_roots: Vec<ContentAddressedRoot>,
+    /// Immutable state content roots.
+    pub state_roots: Vec<ContentAddressedRoot>,
     /// Immutable workspace content bound to this graph position.
     #[serde(default)]
-    pub(super) workspace_checkpoint: Option<ContentAddressedRoot>,
+    pub workspace_checkpoint: Option<ContentAddressedRoot>,
     /// The document projection used to diff the live workspace at the next capture.
     #[serde(default)]
-    pub(super) workspace_entries: BTreeMap<String, ContentHash>,
+    pub workspace_entries: BTreeMap<String, ContentHash>,
     /// The source collection imported for this execution, when mapped input was used.
     #[serde(default)]
-    pub(super) imported_workspace_root: Option<ContentAddressedRoot>,
+    pub imported_workspace_root: Option<ContentAddressedRoot>,
     pub(super) workspace: WorkspaceProvenance,
     pub(super) reconstruction: ReconstructionState,
     pub(super) scratchpad: ScratchpadSnapshot,
@@ -111,7 +110,7 @@ pub enum NodeExecutionStatus {
 
 /// Persists execution and node state in one database transaction.
 #[derive(Clone)]
-pub(super) struct ExecutionSnapshotStore {
+pub struct ExecutionSnapshotStore {
     database: Database,
     #[cfg(test)]
     terminal_saves_before_injected_failure: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -121,7 +120,7 @@ pub(super) struct ExecutionSnapshotStore {
 
 impl ExecutionSnapshotStore {
     /// Creates a store using the already-migrated Aves Flow database.
-    pub(super) fn new(database: Database) -> Self {
+    pub fn new(database: Database) -> Self {
         Self {
             database,
             #[cfg(test)]
@@ -136,7 +135,7 @@ impl ExecutionSnapshotStore {
     }
 
     /// Loads every durable recovery unit and verifies its pinned observer identity.
-    pub(super) async fn load_all(&self) -> Result<Vec<ExecutionSnapshot>, SnapshotError> {
+    pub async fn load_all(&self) -> Result<Vec<ExecutionSnapshot>, SnapshotError> {
         let connection = self.database.connect()?;
         let mut rows = connection
             .query(include_str!("queries/load_executions.sql"), ())
@@ -396,10 +395,10 @@ mod tests {
 
         let restored: WorkspaceProvenance = serde_json::from_value(serde_json::to_value(native).unwrap()).unwrap();
         assert_eq!(restored.root(), source_root);
-        assert!(!restored.is_application());
+        assert!(matches!(restored, WorkspaceProvenance::Native { .. }));
         let restored: WorkspaceProvenance = serde_json::from_value(serde_json::to_value(application).unwrap()).unwrap();
         assert_eq!(restored.root(), application_root);
-        assert!(restored.is_application());
+        assert!(matches!(restored, WorkspaceProvenance::Application { .. }));
     }
 
     pub(super) fn maybe_fail_save(

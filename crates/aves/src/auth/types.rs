@@ -25,7 +25,8 @@ impl MachineIssuerId {
         *self.0.as_bytes()
     }
 
-    pub(crate) fn public_key(&self) -> PublicKey {
+    /// Returns the issuer's public key.
+    pub fn public_key(&self) -> PublicKey {
         self.0
     }
 }

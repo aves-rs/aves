@@ -8,7 +8,6 @@ use crate::utils::database::connect_database;
 
 use super::ast::{BlackboardBinding, FlowNode, NodeConstraints, NodeDataSpace};
 use super::cron::FlowTriggerRecord;
-use super::default_workspace::validate_mappings;
 use super::graph::GraphNode;
 use super::mobility::{
     FlowActivationAcknowledgement, FlowAuthorityState, FlowMobilityCommitAcknowledgement, FlowMobilitySnapshot,
@@ -19,7 +18,7 @@ use super::snapshot::{
 };
 use super::types::{
     FlowDefinition, FlowError, FlowExecutionDetail, FlowExecutionId, FlowId, FlowMobilityDestination, FlowTimestamp,
-    FlowWorkspaceMapping,
+    FlowWorkspaceMapping, validate_mappings,
 };
 
 const CREATE_EXECUTION_DOCUMENT_SQL: &str = include_str!("queries/create_execution_document.sql");
@@ -68,19 +67,21 @@ pub(super) struct PersistedMobilityState {
 
 /// Durable identity pair for one execution's local document.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ExecutionDocumentLink {
-    pub(super) namespace_id: String,
-    pub(super) author_id: String,
+pub struct ExecutionDocumentLink {
+    /// Native document namespace identity.
+    pub namespace_id: String,
+    /// Native document author identity.
+    pub author_id: String,
 }
 
 /// Durable Flow catalog and execution projection store.
-pub(super) struct FlowStore {
+pub struct FlowStore {
     database: Database,
 }
 
 impl FlowStore {
     /// Creates the Flow-owned persistence facade for the shared database.
-    pub(super) fn new(database: Database) -> Self {
+    pub fn new(database: Database) -> Self {
         Self { database }
     }
 
@@ -184,7 +185,8 @@ impl FlowStore {
         Ok(states)
     }
 
-    pub(super) async fn create_execution_document(
+    /// Persists the document link for an execution.
+    pub async fn create_execution_document(
         &self,
         execution_id: FlowExecutionId,
         link: &ExecutionDocumentLink,
@@ -203,7 +205,8 @@ impl FlowStore {
         Ok(())
     }
 
-    pub(super) async fn load_execution_document(
+    /// Loads an execution's document link or returns an execution-not-found error.
+    pub async fn load_execution_document(
         &self,
         execution_id: FlowExecutionId,
     ) -> Result<ExecutionDocumentLink, FlowError> {
@@ -212,7 +215,8 @@ impl FlowStore {
             .ok_or(FlowError::ExecutionNotFound)
     }
 
-    pub(super) async fn load_execution_document_optional(
+    /// Loads an execution's document link if one exists.
+    pub async fn load_execution_document_optional(
         &self,
         execution_id: FlowExecutionId,
     ) -> Result<Option<ExecutionDocumentLink>, FlowError> {
@@ -259,7 +263,7 @@ impl FlowStore {
     }
 
     /// A document is removable only when no other execution still links it.
-    pub(super) async fn document_is_exclusive(
+    pub async fn document_is_exclusive(
         &self,
         namespace_id: &str,
         author_id: &str,
@@ -804,6 +808,9 @@ fn decode_trigger(row: &Row) -> Result<FlowTriggerRecord, FlowError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use super::super::fixtures::recording_workspace_hook;
     use super::super::graph::{FlowGraphAst, GraphNode};
     use super::super::mobility::FlowMobilitySnapshot;
     use super::super::types::FlowBootOptions;
@@ -813,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn authority_state_persists_across_store_reads() {
         let directory = tempfile::tempdir().unwrap();
-        let options = FlowBootOptions::open(directory.path().to_path_buf())
+        let options = FlowBootOptions::open(directory.path().to_path_buf(), Arc::new(recording_workspace_hook))
             .await
             .unwrap();
         let flow_id = FlowId(uuid::Uuid::new_v4());
@@ -852,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn mobility_snapshot_round_trips_through_flow_store() {
         let directory = tempfile::tempdir().unwrap();
-        let options = FlowBootOptions::open(directory.path().to_path_buf())
+        let options = FlowBootOptions::open(directory.path().to_path_buf(), Arc::new(recording_workspace_hook))
             .await
             .unwrap();
         let flow_id = FlowId(uuid::Uuid::new_v4());
@@ -906,7 +913,7 @@ mod tests {
         use super::super::types::{FlowBootOptions, FlowDefinition, FlowId};
 
         let directory = tempfile::tempdir().unwrap();
-        let options = FlowBootOptions::open(directory.path().to_path_buf())
+        let options = FlowBootOptions::open(directory.path().to_path_buf(), Arc::new(recording_workspace_hook))
             .await
             .unwrap();
         let store = super::FlowStore::new(options.database);

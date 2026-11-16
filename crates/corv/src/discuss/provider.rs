@@ -33,7 +33,8 @@ use super::types::{
     ProviderRuntimeState, WorkerCommand,
 };
 
-type SharedConnectionResult = Result<(ConnectionTo<Agent>, bool, bool), agent_client_protocol::Error>;
+/// Connection plus native-ACP MCP, HTTP MCP and session system-prompt support.
+type SharedConnectionResult = Result<(ConnectionTo<Agent>, bool, bool, bool), agent_client_protocol::Error>;
 
 impl Actor {
     /// Add a provider to the ACP server.
@@ -422,8 +423,7 @@ impl Actor {
         let callback_router = self.shared_provider_callback_router(provider_name)?;
         let callback_routes = Arc::new(Mutex::new(CallbackRouteRegistry::new(callback_router)));
         let callback_routes_for_connection = callback_routes.clone();
-        let (ready_tx, ready_rx) =
-            oneshot::channel::<Result<(ConnectionTo<Agent>, bool, bool), agent_client_protocol::Error>>();
+        let (ready_tx, ready_rx) = oneshot::channel::<SharedConnectionResult>();
         let (exit_tx, exit_rx) = oneshot::channel();
         let owner = tokio::spawn(async move {
             let stderr_task = tokio::spawn(async move {
@@ -444,6 +444,11 @@ impl Actor {
                         connection.clone(),
                         init_response.agent_capabilities.mcp_capabilities.acp,
                         init_response.agent_capabilities.mcp_capabilities.http,
+                        init_response
+                            .agent_capabilities
+                            .session_capabilities
+                            .system_prompt
+                            .is_some(),
                     )));
                     connection.incoming_closed().await;
                     Ok(())
@@ -456,13 +461,15 @@ impl Actor {
             stderr_task.abort();
             let _ = exit_tx.send(());
         });
-        let (connection, mcp_acp, mcp_http) = Self::shared_connection_result(provider_name, ready_rx, &owner).await?;
+        let (connection, mcp_acp, mcp_http, system_prompt) =
+            Self::shared_connection_result(provider_name, ready_rx, &owner).await?;
         Ok(SharedConnectionReady {
             connection,
             owner,
             exit_rx,
             mcp_acp,
             mcp_http,
+            system_prompt,
             callback_routes,
         })
     }
@@ -520,9 +527,9 @@ impl Actor {
         provider_name: &str,
         ready_rx: oneshot::Receiver<SharedConnectionResult>,
         owner: &JoinHandle<()>,
-    ) -> Result<(ConnectionTo<Agent>, bool, bool), DiscussError> {
+    ) -> Result<(ConnectionTo<Agent>, bool, bool, bool), DiscussError> {
         let ready_result = ready_rx.await;
-        let (connection, mcp_acp, mcp_http) = match ready_result {
+        let (connection, mcp_acp, mcp_http, system_prompt) = match ready_result {
             Ok(Ok(ready)) => ready,
             Ok(Err(error)) => {
                 owner.abort();
@@ -536,7 +543,7 @@ impl Actor {
                 });
             }
         };
-        Ok((connection, mcp_acp, mcp_http))
+        Ok((connection, mcp_acp, mcp_http, system_prompt))
     }
 
     async fn ensure_shared_provider_connection(&mut self, provider_name: &str) -> Result<(), DiscussError> {
@@ -566,6 +573,7 @@ impl Actor {
             connection_owner,
             mcp_acp,
             mcp_http,
+            system_prompt,
             callback_routes,
             ..
         } = &mut supervisor.resources
@@ -573,6 +581,7 @@ impl Actor {
             *connection = Some(ready.connection);
             *mcp_acp = ready.mcp_acp;
             *mcp_http = ready.mcp_http;
+            *system_prompt = ready.system_prompt;
             *callback_routes = Some(ready.callback_routes.clone());
             *connection_owner = Some(ready.owner);
         } else {
@@ -743,6 +752,7 @@ impl Actor {
                     callback_routes,
                     mcp_acp,
                     mcp_http,
+                    system_prompt,
                     ..
                 } => {
                     supervisor.chat_sessions.clear();
@@ -750,6 +760,7 @@ impl Actor {
                     *callback_router = Arc::new(Mutex::new(CallbackRouter::default()));
                     *mcp_acp = false;
                     *mcp_http = false;
+                    *system_prompt = false;
                     (
                         connection_owner.take(),
                         connection_watcher.take(),
@@ -1230,21 +1241,6 @@ mod tests {
             value["workspace_copy_sources"] = serde_json::json!(sources);
         }
         serde_json::from_value(value).expect("provider source config")
-    }
-
-    #[test]
-    fn absent_sources_use_builtin_defaults_and_mandatory_agents() {
-        for (name, expected) in [
-            ("opencode", Some(".opencode")),
-            ("claude-acp", Some(".claude")),
-            ("codex-acp", Some(".codex")),
-            ("grok-build", Some(".grok")),
-            ("custom-provider", None),
-        ] {
-            let mut sources = vec![".agents".to_string()];
-            sources.extend(expected.map(str::to_string));
-            assert_eq!(effective_workspace_copy_sources(name, &provider(None)), sources);
-        }
     }
 
     #[test]

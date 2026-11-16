@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use super::super::library::{AgentDefinition, AgentId, AssetLibrary, SkillDefinition, SkillId, TeamDefinition};
 use super::super::types::{DiscussConfigOption, DiscussConfigOptionValue, DiscussError};
-use super::{ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, render_skill_file, resolve_agent, resolve_skill};
+use super::{
+    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PrimaryAgentSelection, render_skill_file, resolve_agent,
+    resolve_skill,
+};
 
 pub const GROK_PLUGIN_NAME: &str = "grok-build";
 
@@ -16,6 +19,8 @@ const AGENTS_DIRECTORY: &str = ".grok/agents";
 const SKILLS_DIRECTORY: &str = ".grok/skills";
 
 const GROK_SESSION_CONFIG_META_KEY: &str = "x.ai/sessionConfig";
+/// `session/new` `_meta` field whose text Grok appends to the session system prompt.
+const RULES_META_KEY: &str = "rules";
 const GROK_MODEL_CATEGORY: &str = "model";
 const GROK_EFFORT_CATEGORY: &str = "mode";
 
@@ -74,6 +79,15 @@ impl DiscussAgentPlugin for GrokPlugin {
 
     fn skill_scope_key(&self) -> &'static str {
         "plugin.grok-build"
+    }
+
+    /// Grok's `_meta.agentProfile` ignores project-only agents, so the leader's instructions go
+    /// through `_meta.rules`, which Grok appends to the session system prompt.
+    fn primary_agent_selection(&self, agent: &AgentDefinition) -> PrimaryAgentSelection {
+        PrimaryAgentSelection::SessionMeta(serde_json::Map::from_iter([(
+            RULES_META_KEY.to_string(),
+            serde_json::Value::String(agent.body.to_string()),
+        )]))
     }
 
     fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {

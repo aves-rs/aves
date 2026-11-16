@@ -21,8 +21,9 @@ use super::config::{
 };
 use super::database::*;
 use super::elicitation::validate_elicitation_content;
+use super::library::AgentId;
 use super::messages::DiscussResponse;
-use super::plugins;
+use super::plugins::{self, PrimaryAgentSelection};
 use super::session::{
     PendingElicitationCancel, SESSION_WORKER_JWT_EXPIRATION, SessionWorkerFailure, WorkerSessionParams,
     ensure_agents_workspace_dir, initialize_request, issue_worker_jwt, load_session_request, revoke_worker_jti,
@@ -292,43 +293,86 @@ impl Actor {
         let mut launch_server = plugin.launch_server(agent_spec.server());
         let root_default_config = SessionLaunchConfig::default();
         let launch_workspace = Self::launch_workspace(setup.as_ref(), session_cwd.as_ref(), &self.agents_workspace)?;
+        let restores_team_at_root = matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. }));
+        let persisted_setup_kind = Self::setup_kind_for(setup.as_ref());
+        let (assigned_agent_name, setup_settings) = self.resolve_session_setup(key, setup).await?;
+        let primary_agent = assigned_agent_name
+            .as_deref()
+            .map(|leader_id| {
+                let agent_id = AgentId::try_from(leader_id.to_string()).map_err(|error| {
+                    DiscussError::WorkspaceInvalidAssetId {
+                        asset_id: leader_id.to_string(),
+                        violation: error.to_string(),
+                    }
+                })?;
+                plugins::resolve_agent(self.library, &agent_id)
+            })
+            .transpose()?;
         let launch_inputs = match launch_config.as_ref() {
             Some(config) => Some((config, launch_workspace)),
-            None if matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. })) => {
-                Some((&root_default_config, launch_workspace))
-            }
+            None if restores_team_at_root => Some((&root_default_config, launch_workspace)),
             None => None,
         };
-        let isolated_configured = if let Some((config, workspace)) = launch_inputs {
+        let mut isolated_configured = if let Some((config, workspace)) = launch_inputs {
             launch_server = plugin.configured_launch_server(&launch_server, workspace, config)?;
             true
         } else {
             false
         };
+        // A launch-argument selection names the Agent per process, so the session needs its own.
+        if let Some(agent) = primary_agent
+            && let PrimaryAgentSelection::LaunchArguments(arguments) = plugin.primary_agent_selection(agent)
+        {
+            let McpServer::Stdio(server) = &mut launch_server else {
+                return Err(DiscussError::Validation {
+                    message: "Launch-argument Agent selection requires a stdio ACP server".to_string(),
+                });
+            };
+            server.args.extend(arguments);
+            isolated_configured = true;
+        }
         let agent = Self::acp_agent_from_server(&launch_server)?;
-        let (callback_router, callback_routes, shared_connection, shared_mcp_capabilities, shared_mcp_registrations) =
-            self.provider_supervisors
-                .get(key)
-                .filter(|_| !isolated_configured)
-                .and_then(|supervisor| match &supervisor.resources {
-                    ProviderSupervisorResources::Shared {
-                        connection: Some(connection),
-                        callback_router,
-                        callback_routes,
-                        mcp_acp,
-                        mcp_http,
-                        mcp_registrations,
-                        ..
-                    } => Some((
-                        callback_router.clone(),
-                        callback_routes.clone(),
-                        Some(connection.clone()),
-                        Some((*mcp_acp, *mcp_http)),
-                        Some(mcp_registrations.clone()),
-                    )),
-                    ProviderSupervisorResources::Shared { .. } | ProviderSupervisorResources::Isolated { .. } => None,
-                })
-                .unwrap_or_else(|| (Arc::new(Mutex::new(CallbackRouter::default())), None, None, None, None));
+        let (
+            callback_router,
+            callback_routes,
+            shared_connection,
+            shared_mcp_capabilities,
+            system_prompt_supported,
+            shared_mcp_registrations,
+        ) = self
+            .provider_supervisors
+            .get(key)
+            .filter(|_| !isolated_configured)
+            .and_then(|supervisor| match &supervisor.resources {
+                ProviderSupervisorResources::Shared {
+                    connection: Some(connection),
+                    callback_router,
+                    callback_routes,
+                    mcp_acp,
+                    mcp_http,
+                    system_prompt,
+                    mcp_registrations,
+                    ..
+                } => Some((
+                    callback_router.clone(),
+                    callback_routes.clone(),
+                    Some(connection.clone()),
+                    Some((*mcp_acp, *mcp_http)),
+                    *system_prompt,
+                    Some(mcp_registrations.clone()),
+                )),
+                ProviderSupervisorResources::Shared { .. } | ProviderSupervisorResources::Isolated { .. } => None,
+            })
+            .unwrap_or_else(|| {
+                (
+                    Arc::new(Mutex::new(CallbackRouter::default())),
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+            });
         let configured_defaults = config_settings_from_value(agent_spec.default_session_config());
         let conn = self.persistence.acquire_connection().await?;
         let agent_defaults = if transient_connectivity {
@@ -341,8 +385,6 @@ impl Actor {
                 .unwrap_or(configured_defaults)
         };
         drop(conn);
-        let persisted_setup_kind = Self::setup_kind_for(setup.as_ref());
-        let (assigned_agent_name, setup_settings) = self.resolve_session_setup(key, setup).await?;
         if reconnect_acp_session_id.is_none() {
             session_settings.extend(setup_settings);
         }
@@ -426,7 +468,7 @@ impl Actor {
             auth_launch_server: launch_server,
             session_name,
             agent_name,
-            assigned_agent_name,
+            primary_agent,
             reconnect_acp_session_id,
             persisted_config_options,
             session_settings,
@@ -455,6 +497,7 @@ impl Actor {
             callback_routes,
             shared_connection,
             shared_mcp_capabilities,
+            system_prompt_supported,
             shared_mcp_registrations,
         };
         let join_handle = tokio::spawn(run_session_worker_with_reporting(

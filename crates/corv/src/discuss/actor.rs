@@ -86,6 +86,7 @@ pub(super) struct SharedConnectionReady {
     pub(super) exit_rx: oneshot::Receiver<()>,
     pub(super) mcp_acp: bool,
     pub(super) mcp_http: bool,
+    pub(super) system_prompt: bool,
     pub(super) callback_routes: Arc<Mutex<CallbackRouteRegistry>>,
 }
 

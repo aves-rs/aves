@@ -5,12 +5,17 @@ use serde::Serialize;
 
 use super::super::library::{AgentDefinition, AgentId, AssetLibrary, SkillDefinition, TeamDefinition};
 use super::super::types::DiscussError;
-use super::{ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, render_skill_file, resolve_agent, resolve_skill};
+use super::{
+    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PrimaryAgentSelection, render_skill_file, resolve_agent,
+    resolve_skill,
+};
 
 pub const CLAUDE_PLUGIN_NAME: &str = "claude-acp";
 
 const AGENTS_DIRECTORY: &str = ".claude/agents";
 const SKILLS_DIRECTORY: &str = ".claude/skills";
+/// claude-agent-acp's session config option selecting the main-thread custom agent.
+const AGENT_CONFIG_ID: &str = "agent";
 
 /// Claude ACP Discuss integration.
 pub struct ClaudePlugin;
@@ -41,6 +46,11 @@ impl DiscussAgentPlugin for ClaudePlugin {
 
     fn skill_scope_key(&self) -> &'static str {
         "plugin.claude-acp"
+    }
+
+    /// claude-agent-acp lists `.claude/agents` in its `agent` option and runs the main thread as the selection.
+    fn primary_agent_selection(&self, _agent: &AgentDefinition) -> PrimaryAgentSelection {
+        PrimaryAgentSelection::ConfigOption(AGENT_CONFIG_ID)
     }
 
     fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {

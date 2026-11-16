@@ -90,6 +90,11 @@ pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -
                 init_response.agent_capabilities.mcp_capabilities.acp,
                 init_response.agent_capabilities.mcp_capabilities.http,
             ));
+            params.system_prompt_supported = init_response
+                .agent_capabilities
+                .session_capabilities
+                .system_prompt
+                .is_some();
             run_connected_session(params, connection).await
         })
         .await;
@@ -576,7 +581,8 @@ async fn prepare_worker_session(
             reconnect_session_id: params.reconnect_acp_session_id.clone(),
             cwd: params.agents_workspace.clone(),
             mcp_servers: mcp_descriptors.clone(),
-            assigned_agent_name: params.assigned_agent_name.clone(),
+            primary_agent: params.primary_agent,
+            system_prompt_supported: params.system_prompt_supported,
             resolved_config: merged_config_preferences(&params.agent_defaults, &params.session_settings),
             persisted_config_options: params.persisted_config_options.clone(),
         },
@@ -634,7 +640,11 @@ async fn open_worker_session(
         options,
     )
     .await
-    .map_err(agent_client_protocol::Error::into_internal_error)?;
+    .map_err(|error| {
+        // The ACP boundary reduces this to a bare internal error; record the typed cause here.
+        tracing::warn!(%discuss_session_id, provider = %agent_name, %error, "Configured ACP session open failed");
+        agent_client_protocol::Error::into_internal_error(error)
+    })?;
     let session = configured.session;
     tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), "ACP session configuration completed");
     let latest_config_options = configured.config_options;

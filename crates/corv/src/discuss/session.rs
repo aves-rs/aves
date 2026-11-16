@@ -9,10 +9,11 @@ use std::{
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
-    AuthCapabilities, AuthMethod, ClientCapabilities, CreateElicitationRequest, CreateElicitationResponse,
-    ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities, ElicitationScope, InitializeRequest,
-    LoadSessionRequest, McpServer, NewSessionRequest, NewSessionResponse, RequestPermissionRequest,
-    RequestPermissionResponse, SessionConfigOptionValue, SessionId, SessionInfo, SetSessionConfigOptionRequest,
+    AuthCapabilities, AuthMethod, ClientCapabilities, ContentBlock, CreateElicitationRequest,
+    CreateElicitationResponse, ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities,
+    ElicitationScope, InitializeRequest, LoadSessionRequest, McpServer, Meta, NewSessionRequest, NewSessionResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionConfigOptionValue, SessionId, SessionInfo,
+    SetSessionConfigOptionRequest, SystemPrompt, TextContent,
 };
 use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
 use agent_client_protocol::{
@@ -35,8 +36,10 @@ use aves::runtime::ServiceReader;
 
 use super::agents::{AssistantTurnBuffer, FlushPayload};
 use super::boot::DiscussMcpDomain;
-use super::config::{ConfigPreferenceReconciler, assigned_agent_mode_selection, without_mode_preferences};
+use super::config::{ConfigPreferenceReconciler, primary_agent_option_selection};
+use super::library::AgentDefinition;
 use super::messages::DiscussResponse;
+use super::plugins::PrimaryAgentSelection;
 use super::plugins::{self, ConfigSettings};
 use super::storage::DiscussPersistence;
 use super::supervisor::{
@@ -100,7 +103,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) auth_launch_server: McpServer,
     pub(super) session_name: String,
     pub(super) agent_name: String,
-    pub(super) assigned_agent_name: Option<String>,
+    pub(super) primary_agent: Option<&'static AgentDefinition>,
     pub(super) reconnect_acp_session_id: Option<SessionId>,
     pub(super) persisted_config_options: Vec<DiscussConfigOption>,
     pub(super) session_settings: ConfigSettings,
@@ -129,6 +132,8 @@ pub(super) struct WorkerSessionParams {
     pub(super) callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
     pub(super) shared_connection: Option<ConnectionTo<Agent>>,
     pub(super) shared_mcp_capabilities: Option<(bool, bool)>,
+    /// Whether the Provider advertises `sessionCapabilities.systemPrompt`.
+    pub(super) system_prompt_supported: bool,
     pub(super) shared_mcp_registrations: Option<SharedMcpRegistrations>,
 }
 
@@ -859,9 +864,44 @@ pub(super) struct OpenConfiguredSessionOptions {
     pub(super) reconnect_session_id: Option<SessionId>,
     pub(super) cwd: PathBuf,
     pub(super) mcp_servers: Vec<McpServer>,
-    pub(super) assigned_agent_name: Option<String>,
+    pub(super) primary_agent: Option<&'static AgentDefinition>,
+    pub(super) system_prompt_supported: bool,
     pub(super) resolved_config: ConfigSettings,
     pub(super) persisted_config_options: Vec<DiscussConfigOption>,
+}
+
+/// Session-open request fields that select the primary Agent before the session exists.
+struct PrimaryAgentOpen {
+    system_prompt: Option<SystemPrompt>,
+    meta: Option<Meta>,
+}
+
+impl PrimaryAgentOpen {
+    fn for_selection(
+        primary_agent: Option<&(&'static AgentDefinition, PrimaryAgentSelection)>,
+        system_prompt_supported: bool,
+    ) -> Result<Self, DiscussError> {
+        let mut open = Self {
+            system_prompt: None,
+            meta: None,
+        };
+        match primary_agent {
+            Some((agent, PrimaryAgentSelection::SystemPrompt)) => {
+                if !system_prompt_supported {
+                    return Err(DiscussError::UnsupportedCapability {
+                        capability: "system_prompt".to_string(),
+                    });
+                }
+                open.system_prompt = Some(SystemPrompt::new(vec![ContentBlock::Text(TextContent::new(
+                    agent.body,
+                ))]));
+            }
+            Some((_, PrimaryAgentSelection::SessionMeta(meta))) => open.meta = Some(meta.clone()),
+            // Launch arguments were applied to the session's own process before it started.
+            Some((_, PrimaryAgentSelection::ConfigOption(_) | PrimaryAgentSelection::LaunchArguments(_))) | None => {}
+        }
+        Ok(open)
+    }
 }
 
 pub(super) struct ConfiguredSession {
@@ -881,20 +921,27 @@ pub(super) async fn open_configured_session(
     options: OpenConfiguredSessionOptions,
 ) -> Result<ConfiguredSession, DiscussError> {
     tracing::debug!(provider = provider_name, cwd = %options.cwd.display(), reconnect = options.reconnect_session_id.is_some(), "Requesting ACP session open");
+    let agent_plugin = plugins::for_agent(provider_name);
+    let primary_agent = options
+        .primary_agent
+        .map(|agent| (agent, agent_plugin.primary_agent_selection(agent)));
+    let open = PrimaryAgentOpen::for_selection(primary_agent.as_ref(), options.system_prompt_supported)?;
     let session_response = if let Some(session_id) = options.reconnect_session_id {
         let response = connection
-            .send_request(load_session_request(
-                session_id.clone(),
-                options.cwd.clone(),
-                &options.mcp_servers,
-            ))
+            .send_request(
+                load_session_request(session_id.clone(), options.cwd.clone(), &options.mcp_servers)
+                    .system_prompt(open.system_prompt)
+                    .meta(open.meta),
+            )
             .block_task()
             .await?;
         NewSessionResponse::new(session_id).config_options(response.config_options)
     } else {
         connection
             .send_request_to(Agent, {
-                let request = NewSessionRequest::new(options.cwd);
+                let request = NewSessionRequest::new(options.cwd)
+                    .system_prompt(open.system_prompt)
+                    .meta(open.meta);
                 if options.mcp_servers.is_empty() {
                     request
                 } else {
@@ -917,46 +964,38 @@ pub(super) async fn open_configured_session(
         callback_tx,
     )?;
 
-    let agent_plugin = plugins::for_agent(provider_name);
     let normalized_options =
         agent_plugin.initial_config_options(initial_config_options.clone(), initial_config_metadata.as_ref());
     let supports_config_updates = initial_config_options.is_some() || normalized_options.is_some();
     let mut provider_options = normalized_options.unwrap_or(options.persisted_config_options);
-    tracing::debug!(provider = provider_name, acp_session_id = %session.session_id(), assigned_agent = ?options.assigned_agent_name, option_count = provider_options.len(), "Resolving ACP session configuration");
+    tracing::debug!(provider = provider_name, acp_session_id = %session.session_id(), primary_agent = ?primary_agent.as_ref().map(|(agent, _)| agent.id.to_string()), option_count = provider_options.len(), "Resolving ACP session configuration");
 
     let mut applied_settings = options.resolved_config.clone();
-    let selected_mode_config_id = if let Some(assigned_agent_name) = options.assigned_agent_name {
-        let mode_selection =
-            assigned_agent_mode_selection(&provider_options, &assigned_agent_name).ok_or_else(|| {
-                DiscussError::Validation {
-                    message: format!("Provider does not advertise assigned Agent `{assigned_agent_name}`"),
-                }
-            })?;
-        let selected_mode_config_id = mode_selection.config_id.clone();
-        let selected_mode_value = mode_selection.value.clone();
-        tracing::debug!(provider = provider_name, acp_session_id = %session.session_id(), team = %assigned_agent_name, "Applying assigned Agent mode");
+    let mut preferences = options.resolved_config;
+    if let Some((agent, PrimaryAgentSelection::ConfigOption(config_id))) = &primary_agent {
+        let agent_id = agent.id.to_string();
+        let selection = primary_agent_option_selection(&provider_options, config_id, &agent_id).ok_or_else(|| {
+            DiscussError::Validation {
+                message: format!("Provider does not advertise assigned Agent `{agent_id}`"),
+            }
+        })?;
+        tracing::debug!(provider = provider_name, acp_session_id = %session.session_id(), agent = %agent_id, "Selecting primary Agent");
         let response = session
             .connection()
             .send_request(SetSessionConfigOptionRequest::new(
                 session.session_id().clone(),
-                mode_selection.config_id,
-                SessionConfigOptionValue::value_id(mode_selection.value),
+                selection.config_id.clone(),
+                SessionConfigOptionValue::value_id(selection.value.clone()),
             ))
             .block_task()
             .await?;
         provider_options = agent_plugin
             .initial_config_options(Some(response.config_options), None)
             .unwrap_or_default();
-        applied_settings.insert(selected_mode_config_id.clone(), selected_mode_value);
-        Some(selected_mode_config_id)
-    } else {
-        None
-    };
-
-    let preferences = selected_mode_config_id
-        .as_deref()
-        .map(|config_id| without_mode_preferences(&options.resolved_config, &provider_options, config_id))
-        .unwrap_or(options.resolved_config);
+        // The Agent selection is authoritative; a stored preference for the same option must not undo it.
+        preferences.remove(&selection.config_id);
+        applied_settings.insert(selection.config_id, selection.value);
+    }
     let mut reconciler = ConfigPreferenceReconciler::new(&preferences, provider_options);
 
     while let Some(selection) = reconciler.next() {
@@ -996,6 +1035,40 @@ pub(super) fn channel_send_error(operation: &'static str, cause: impl Into<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_agent_open_shapes_the_session_request_per_selection() {
+        let agent = super::super::test_library::library()
+            .agents_for()
+            .next()
+            .expect("agent");
+
+        let open =
+            PrimaryAgentOpen::for_selection(Some(&(agent, PrimaryAgentSelection::SystemPrompt)), true).expect("open");
+        assert_eq!(
+            open.system_prompt,
+            Some(SystemPrompt::new(vec![ContentBlock::Text(TextContent::new(
+                agent.body
+            ))]))
+        );
+        assert!(open.meta.is_none());
+
+        assert!(matches!(
+            PrimaryAgentOpen::for_selection(Some(&(agent, PrimaryAgentSelection::SystemPrompt)), false),
+            Err(DiscussError::UnsupportedCapability { ref capability }) if capability == "system_prompt"
+        ));
+
+        let meta = Meta::from_iter([("agentProfile".to_string(), serde_json::json!("leader"))]);
+        let open =
+            PrimaryAgentOpen::for_selection(Some(&(agent, PrimaryAgentSelection::SessionMeta(meta.clone()))), false)
+                .expect("open");
+        assert_eq!(open.meta, Some(meta));
+        assert!(open.system_prompt.is_none());
+
+        let open = PrimaryAgentOpen::for_selection(Some(&(agent, PrimaryAgentSelection::ConfigOption("agent"))), false)
+            .expect("open");
+        assert!(open.system_prompt.is_none() && open.meta.is_none());
+    }
 
     #[test]
     fn form_elicitation_routes_by_session_without_url_correlation() {

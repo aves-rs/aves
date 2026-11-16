@@ -44,39 +44,25 @@ pub(super) fn merged_config_preferences(
     preferences
 }
 
-pub(super) fn assigned_agent_mode_selection(
+/// Finds the Provider-advertised value selecting an Agent through the plugin-chosen config option.
+pub(super) fn primary_agent_option_selection(
     provider_options: &[DiscussConfigOption],
-    assigned_agent_id: &str,
+    config_id: &str,
+    agent_id: &str,
 ) -> Option<ConfigPreferenceSelection> {
     provider_options
         .iter()
-        .filter(|option| option.category == "mode")
-        .find_map(|option| {
+        .find(|option| option.id == config_id)
+        .filter(|option| {
             option
                 .options
                 .iter()
-                .find(|candidate| candidate.value == assigned_agent_id)
-                .map(|candidate| ConfigPreferenceSelection {
-                    config_id: option.id.clone(),
-                    value: candidate.value.clone(),
-                })
+                .any(|candidate| candidate.value == agent_id)
         })
-}
-
-pub(super) fn without_mode_preferences(
-    preferences: &ConfigSettings,
-    provider_options: &[DiscussConfigOption],
-    selected_mode_config_id: &str,
-) -> ConfigSettings {
-    let mut non_mode = preferences.clone();
-    non_mode.remove(selected_mode_config_id);
-    for option in provider_options
-        .iter()
-        .filter(|option| option.category == "mode")
-    {
-        non_mode.remove(&option.id);
-    }
-    non_mode
+        .map(|option| ConfigPreferenceSelection {
+            config_id: option.id.clone(),
+            value: agent_id.to_string(),
+        })
 }
 
 #[derive(Debug, PartialEq, Eq)]

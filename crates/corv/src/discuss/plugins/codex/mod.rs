@@ -9,8 +9,8 @@ use serde::Serialize;
 use super::super::DiscussError;
 use super::super::library::{AgentDefinition, AgentId, AssetLibrary, SkillDefinition, TeamDefinition};
 use super::{
-    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, destroy_default_skill, install_default_skill,
-    resolve_agent, resolve_skill,
+    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PrimaryAgentSelection, destroy_default_skill,
+    install_default_skill, resolve_agent, resolve_skill,
 };
 
 pub(super) const CODEX_PLUGIN_NAME: &str = "codex-acp";
@@ -47,6 +47,11 @@ impl DiscussAgentPlugin for CodexPlugin {
 
     fn skill_scope_key(&self) -> &'static str {
         "plugin.default"
+    }
+
+    /// codex-acp has no main-agent picker; it applies an appended ACP system prompt as developer instructions.
+    fn primary_agent_selection(&self, _agent: &AgentDefinition) -> PrimaryAgentSelection {
+        PrimaryAgentSelection::SystemPrompt
     }
 
     fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {

@@ -3,6 +3,7 @@
 //! The actor selects one plugin by exact registry id and uses this trait for
 //! provider config normalization and plugin-owned workspace materialization.
 
+mod antigravity;
 mod claude;
 mod codex;
 mod grok;
@@ -25,10 +26,25 @@ use super::types::{
     SessionLaunchConfig,
 };
 
+use antigravity::{ANTIGRAVITY_PLUGIN_NAME, PLUGIN as ANTIGRAVITY_AGENT_PLUGIN};
 use claude::{CLAUDE_PLUGIN_NAME, PLUGIN as CLAUDE_AGENT_PLUGIN};
 use codex::{CODEX_PLUGIN_NAME, PLUGIN as CODEX_AGENT_PLUGIN};
 use grok::{GROK_PLUGIN_NAME, PLUGIN as GROK_AGENT_PLUGIN};
 use opencode::{OPENCODE_PLUGIN_NAME, OpenCodeCaptureState, PLUGIN as OPENCODE_AGENT_PLUGIN};
+
+/// Provider settings already resolved by the Discuss actor.
+///
+/// Plugins must not merge these values with Provider defaults. An entry is
+/// present only when a Team member has an explicit, non-default override.
+pub type ConfigSettings = BTreeMap<String, String>;
+
+static DEFAULT_PLUGIN: DefaultAgentPlugin = DefaultAgentPlugin;
+
+const DEFAULT_PLUGIN_NAME: &str = "default";
+const DEFAULT_AGENTS_DIRECTORY: &str = ".agents/agents";
+const DEFAULT_SKILLS_DIRECTORY: &str = ".agents/skills";
+
+struct DefaultAgentPlugin;
 
 /// Mutable, worker-local state used only by plugins whose utility payloads
 /// arrive over multiple ACP updates.
@@ -47,20 +63,6 @@ impl PluginCaptureState {
     }
 }
 
-const DEFAULT_PLUGIN_NAME: &str = "default";
-const DEFAULT_AGENTS_DIRECTORY: &str = ".agents/agents";
-const DEFAULT_SKILLS_DIRECTORY: &str = ".agents/skills";
-
-struct DefaultAgentPlugin;
-
-/// Provider settings already resolved by the Discuss actor.
-///
-/// Plugins must not merge these values with Provider defaults. An entry is
-/// present only when a Team member has an explicit, non-default override.
-pub type ConfigSettings = BTreeMap<String, String>;
-
-static DEFAULT_PLUGIN: DefaultAgentPlugin = DefaultAgentPlugin;
-
 /// Declares whether a Provider's ACP connection may serve multiple sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionStrategy {
@@ -68,6 +70,20 @@ pub enum ConnectionStrategy {
     Shared,
     /// Each session owns an independent ACP process and connection.
     Isolated,
+}
+
+/// How a Provider makes an installed Agent the primary agent of a session.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PrimaryAgentSelection {
+    /// Select the Provider-advertised session config option whose value is the Agent id.
+    ConfigOption(&'static str),
+    /// Attach Provider-specific `_meta` to the session open request.
+    SessionMeta(serde_json::Map<String, serde_json::Value>),
+    /// Append the Agent's instructions as the ACP session system prompt; requires the
+    /// Provider to advertise `sessionCapabilities.systemPrompt`.
+    SystemPrompt,
+    /// Append these arguments to the session's own Provider process launch.
+    LaunchArguments(Vec<String>),
 }
 
 #[derive(serde::Serialize)]
@@ -224,6 +240,7 @@ fn install_agent_file(
 /// the provider-neutral ACP implementation and portable Agent renderer.
 pub fn for_agent(agent_name: &str) -> &'static dyn DiscussAgentPlugin {
     match agent_name {
+        ANTIGRAVITY_PLUGIN_NAME => &ANTIGRAVITY_AGENT_PLUGIN,
         CLAUDE_PLUGIN_NAME => &CLAUDE_AGENT_PLUGIN,
         CODEX_PLUGIN_NAME => &CODEX_AGENT_PLUGIN,
         GROK_PLUGIN_NAME => &GROK_AGENT_PLUGIN,
@@ -235,10 +252,11 @@ pub fn for_agent(agent_name: &str) -> &'static dyn DiscussAgentPlugin {
 /// Resolve the optional built-in copy source beside the canonical Provider keys.
 pub(super) fn default_workspace_copy_source(provider_name: &str) -> Option<&'static str> {
     match provider_name {
-        OPENCODE_PLUGIN_NAME => Some(".opencode"),
+        ANTIGRAVITY_PLUGIN_NAME => Some(".gemini"),
         CLAUDE_PLUGIN_NAME => Some(".claude"),
         CODEX_PLUGIN_NAME => Some(".codex"),
         GROK_PLUGIN_NAME => Some(".grok"),
+        OPENCODE_PLUGIN_NAME => Some(".opencode"),
         _ => None,
     }
 }
@@ -326,6 +344,14 @@ pub trait DiscussAgentPlugin: Sync {
         Err(DiscussError::Validation {
             message: "Provider does not support session launch configuration".to_string(),
         })
+    }
+
+    /// Choose how this Provider selects an installed Agent as a session's primary agent.
+    ///
+    /// Unverified Providers use the standard ACP session system prompt.
+    fn primary_agent_selection(&self, agent: &AgentDefinition) -> PrimaryAgentSelection {
+        let _ = agent;
+        PrimaryAgentSelection::SystemPrompt
     }
 
     /// Reconcile an advertised `session/list` capability with provider-adapter
@@ -634,6 +660,38 @@ mod tests {
     use super::super::test_library;
     use super::*;
 
+    #[test]
+    fn every_plugin_owns_its_primary_agent_selection() {
+        let agent = test_library::library().agents_for().next().expect("agent");
+        assert_eq!(
+            for_agent(ANTIGRAVITY_PLUGIN_NAME).primary_agent_selection(agent),
+            PrimaryAgentSelection::LaunchArguments(vec!["--agent".to_string(), agent.id.to_string()])
+        );
+        assert_eq!(
+            for_agent(CLAUDE_PLUGIN_NAME).primary_agent_selection(agent),
+            PrimaryAgentSelection::ConfigOption("agent")
+        );
+        assert_eq!(
+            for_agent(CODEX_PLUGIN_NAME).primary_agent_selection(agent),
+            PrimaryAgentSelection::SystemPrompt
+        );
+        assert_eq!(
+            for_agent(GROK_PLUGIN_NAME).primary_agent_selection(agent),
+            PrimaryAgentSelection::SessionMeta(serde_json::Map::from_iter([(
+                "rules".to_string(),
+                serde_json::Value::String(agent.body.to_string()),
+            )]))
+        );
+        assert_eq!(
+            for_agent(OPENCODE_PLUGIN_NAME).primary_agent_selection(agent),
+            PrimaryAgentSelection::ConfigOption("mode")
+        );
+        assert_eq!(
+            for_agent("custom-acp").primary_agent_selection(agent),
+            PrimaryAgentSelection::SystemPrompt
+        );
+    }
+
     struct ProviderLayout {
         name: &'static str,
         agents_directory: &'static str,
@@ -641,12 +699,12 @@ mod tests {
         skills_directory: &'static str,
     }
 
-    const PROVIDER_LAYOUTS: [ProviderLayout; 4] = [
+    const PROVIDER_LAYOUTS: [ProviderLayout; 5] = [
         ProviderLayout {
-            name: OPENCODE_PLUGIN_NAME,
-            agents_directory: ".opencode/agents",
+            name: ANTIGRAVITY_PLUGIN_NAME,
+            agents_directory: ".agents/agents",
             agent_extension: "md",
-            skills_directory: ".opencode/skills",
+            skills_directory: ".agents/skills",
         },
         ProviderLayout {
             name: CLAUDE_PLUGIN_NAME,
@@ -655,16 +713,22 @@ mod tests {
             skills_directory: ".claude/skills",
         },
         ProviderLayout {
+            name: CODEX_PLUGIN_NAME,
+            agents_directory: ".codex/agents",
+            agent_extension: "toml",
+            skills_directory: ".agents/skills",
+        },
+        ProviderLayout {
             name: GROK_PLUGIN_NAME,
             agents_directory: ".grok/agents",
             agent_extension: "md",
             skills_directory: ".grok/skills",
         },
         ProviderLayout {
-            name: CODEX_PLUGIN_NAME,
-            agents_directory: ".codex/agents",
-            agent_extension: "toml",
-            skills_directory: ".agents/skills",
+            name: OPENCODE_PLUGIN_NAME,
+            agents_directory: ".opencode/agents",
+            agent_extension: "md",
+            skills_directory: ".opencode/skills",
         },
     ];
 
@@ -937,15 +1001,6 @@ mod tests {
             }
         }
     }
-}
-
-#[cfg(test)]
-mod install_team_at_root_tests {
-    use std::fs;
-
-    use tempfile::tempdir;
-
-    use super::*;
 
     #[test]
     fn install_team_at_root_materializes_leader_and_followers_under_the_given_root_only() {

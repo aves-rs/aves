@@ -24,14 +24,16 @@ use super::super::types::{
     DiscussTodoStatus, DiscussUtilityPayload, SessionCliLogin, SessionLaunchConfig,
 };
 use super::{
-    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PluginCaptureState, render_skill_file, resolve_agent,
-    resolve_skill,
+    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PluginCaptureState, PrimaryAgentSelection,
+    render_skill_file, resolve_agent, resolve_skill,
 };
 
 pub const OPENCODE_PLUGIN_NAME: &str = "opencode";
 
 const AGENTS_DIRECTORY: &str = ".opencode/agents";
 const CONFIG_PATH: &str = ".opencode/opencode.json";
+/// OpenCode's session config option selecting the primary agent.
+const MODE_CONFIG_ID: &str = "mode";
 const CHILD_SESSION_LOOKUP_ATTEMPTS: usize = 3;
 const CHILD_SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -111,6 +113,11 @@ struct OpenCodeConfig {
 impl DiscussAgentPlugin for OpenCodePlugin {
     fn connection_strategy(&self) -> ConnectionStrategy {
         ConnectionStrategy::Shared
+    }
+
+    /// OpenCode lists primary agents as values of its `mode` option.
+    fn primary_agent_selection(&self, _agent: &AgentDefinition) -> PrimaryAgentSelection {
+        PrimaryAgentSelection::ConfigOption(MODE_CONFIG_ID)
     }
 
     fn team_launch_server(&self, server: &McpServer, workspace: &Path) -> Result<Option<McpServer>, DiscussError> {

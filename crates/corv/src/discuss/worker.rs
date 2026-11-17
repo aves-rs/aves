@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAction, ElicitationMode, ListSessionsRequest,
     McpServer, NewSessionResponse, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    SessionConfigOptionValue, SessionId, SetSessionConfigOptionRequest,
+    SessionConfigOptionValue, SessionId, SetSessionConfigOptionRequest, SetSessionTitleRequest,
 };
 use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
 use agent_client_protocol::{AcpAgent, Agent, Client, DynamicHandlerGuard, Responder, UntypedMessage};
@@ -100,6 +100,11 @@ pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -
                 .session_capabilities
                 .system_prompt
                 .is_some();
+            params.title_supported = init_response
+                .agent_capabilities
+                .session_capabilities
+                .title
+                .is_some();
             run_connected_session(params, connection).await
         })
         .await;
@@ -142,6 +147,8 @@ pub(super) async fn run_connected_session(
         pending_elicitation_cancel_tx,
         announce_desktop_association,
         transient_connectivity,
+        provider_title,
+        title_supported,
         ..
     } = params;
     let WorkerSessionSetup {
@@ -155,6 +162,12 @@ pub(super) async fn run_connected_session(
         opened,
     } = setup;
     let mut session = opened.session;
+    if title_supported
+        && let Some(title) = provider_title
+        && let Err(error) = send_session_title(&session, title).await
+    {
+        tracing::debug!(target: "application_acp", %error, "could not set provider session title");
+    }
     let mut latest_config_options = opened.latest_config_options;
     let mut session_settings = opened.session_settings;
 
@@ -221,6 +234,7 @@ pub(super) async fn run_connected_session(
         agent_node_terminal_state: &mut agent_node_terminal_state,
         agent_node_deadline: &mut agent_node_deadline,
         suppress_transcript: &mut suppress_transcript,
+        title_supported,
     };
     let result = pump_connected_session(
         &mut state,
@@ -277,6 +291,7 @@ struct ConnectedLoopState<'a> {
     agent_node_terminal_state: &'a mut AgentNodeTerminalState,
     agent_node_deadline: &'a mut Option<Instant>,
     suppress_transcript: &'a mut bool,
+    title_supported: bool,
 }
 
 #[expect(
@@ -321,6 +336,7 @@ async fn pump_connected_session(
         agent_node_terminal_state,
         agent_node_deadline,
         suppress_transcript,
+        title_supported,
     } = state;
     loop {
         tokio::select! {
@@ -472,6 +488,13 @@ async fn pump_connected_session(
                         .await;
                         let _ = reply.send(result);
                     }
+                    Some(WorkerCommand::SetTitle { title }) => {
+                        if *title_supported
+                            && let Err(error) = send_session_title(session, title).await
+                        {
+                            tracing::debug!(target: "application_acp", %error, "could not update provider session title");
+                        }
+                    }
                     Some(WorkerCommand::ListProviderSessions { reply }) => {
                         let _ = reply.send(list_provider_sessions(session).await);
                     }
@@ -565,6 +588,15 @@ async fn list_provider_sessions(session: &WorkerSession) -> Result<Vec<ProviderS
         .await
         .map(|response| provider_sessions_from_schema(response.sessions))
         .map_err(DiscussError::from)
+}
+
+async fn send_session_title(session: &WorkerSession, title: String) -> Result<(), agent_client_protocol::Error> {
+    session
+        .connection()
+        .send_request(SetSessionTitleRequest::new(session.session_id().clone(), title))
+        .block_task()
+        .await?;
+    Ok(())
 }
 
 async fn load_provider_session(

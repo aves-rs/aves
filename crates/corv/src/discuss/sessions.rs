@@ -68,6 +68,7 @@ struct SessionWorkerInputs<'a> {
     launch_limitations: Vec<LaunchLimitation>,
     launch_server: McpServer,
     session_name: String,
+    provider_title: Option<String>,
     primary_agent: Option<ResolvedAgent>,
     reconnect_acp_session_id: Option<SessionId>,
     persisted_config_options: Vec<DiscussConfigOption>,
@@ -87,6 +88,7 @@ struct SessionWorkerInputs<'a> {
     shared_connection: Option<ConnectionTo<Agent>>,
     shared_mcp_capabilities: Option<(bool, bool)>,
     system_prompt_supported: bool,
+    title_supported: bool,
     shared_mcp_registrations: Option<SharedMcpRegistrations>,
 }
 
@@ -152,6 +154,7 @@ impl Actor {
             launch_config,
             provider_name,
             agent_name,
+            session_name,
             config_overrides,
             application_mcp_enabled,
             prompt,
@@ -188,7 +191,7 @@ impl Actor {
             &provider_name,
             SpawnSessionOptions {
                 launch_config,
-                name: Some(agent_name.clone()),
+                name: Some(session_name.unwrap_or_else(|| agent_name.clone())),
                 setup,
                 session_config_overrides: config_overrides,
                 acp_session_id: None,
@@ -276,7 +279,8 @@ impl Actor {
             });
         };
         self.ensure_provider_accepts_session(key, transient_connectivity)?;
-        let session_name = name.unwrap_or_else(|| "A new session".to_string());
+        let session_name = name.clone().unwrap_or_else(|| "A new session".to_string());
+        let caller_title = name.clone();
         // NewSession is keyed only by the caller-owned id. Resolve the
         // provider recovery id from the persisted anchor rather than accepting
         // one from Zeus or Hades.
@@ -292,6 +296,16 @@ impl Actor {
         } else {
             let conn = self.persistence.acquire_connection().await?;
             load_discuss_session(&conn, &discuss_session_id.to_string()).await?
+        };
+        let provider_title = if transient_connectivity {
+            None
+        } else {
+            stored_launch
+                .as_ref()
+                .and_then(|row| row.display_title.as_deref())
+                .filter(|title| !title.trim().is_empty())
+                .map(str::to_owned)
+                .or(caller_title)
         };
         let stored_cwd = stored_launch
             .as_ref()
@@ -367,6 +381,7 @@ impl Actor {
             shared_connection,
             shared_mcp_capabilities,
             system_prompt_supported,
+            title_supported,
             shared_mcp_registrations,
         ) = self
             .provider_supervisors
@@ -380,6 +395,7 @@ impl Actor {
                     mcp_acp,
                     mcp_http,
                     system_prompt,
+                    title_supported,
                     mcp_registrations,
                     ..
                 } => Some((
@@ -388,6 +404,7 @@ impl Actor {
                     Some(connection.clone()),
                     Some((*mcp_acp, *mcp_http)),
                     *system_prompt,
+                    *title_supported,
                     Some(mcp_registrations.clone()),
                 )),
                 ProviderSupervisorResources::Shared { .. } | ProviderSupervisorResources::Isolated { .. } => None,
@@ -398,6 +415,7 @@ impl Actor {
                     None,
                     None,
                     None,
+                    false,
                     false,
                     None,
                 )
@@ -458,6 +476,7 @@ impl Actor {
             launch_limitations,
             launch_server,
             session_name,
+            provider_title,
             primary_agent,
             reconnect_acp_session_id,
             persisted_config_options,
@@ -477,6 +496,7 @@ impl Actor {
             shared_connection,
             shared_mcp_capabilities,
             system_prompt_supported,
+            title_supported,
             shared_mcp_registrations,
         })
         .await
@@ -493,6 +513,7 @@ impl Actor {
             launch_limitations,
             launch_server,
             session_name,
+            provider_title,
             primary_agent,
             reconnect_acp_session_id,
             persisted_config_options,
@@ -512,6 +533,7 @@ impl Actor {
             shared_connection,
             shared_mcp_capabilities,
             system_prompt_supported,
+            title_supported,
             shared_mcp_registrations,
         } = inputs;
         let stream_tx = self.stream_tx.clone();
@@ -590,6 +612,7 @@ impl Actor {
             discuss_session_id,
             auth_launch_server: launch_server,
             session_name,
+            provider_title,
             agent_name,
             primary_agent,
             reconnect_acp_session_id,
@@ -624,6 +647,7 @@ impl Actor {
             shared_connection,
             shared_mcp_capabilities,
             system_prompt_supported,
+            title_supported,
             shared_mcp_registrations,
         };
         let join_handle = tokio::spawn(run_session_worker_with_reporting(
@@ -1324,6 +1348,11 @@ impl Actor {
 
         let conn = self.persistence.acquire_connection().await?;
         rename_discuss_session(&conn, discuss_session_id, title).await?;
+        if let Some(entry) = self.worker_registry.get(&discuss_session_id) {
+            let _ = entry.command_tx.try_send(WorkerCommand::SetTitle {
+                title: title.to_owned(),
+            });
+        }
         Ok(DiscussResponse::Success)
     }
 }

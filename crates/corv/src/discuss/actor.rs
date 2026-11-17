@@ -94,6 +94,7 @@ pub(super) struct SharedConnectionReady {
     pub(super) mcp_acp: bool,
     pub(super) mcp_http: bool,
     pub(super) system_prompt: bool,
+    pub(super) title_supported: bool,
     pub(super) callback_routes: Arc<Mutex<CallbackRouteRegistry>>,
 }
 
@@ -512,6 +513,7 @@ impl Actor {
                 launch_config,
                 provider_name,
                 agent_name,
+                session_name,
                 config_overrides,
                 application_mcp_enabled,
                 prompt,
@@ -527,6 +529,7 @@ impl Actor {
                     launch_config,
                     provider_name,
                     agent_name,
+                    session_name,
                     config_overrides,
                     application_mcp_enabled,
                     prompt,

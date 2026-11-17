@@ -1071,7 +1071,7 @@ fn canonical_test_team() -> (String, AgentId, Version) {
 }
 
 #[tokio::test]
-async fn builtin_skills_return_only_ordered_metadata() {
+async fn builtin_skills_return_ordered_entries_with_body() {
     let (bus_requester, _mock) = MockBus::new(8);
     let (broadcast_tx, _) = mpsc::channel(1);
     let (actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
@@ -1096,7 +1096,8 @@ async fn builtin_skills_return_only_ordered_metadata() {
     assert_eq!(
         serde_json::to_value(&entries[0]).unwrap(),
         json!({
-            "skillId": "financial-data", "name": "Test skill", "description": "Test skill description", "version": "1.0.0"
+            "skillId": "financial-data", "name": "Test skill", "description": "Test skill description", "version": "1.0.0",
+            "body": "Test skill instructions.\n"
         })
     );
 }

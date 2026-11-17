@@ -292,6 +292,7 @@ pub(super) enum ProviderSupervisorResources {
         mcp_http: bool,
         /// Whether the Provider advertises `sessionCapabilities.systemPrompt`.
         system_prompt: bool,
+        title_supported: bool,
         callback_router: Arc<Mutex<CallbackRouter>>,
         callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
         mcp_registrations: SharedMcpRegistrations,
@@ -322,6 +323,7 @@ impl ProviderSupervisor {
                 mcp_acp: false,
                 mcp_http: false,
                 system_prompt: false,
+                title_supported: false,
                 callback_router: Arc::new(Mutex::new(CallbackRouter::default())),
                 callback_routes: None,
                 mcp_registrations: SharedMcpRegistrations::default(),

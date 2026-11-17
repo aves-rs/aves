@@ -105,6 +105,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) discuss_session_id: DiscussSessionId,
     pub(super) auth_launch_server: McpServer,
     pub(super) session_name: String,
+    pub(super) provider_title: Option<String>,
     pub(super) agent_name: String,
     pub(super) primary_agent: Option<ResolvedAgent>,
     pub(super) reconnect_acp_session_id: Option<SessionId>,
@@ -140,6 +141,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) shared_mcp_capabilities: Option<(bool, bool)>,
     /// Whether the Provider advertises `sessionCapabilities.systemPrompt`.
     pub(super) system_prompt_supported: bool,
+    pub(super) title_supported: bool,
     pub(super) shared_mcp_registrations: Option<SharedMcpRegistrations>,
 }
 

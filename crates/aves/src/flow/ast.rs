@@ -172,6 +172,9 @@ pub struct AgentNodeConfig {
     pub provider_name: String,
     /// Exact Agent identifier selected by the migrated definition.
     pub agent_name: String,
+    /// Display name for the Discuss session this node starts; defaults to the agent name.
+    #[serde(default)]
+    pub session_name: Option<String>,
     /// Prompt sent to the non-interactive agent session.
     pub prompt: String,
     /// Optional bounded session turn limit.

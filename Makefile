@@ -9,9 +9,6 @@ fmt:
 check:
 	direnv exec . cargo check
 
-build:
-	direnv exec . cargo build --profile=dev
-
 lint:
 	direnv exec . cargo clippy -- --deny warnings
 
@@ -26,4 +23,3 @@ zedy:
 	$(MAKE) check
 	$(MAKE) lint
 	$(MAKE) test
-	$(MAKE) build

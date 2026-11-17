@@ -1540,6 +1540,48 @@ pub enum AgentThemeColor {
     Dimmed,
 }
 
+/// Public metadata for a built-in skill.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltinSkillEntry {
+    pub skill_id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+}
+
+/// Source of an installed asset claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InstalledClaimBasis {
+    /// A standalone custom installation.
+    Standalone,
+    /// A team installation.
+    Team,
+}
+
+/// Recorded asset installation, not a filesystem existence check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledAssetClaim {
+    pub provider_name: String,
+    pub asset_id: String,
+    pub basis: InstalledClaimBasis,
+    pub team_leader_id: Option<String>,
+    pub installed_version: Option<String>,
+    pub scope_key: Option<String>,
+    pub provider_installed: bool,
+    pub definition_present: bool,
+}
+
+/// An installed team whose missing definition prevents skill enumeration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompleteTeamClaim {
+    pub provider_name: String,
+    pub team_leader_id: String,
+}
+
 /// Metadata and provenance for a cached custom asset.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1602,6 +1644,18 @@ pub struct TeamCatalogMember {
     pub job_title: String,
 }
 
+/// Origin of the currently available Team definition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamDefinitionKind {
+    /// An application-supplied Team definition.
+    Builtin,
+    /// A user-defined Team definition.
+    Custom,
+    /// An installation whose definition is no longer available.
+    Unavailable,
+}
+
 /// One Phanes Team and its persisted installation state.
 ///
 /// Teams are identified by their stable leader id. The member and skill names
@@ -1636,12 +1690,17 @@ pub struct TeamCatalogEntry {
     pub theme_color: Option<AgentThemeColor>,
     /// Whether the current Phanes registry contains this Team definition.
     pub definition_available: bool,
+    /// Origin of the Team definition, or unavailable for an orphaned installation.
+    pub definition_kind: TeamDefinitionKind,
     /// Canonical Team members, including stable IDs, when the definition is available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<TeamCatalogMember>>,
     /// Canonical skill display names when the Team definition is available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_names: Option<Vec<String>>,
+    /// Ordered stable skill identifiers when the Team definition is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_ids: Option<Vec<String>>,
 }
 
 // ── ACP protocol payload types ─────────────────────────────────────────────

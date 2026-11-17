@@ -98,6 +98,20 @@ pub(super) async fn clear_mcp_scope(
 }
 
 impl Actor {
+    pub(super) async fn handle_list_provider_mcp_assignments(
+        &self,
+        provider: &str,
+    ) -> Result<DiscussResponse, DiscussError> {
+        if !self.agents.contains_key(provider) {
+            return Err(DiscussError::UnknownAgent {
+                agent_key: provider.to_owned(),
+            });
+        }
+        let conn = self.persistence.acquire_connection().await?;
+        let mcp_names = list_mcp_assignments_by_scope(&conn, McpAssignmentScope::Provider, provider).await?;
+        Ok(DiscussResponse::ProviderMcpAssignments { mcp_names })
+    }
+
     pub(super) async fn handle_list_custom_mcps(&self) -> Result<DiscussResponse, DiscussError> {
         let conn = self.persistence.acquire_connection().await?;
         let mut entries = Vec::new();

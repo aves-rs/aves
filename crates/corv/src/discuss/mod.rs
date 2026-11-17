@@ -42,7 +42,7 @@ pub use boot::{DiscussBootOptions, DiscussSettings};
 pub use discovery::{
     DiscoveredProvider, DiscoveryOutcome, DiscoverySource, ProviderEnvironment, ProviderLaunch, discover_providers,
 };
-pub use domain::{DiscussDomain, DiscussIdentityService, DiscussStreamingService};
+pub use domain::{DiscussDomain, DiscussIdentityService, DiscussProviderConfigSudoService, DiscussStreamingService};
 pub use elicitation::{
     DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload,
     DiscussRestrictedFormField, DiscussRestrictedFormFieldType, DiscussRestrictedFormOption,
@@ -64,10 +64,11 @@ pub use messages::{
     NewSessionInput, ProviderManagedConfigOutput, ProviderRemoveSuccessOutput, ProvidersListOutput,
     RemoveProviderInput, RemoveSessionInput, RenameSessionInput, ReserveInspectorInput, ReserveInspectorOutput,
     ResolveSessionIdentityInput, SendUserTurnInput, SessionIdentityResolvedOutput, SessionListOutput,
-    SessionLoadOutput, SetConfigOptionInput, StartInspectorInput, StartServerInput, StopServerInput, SuccessOutput,
-    UnassignMcpInput, UpdateCustomMcpInput, discuss_operation_descriptors_with_root_error, dispatch_add_provider,
-    dispatch_get_config_options, dispatch_get_provider_managed_config, dispatch_get_server_status,
-    dispatch_install_team, dispatch_install_team_and_start_session, dispatch_list_custom_mcps, dispatch_list_providers,
+    SessionLoadOutput, SetConfigOptionInput, SetProviderManagedConfigInput, StartInspectorInput, StartServerInput,
+    StopServerInput, SuccessOutput, UnassignMcpInput, UpdateCustomMcpInput,
+    discuss_operation_descriptors_with_root_error, dispatch_add_provider, dispatch_get_config_options,
+    dispatch_get_provider_managed_config, dispatch_get_server_status, dispatch_install_team,
+    dispatch_install_team_and_start_session, dispatch_list_custom_mcps, dispatch_list_providers,
     dispatch_list_sessions, dispatch_load_session, dispatch_remove_provider, dispatch_remove_session,
     dispatch_rename_session, dispatch_set_config_option, dispatch_start_server, dispatch_stop_server, rpc_router,
     send_new_session,
@@ -76,11 +77,11 @@ pub use plugins::install_team_at_root;
 pub use types::{
     AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, AcpProvider, AgentThemeColor,
     CleanupWarning, CustomMcpEntry, CustomMcpScope, DiscussChatTurnRecord, DiscussConfigOption,
-    DiscussConfigOptionValue, DiscussError, DiscussMcpStatus, DiscussMemberOverrides, DiscussPermissionOption,
-    DiscussSessionId, DiscussSessionInfo, DiscussSessionSetup, DiscussStreamEvent, DiscussSubagentRecord,
-    DiscussSubagentSurfaceState, DiscussTerminalAuthMethod, DiscussTodoItem, DiscussTodoSnapshot, DiscussTodoStatus,
-    DiscussUtilityPayload, DiscussUtilityUpdate, Effect, ElicitationRequestId, InspectorBinding, InstalledAssetKind,
-    LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, LaunchPermissionOutcome, Operation,
-    PermissionRequestId, ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus, Rule, RuleSet,
-    SensitiveMcpDescriptor, SessionCliLogin, SessionCliTool, SessionLaunchConfig,
+    DiscussConfigOptionValue, DiscussError, DiscussImageAttachment, DiscussMcpStatus, DiscussMemberOverrides,
+    DiscussPermissionOption, DiscussSessionId, DiscussSessionInfo, DiscussSessionSetup, DiscussStreamEvent,
+    DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTerminalAuthMethod, DiscussTodoItem,
+    DiscussTodoSnapshot, DiscussTodoStatus, DiscussUtilityPayload, DiscussUtilityUpdate, Effect, ElicitationRequestId,
+    InspectorBinding, InstalledAssetKind, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject,
+    LaunchPermissionOutcome, Operation, PermissionRequestId, ProviderRuntimeFailure, ProviderRuntimeState,
+    ProviderRuntimeStatus, Rule, RuleSet, SensitiveMcpDescriptor, SessionCliLogin, SessionCliTool, SessionLaunchConfig,
 };

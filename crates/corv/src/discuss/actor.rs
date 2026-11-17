@@ -601,6 +601,12 @@ impl Actor {
                 self.handle_mcp_assignment(scope_kind, &scope_id, &mcp_name, false)
                     .await
             }
+            DiscussRequestPayload::ListBuiltinSkills => self.handle_list_builtin_skills(),
+            DiscussRequestPayload::ListProviderInstalledAssets => self.handle_list_provider_installed_assets().await,
+            DiscussRequestPayload::ListProviderMcpAssignments { provider_name } => {
+                self.handle_list_provider_mcp_assignments(&provider_name)
+                    .await
+            }
             DiscussRequestPayload::ListCustomAgents => self.handle_list_custom_agents().await,
             DiscussRequestPayload::ListCustomSkills => self.handle_list_custom_skills().await,
             DiscussRequestPayload::GetCustomAgent { agent_id } => self.handle_get_custom_agent(&agent_id).await,
@@ -1272,6 +1278,9 @@ fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
         DiscussRequestPayload::DeleteCustomMcp { .. } => "deleteCustomMcp",
         DiscussRequestPayload::AssignMcp { .. } => "assignMcp",
         DiscussRequestPayload::UnassignMcp { .. } => "unassignMcp",
+        DiscussRequestPayload::ListBuiltinSkills => "listBuiltinSkills",
+        DiscussRequestPayload::ListProviderInstalledAssets => "listProviderInstalledAssets",
+        DiscussRequestPayload::ListProviderMcpAssignments { .. } => "listProviderMcpAssignments",
         DiscussRequestPayload::ListCustomAgents => "listCustomAgents",
         DiscussRequestPayload::ListCustomSkills => "listCustomSkills",
         DiscussRequestPayload::GetCustomAgent { .. } => "getCustomAgent",

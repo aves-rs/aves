@@ -1573,7 +1573,9 @@ async fn handle_session_update(
             let terminal_output = serde_json::json!({
                 "text": flush.aggregated_text.clone(),
                 "thought": flush.aggregated_thought.clone(),
-                "parts": flush.parts.clone(),
+                "parts": flush.parts.iter().filter(|part| {
+                    part.get("kind").and_then(serde_json::Value::as_str) != Some("image")
+                }).collect::<Vec<_>>(),
                 "stopReason": flush.stop_reason.clone(),
             });
             enqueue_utility_persistence(persistence_queue, utility_payload).await;

@@ -1070,6 +1070,223 @@ fn canonical_test_team() -> (String, AgentId, Version) {
     )
 }
 
+#[tokio::test]
+async fn builtin_skills_return_only_ordered_metadata() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let DiscussResponse::ListBuiltinSkills { entries } = actor.handle_list_builtin_skills().unwrap() else {
+        panic!("expected built-in skill entries");
+    };
+    let ids: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.skill_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "financial-data",
+            "forensics",
+            "valuation",
+            "market-methodology",
+            "equity-outlook",
+            "flow-builder"
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(&entries[0]).unwrap(),
+        json!({
+            "skillId": "financial-data", "name": "Test skill", "description": "Test skill description", "version": "1.0.0"
+        })
+    );
+}
+
+#[tokio::test]
+async fn installed_inventory_retains_standalone_team_and_stale_claims() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    actor
+        .agents
+        .insert("opencode".into(), make_local_mcp_server("unused"));
+    let conn = actor.persistence.acquire_connection().await.unwrap();
+    let asset = CustomAssetRow {
+        id: "custom-agent".into(),
+        name: "Custom".into(),
+        job_title: Some("Role".into()),
+        description: "Custom".into(),
+        version: "1.2.3".into(),
+        source_kind: CustomSourceKind::LocalMarkdown,
+        source_url: None,
+        last_pull_at_ms: None,
+        last_pull_ok: None,
+        pull_error: None,
+        updated_at_ms: 0,
+    };
+    upsert_custom_agent(&conn, &asset).await.unwrap();
+    let skill = CustomAssetRow {
+        id: "custom-skill".into(),
+        ..asset.clone()
+    };
+    upsert_custom_skill(&conn, &skill).await.unwrap();
+    for (kind, provider, id, version) in [
+        (CustomInstallationKind::Agent, "opencode", "custom-agent", "1.2.3"),
+        (CustomInstallationKind::Agent, "removed", "missing-agent", "0.4.0"),
+        (CustomInstallationKind::Skill, "opencode", "custom-skill", "2.0.0"),
+    ] {
+        upsert_custom_installation(
+            &conn,
+            kind,
+            &CustomInstallationRow {
+                provider_name: provider.into(),
+                asset_id: id.into(),
+                installed_version: version.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    upsert_custom_team(
+        &conn,
+        &CustomTeamRow {
+            leader_id: "custom-agent".into(),
+            display_name: None,
+            followers_json: "[\"equity-auditor\"]".into(),
+            skills_json: "[\"custom-skill\",\"missing-skill\"]".into(),
+            version: "1.0.0".into(),
+            updated_at_ms: 0,
+        },
+    )
+    .await
+    .unwrap();
+    for (leader, provider, members) in [
+        ("equity-analyst", "opencode", "[]"),
+        ("custom-agent", "opencode", "[]"),
+        ("retired-team", "removed", "[\"retired-team\",\"equity-auditor\"]"),
+    ] {
+        upsert_discuss_team_installation(&conn, leader, provider, "9.0.0", "{}", members, None)
+            .await
+            .unwrap();
+    }
+    let DiscussResponse::ProviderInstalledAssets {
+        agents,
+        skills,
+        incomplete_teams,
+    } = actor.handle_list_provider_installed_assets().await.unwrap()
+    else {
+        panic!("expected inventory");
+    };
+    let agent_scope = plugins::for_agent("opencode").agent_scope_key();
+    let skill_scope = plugins::for_agent("opencode").skill_scope_key();
+    let standalone = agents
+        .iter()
+        .find(|row| row.asset_id == "custom-agent" && row.basis == InstalledClaimBasis::Standalone)
+        .unwrap();
+    assert_eq!(standalone.installed_version.as_deref(), Some("1.2.3"));
+    assert_eq!(standalone.scope_key.as_deref(), Some(agent_scope));
+    assert!(standalone.provider_installed && standalone.definition_present && standalone.team_leader_id.is_none());
+    let stale = agents
+        .iter()
+        .find(|row| row.asset_id == "missing-agent")
+        .unwrap();
+    assert!(!stale.provider_installed && !stale.definition_present && stale.scope_key.is_none());
+    for id in ["equity-analyst", "equity-auditor", "generalist-reviewer"] {
+        assert!(agents.iter().any(|row| row.asset_id == id
+            && row.team_leader_id.as_deref() == Some("equity-analyst")
+            && row.installed_version.is_none()
+            && row.definition_present));
+    }
+    assert!(
+        agents
+            .iter()
+            .any(|row| row.asset_id == "equity-auditor" && row.team_leader_id.as_deref() == Some("custom-agent"))
+    );
+    assert!(skills.iter().any(|row| row.asset_id == "financial-data"
+        && row.team_leader_id.as_deref() == Some("equity-analyst")
+        && row.scope_key.as_deref() == Some(skill_scope)));
+    assert!(skills.iter().any(|row| row.asset_id == "custom-skill"
+        && row.basis == InstalledClaimBasis::Standalone
+        && row.installed_version.as_deref() == Some("2.0.0")));
+    assert!(skills.iter().any(|row| row.asset_id == "custom-skill"
+        && row.team_leader_id.as_deref() == Some("custom-agent")
+        && row.definition_present
+        && row.installed_version.is_none()));
+    assert!(
+        skills
+            .iter()
+            .any(|row| row.asset_id == "missing-skill" && !row.definition_present)
+    );
+    assert!(agents.iter().any(|row| row.asset_id == "retired-team"
+        && row.team_leader_id.as_deref() == Some("retired-team")
+        && !row.provider_installed
+        && !row.definition_present
+        && row.scope_key.is_none()));
+    assert!(agents.iter().any(|row| row.asset_id == "equity-auditor"
+        && row.team_leader_id.as_deref() == Some("retired-team")
+        && row.definition_present
+        && row.scope_key.is_none()));
+    assert!(
+        !skills
+            .iter()
+            .any(|row| row.team_leader_id.as_deref() == Some("retired-team"))
+    );
+    assert_eq!(
+        incomplete_teams,
+        vec![IncompleteTeamClaim {
+            provider_name: "removed".into(),
+            team_leader_id: "retired-team".into()
+        }]
+    );
+    for claims in [&agents, &skills] {
+        assert!(claims.windows(2).all(|pair| (
+            &pair[0].provider_name,
+            &pair[0].asset_id,
+            pair[0].basis,
+            &pair[0].team_leader_id
+        ) <= (
+            &pair[1].provider_name,
+            &pair[1].asset_id,
+            pair[1].basis,
+            &pair[1].team_leader_id
+        )));
+    }
+}
+
+#[tokio::test]
+async fn provider_mcp_assignments_return_names_and_reject_unknown_provider() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    actor
+        .agents
+        .insert("opencode".into(), make_local_mcp_server("unused"));
+    let conn = actor.persistence.acquire_connection().await.unwrap();
+    for name in ["zeta", "alpha", "other"] {
+        upsert_custom_mcp(&conn, name, make_local_mcp_server("unused").server(), 0)
+            .await
+            .unwrap();
+    }
+    insert_mcp_assignment(&conn, McpAssignmentScope::Provider, "opencode", "zeta")
+        .await
+        .unwrap();
+    insert_mcp_assignment(&conn, McpAssignmentScope::Provider, "opencode", "alpha")
+        .await
+        .unwrap();
+    insert_mcp_assignment(&conn, McpAssignmentScope::Team, "opencode", "other")
+        .await
+        .unwrap();
+    let DiscussResponse::ProviderMcpAssignments { mcp_names } = actor
+        .handle_list_provider_mcp_assignments("opencode")
+        .await
+        .unwrap()
+    else {
+        panic!("expected assignments");
+    };
+    assert_eq!(mcp_names, ["alpha", "zeta"]);
+    assert!(matches!(actor.handle_list_provider_mcp_assignments("removed").await,
+        Err(DiscussError::UnknownAgent { agent_key }) if agent_key == "removed"));
+}
+
 #[test]
 fn agent_versions_use_semver_precedence_and_fail_closed_on_invalid_values() {
     let current = Version::parse("1.2.3+current-build").expect("valid current version");
@@ -6162,12 +6379,14 @@ fn discuss_team_responses_serde_roundtrip() {
                 member_overrides: Some(std::collections::BTreeMap::new()),
                 theme_color: Some(AgentThemeColor::Warning),
                 definition_available: true,
+                definition_kind: TeamDefinitionKind::Builtin,
                 members: Some(vec![TeamCatalogMember {
                     agent_id: "chief-of-staff".to_string(),
                     name: "Chief of Staff".to_string(),
                     job_title: "Operations lead".to_string(),
                 }]),
                 skill_names: Some(Vec::new()),
+                skill_ids: Some(Vec::new()),
             }],
         },
         DiscussResponse::InstallTeam { warnings: Vec::new() },
@@ -6363,12 +6582,14 @@ fn team_catalog_entry_serde_roundtrip() {
         )])),
         theme_color: Some(AgentThemeColor::Warning),
         definition_available: true,
+        definition_kind: TeamDefinitionKind::Builtin,
         members: Some(vec![TeamCatalogMember {
             agent_id: "chief-of-staff".to_string(),
             name: "Chief of Staff".to_string(),
             job_title: "Operations lead".to_string(),
         }]),
         skill_names: Some(vec!["planning".to_string()]),
+        skill_ids: Some(vec!["planning".to_string()]),
     };
 
     let json = serde_json::to_value(&entry).expect("serialize catalog entry");
@@ -6395,8 +6616,10 @@ fn absent_team_definition_omits_optional_metadata() {
         member_overrides: Some(BTreeMap::new()),
         theme_color: None,
         definition_available: false,
+        definition_kind: TeamDefinitionKind::Unavailable,
         members: None,
         skill_names: None,
+        skill_ids: None,
     };
 
     let json = serde_json::to_value(&entry).expect("serialize absent-definition entry");

@@ -733,17 +733,6 @@ impl Actor {
         self.workspace_hook = hook;
     }
 
-    async fn execution_root(&self, execution_id: FlowExecutionId) -> PathBuf {
-        self.snapshot_store
-            .load_all()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|snapshot| snapshot.execution.execution_id == execution_id)
-            .unwrap()
-            .workspace
-            .root()
-    }
     async fn shutdown(&mut self) -> Result<FlowResponse, FlowError> {
         self.shutdown_runtime().await
     }

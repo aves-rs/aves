@@ -17,6 +17,7 @@ use super::storage::{
 };
 use super::types::{
     AgentThemeColor, CustomMcpScope, DiscussError, DiscussMemberOverrides, TeamCatalogEntry, TeamCatalogMember,
+    TeamDefinitionKind,
 };
 
 impl Actor {
@@ -882,8 +883,10 @@ impl Actor {
                     .map(serde_json::from_str)
                     .transpose()?,
                 definition_available: true,
+                definition_kind: TeamDefinitionKind::Builtin,
                 members,
                 skill_names,
+                skill_ids: Some(team.skills.iter().map(ToString::to_string).collect()),
             });
         }
 
@@ -937,8 +940,10 @@ impl Actor {
                     .map(serde_json::from_str)
                     .transpose()?,
                 definition_available: true,
+                definition_kind: TeamDefinitionKind::Custom,
                 members: Some(members),
                 skill_names: Some(skill_names),
+                skill_ids: Some(team.skills.iter().map(ToString::to_string).collect()),
             });
         }
 
@@ -958,8 +963,10 @@ impl Actor {
                     .map(serde_json::from_str)
                     .transpose()?,
                 definition_available: false,
+                definition_kind: TeamDefinitionKind::Unavailable,
                 members: None,
                 skill_names: None,
+                skill_ids: None,
             });
         }
 

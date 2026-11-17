@@ -12,14 +12,14 @@ use aves::flow::{LifecycleCorrelation, NodeExecutionId};
 
 use super::DiscussDomain;
 use super::types::{
-    AcpProvider, AgentNodeSessionLimits, AgentNodeTickResult, AgentThemeColor, CleanupWarning, CustomAgentDetail,
-    CustomAssetMetadata, CustomMcpEntry, CustomMcpScope, CustomSkillBundleFile, CustomSkillDetail,
+    AcpProvider, AgentNodeSessionLimits, AgentNodeTickResult, AgentThemeColor, BuiltinSkillEntry, CleanupWarning,
+    CustomAgentDetail, CustomAssetMetadata, CustomMcpEntry, CustomMcpScope, CustomSkillBundleFile, CustomSkillDetail,
     DiscussAllowanceGroupBy, DiscussAllowanceProjection, DiscussAllowanceReport, DiscussChatTurnRecord,
     DiscussConfigOption, DiscussConfigValues, DiscussElicitationAnswer, DiscussError, DiscussImageAttachment,
     DiscussMcpStatus, DiscussMemberOverrides, DiscussPermissionOption, DiscussProviderConfig, DiscussSessionId,
     DiscussSessionInfo, DiscussSessionSetup, DiscussSubagentRecord, DiscussUsageGroupBy, DiscussUsageReport,
-    ElicitationRequestId, InspectorBinding, InstalledAssetKind, PermissionRequestId, ProviderRuntimeState,
-    SensitiveMcpDescriptor, SessionLaunchConfig, TeamCatalogEntry,
+    ElicitationRequestId, IncompleteTeamClaim, InspectorBinding, InstalledAssetClaim, InstalledAssetKind,
+    PermissionRequestId, ProviderRuntimeState, SensitiveMcpDescriptor, SessionLaunchConfig, TeamCatalogEntry,
 };
 
 /// Discuss domain request wrapper.
@@ -372,6 +372,15 @@ pub enum DiscussRequestPayload {
         mcp_name: String,
     },
 
+    /// List built-in skill metadata.
+    #[operation(name = "listBuiltinSkills", kind = "query", response = ListBuiltinSkillsOutput, response_variant = "ListBuiltinSkills")]
+    ListBuiltinSkills,
+    /// List recorded provider asset installation claims.
+    #[operation(name = "listProviderInstalledAssets", kind = "query", response = ProviderInstalledAssetsOutput, response_variant = "ProviderInstalledAssets")]
+    ListProviderInstalledAssets,
+    /// List MCP names assigned to an installed provider.
+    #[operation(name = "listProviderMcpAssignments", kind = "query", response = ProviderMcpAssignmentsOutput, response_variant = "ProviderMcpAssignments")]
+    ListProviderMcpAssignments { provider_name: String },
     /// List cached custom agents.
     #[operation(name = "listCustomAgents", kind = "query", response = ListCustomAgentsOutput, response_variant = "ListCustomAgents")]
     ListCustomAgents,
@@ -679,6 +688,16 @@ pub enum DiscussResponse {
 
     /// Stored custom MCP descriptors.
     ListCustomMcps { entries: Vec<CustomMcpEntry> },
+    /// Built-in skill metadata in library order.
+    ListBuiltinSkills { entries: Vec<BuiltinSkillEntry> },
+    /// Recorded provider installation claims.
+    ProviderInstalledAssets {
+        agents: Vec<InstalledAssetClaim>,
+        skills: Vec<InstalledAssetClaim>,
+        incomplete_teams: Vec<IncompleteTeamClaim>,
+    },
+    /// MCP names assigned to a provider.
+    ProviderMcpAssignments { mcp_names: Vec<String> },
     /// Cached custom agent metadata.
     ListCustomAgents { entries: Vec<CustomAssetMetadata> },
     /// Cached custom skill metadata.

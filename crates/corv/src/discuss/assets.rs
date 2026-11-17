@@ -35,8 +35,8 @@ use super::storage::{
 };
 use super::types::InstalledAssetKind;
 use super::types::{
-    CustomAgentDetail, CustomAssetMetadata, CustomSkillBundleFile, CustomSkillDetail, DiscussError,
-    DiscussMemberOverrides, DiscussSessionSetup,
+    BuiltinSkillEntry, CustomAgentDetail, CustomAssetMetadata, CustomSkillBundleFile, CustomSkillDetail, DiscussError,
+    DiscussMemberOverrides, DiscussSessionSetup, IncompleteTeamClaim, InstalledAssetClaim, InstalledClaimBasis,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -567,6 +567,177 @@ impl Actor {
             row,
         )
         .await
+    }
+
+    pub(super) fn handle_list_builtin_skills(&self) -> Result<DiscussResponse, DiscussError> {
+        let entries = self
+            .library
+            .skills_for()
+            .map(|skill| BuiltinSkillEntry {
+                skill_id: skill.id.to_string(),
+                name: skill.name.to_owned(),
+                description: skill.description.to_owned(),
+                version: skill.version.to_string(),
+            })
+            .collect();
+        Ok(DiscussResponse::ListBuiltinSkills { entries })
+    }
+
+    pub(super) async fn handle_list_provider_installed_assets(&self) -> Result<DiscussResponse, DiscussError> {
+        let conn = self.persistence.acquire_connection().await?;
+        let agent_ids: BTreeSet<String> = self
+            .library
+            .agents_for()
+            .map(|agent| agent.id.to_string())
+            .chain(
+                list_custom_agents(&conn)
+                    .await?
+                    .into_iter()
+                    .map(|row| row.id),
+            )
+            .collect();
+        let skill_ids: BTreeSet<String> = self
+            .library
+            .skills_for()
+            .map(|skill| skill.id.to_string())
+            .chain(
+                list_custom_skills(&conn)
+                    .await?
+                    .into_iter()
+                    .map(|row| row.id),
+            )
+            .collect();
+        let custom_teams: BTreeMap<_, _> = list_custom_teams(&conn)
+            .await?
+            .into_iter()
+            .map(|team| (team.leader_id.clone(), team))
+            .collect();
+        let mut agents = Vec::new();
+        let mut skills = Vec::new();
+        let mut incomplete_teams = Vec::new();
+        for (kind, ids, claims) in [
+            (CustomInstallationKind::Agent, &agent_ids, &mut agents),
+            (CustomInstallationKind::Skill, &skill_ids, &mut skills),
+        ] {
+            for row in list_custom_installations(&conn, kind).await? {
+                let present = ids.contains(&row.asset_id);
+                claims.push(self.inventory_claim(
+                    row.provider_name,
+                    row.asset_id,
+                    kind,
+                    None,
+                    Some(row.installed_version),
+                    present,
+                ));
+            }
+        }
+        for row in list_discuss_team_installations(&conn).await? {
+            let builtin = self
+                .library
+                .teams_for()
+                .find(|team| team.leader.as_ref() == row.leader_id);
+            let (members, team_skills): (Vec<String>, Vec<String>) = if let Some(team) = builtin {
+                (
+                    std::iter::once(team.leader.to_string())
+                        .chain(team.followers.iter().map(ToString::to_string))
+                        .collect(),
+                    team.skills.iter().map(ToString::to_string).collect(),
+                )
+            } else if let Some(team) = custom_teams.get(&row.leader_id) {
+                let followers: Vec<String> = serde_json::from_str(&team.followers_json)?;
+                let team_skills: Vec<String> = serde_json::from_str(&team.skills_json)?;
+                (
+                    std::iter::once(team.leader_id.clone())
+                        .chain(followers)
+                        .collect(),
+                    team_skills,
+                )
+            } else {
+                incomplete_teams.push(IncompleteTeamClaim {
+                    provider_name: row.provider_name.clone(),
+                    team_leader_id: row.leader_id.clone(),
+                });
+                (serde_json::from_str(&row.members_json)?, Vec::new())
+            };
+            for id in members {
+                let present = agent_ids.contains(&id);
+                agents.push(self.inventory_claim(
+                    row.provider_name.clone(),
+                    id,
+                    CustomInstallationKind::Agent,
+                    Some(row.leader_id.clone()),
+                    None,
+                    present,
+                ));
+            }
+            for id in team_skills {
+                let present = skill_ids.contains(&id);
+                skills.push(self.inventory_claim(
+                    row.provider_name.clone(),
+                    id,
+                    CustomInstallationKind::Skill,
+                    Some(row.leader_id.clone()),
+                    None,
+                    present,
+                ));
+            }
+        }
+        for claims in [&mut agents, &mut skills] {
+            claims.sort_by(|a, b| {
+                (&a.provider_name, &a.asset_id, a.basis, &a.team_leader_id).cmp(&(
+                    &b.provider_name,
+                    &b.asset_id,
+                    b.basis,
+                    &b.team_leader_id,
+                ))
+            });
+        }
+        incomplete_teams
+            .sort_by(|a, b| (&a.provider_name, &a.team_leader_id).cmp(&(&b.provider_name, &b.team_leader_id)));
+        Ok(DiscussResponse::ProviderInstalledAssets {
+            agents,
+            skills,
+            incomplete_teams,
+        })
+    }
+
+    fn inventory_claim(
+        &self,
+        provider_name: String,
+        asset_id: String,
+        kind: CustomInstallationKind,
+        team_leader_id: Option<String>,
+        installed_version: Option<String>,
+        definition_present: bool,
+    ) -> InstalledAssetClaim {
+        let provider_installed = self.agents.contains_key(&provider_name);
+        let scope_key = if provider_installed {
+            let plugin = plugins::for_agent(&provider_name);
+            Some(
+                match kind {
+                    CustomInstallationKind::Agent => plugin.agent_scope_key(),
+                    CustomInstallationKind::Skill => plugin.skill_scope_key(),
+                }
+                .to_owned(),
+            )
+        } else {
+            None
+        };
+        let basis = if team_leader_id.is_some() {
+            InstalledClaimBasis::Team
+        } else {
+            InstalledClaimBasis::Standalone
+        };
+        InstalledAssetClaim {
+            provider_name,
+            asset_id,
+            basis,
+            team_leader_id,
+            installed_version,
+            scope_key,
+            provider_installed,
+            definition_present,
+        }
     }
 
     pub(super) async fn handle_list_custom_agents(&self) -> Result<DiscussResponse, DiscussError> {

@@ -214,6 +214,11 @@ impl AssistantTurnBuffer {
             .push(serde_json::json!({"kind": "thought", "text": thought}));
     }
 
+    pub(super) fn append_image(&mut self, data: &str, mime_type: &str) {
+        self.parts
+            .push(serde_json::json!({"kind": "image", "mimeType": mime_type, "data": data}));
+    }
+
     pub(super) fn append_tool_call(&mut self, update: serde_json::Value, is_update: bool) {
         self.parts.push(serde_json::json!({
             "kind": "tool_call",
@@ -456,6 +461,7 @@ fn append_dispatch_delta(buffer: &mut AssistantTurnBuffer, dispatch: &AcpDispatc
             match delta {
                 AssistantDelta::Text(text) => buffer.append_text(&text),
                 AssistantDelta::Thought(thought) => buffer.append_thought(&thought),
+                AssistantDelta::Image { data, mime_type } => buffer.append_image(&data, &mime_type),
             }
             return;
         }
@@ -489,13 +495,24 @@ fn append_metadata_update(buffer: &mut AssistantTurnBuffer, dispatch: &AcpDispat
 enum AssistantDelta {
     Text(String),
     Thought(String),
+    Image { data: String, mime_type: String },
 }
 
 fn extract_assistant_delta(params: &serde_json::Value) -> Option<AssistantDelta> {
     let update = params.get("update")?;
     let session_update = update.get("sessionUpdate")?.as_str()?;
     match session_update {
-        "agent_message_chunk" => extract_text_from_content_block(update.get("content")?).map(AssistantDelta::Text),
+        "agent_message_chunk" => {
+            let content = update.get("content")?;
+            if content.get("type")?.as_str()? == "image" {
+                Some(AssistantDelta::Image {
+                    data: content.get("data")?.as_str()?.to_string(),
+                    mime_type: content.get("mimeType")?.as_str()?.to_string(),
+                })
+            } else {
+                extract_text_from_content_block(content).map(AssistantDelta::Text)
+            }
+        }
         "agent_thought_chunk" => extract_text_from_content_block(update.get("content")?).map(AssistantDelta::Thought),
         _ => None,
     }

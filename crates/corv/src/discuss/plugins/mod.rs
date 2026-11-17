@@ -476,11 +476,6 @@ pub trait DiscussAgentPlugin: Sync {
         false
     }
 
-    /// Return an isolated launch when a Team requires workspace-local assets.
-    fn team_launch_server(&self, _server: &McpServer, _workspace: &Path) -> Result<Option<McpServer>, DiscussError> {
-        Ok(None)
-    }
-
     /// Apply explicitly supplied session configuration to a private process.
     fn configured_launch_server(
         &self,

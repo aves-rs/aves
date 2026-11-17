@@ -116,25 +116,6 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         PrimaryAgentSelection::ConfigOption(MODE_CONFIG_ID)
     }
 
-    fn team_launch_server(&self, server: &McpServer, workspace: &Path) -> Result<Option<McpServer>, DiscussError> {
-        let McpServer::Stdio(mut server) = server.clone() else {
-            return Err(DiscussError::Validation {
-                message: "OpenCode Team sessions require a stdio provider".to_string(),
-            });
-        };
-        let directory = workspace.join(".opencode");
-        let directory = directory.to_str().ok_or_else(|| DiscussError::Validation {
-            message: "OpenCode Team configuration directory is not UTF-8".to_string(),
-        })?;
-        server
-            .env
-            .retain(|entry| entry.name != "OPENCODE_CONFIG_DIR");
-        server
-            .env
-            .push(EnvVariable::new("OPENCODE_CONFIG_DIR", directory));
-        Ok(Some(McpServer::Stdio(server)))
-    }
-
     fn uses_mcp_launch_env(&self) -> bool {
         true
     }
@@ -153,7 +134,7 @@ impl DiscussAgentPlugin for OpenCodePlugin {
     fn configured_launch_server(
         &self,
         server: &McpServer,
-        workspace: &Path,
+        _workspace: &Path,
         config: &SessionLaunchConfig,
     ) -> Result<McpServer, DiscussError> {
         // ACP terminal authentication is provider-wide, not a per-session CLI login.
@@ -167,31 +148,9 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         if !config.cli_tools.is_empty() {
             return Err(DiscussError::SessionCliToolUnsupported);
         }
-        if let McpServer::Stdio(provider) = server {
-            let directory = match provider
-                .env
-                .iter()
-                .rev()
-                .find(|entry| entry.name == "OPENCODE_CONFIG_DIR")
-            {
-                Some(entry) => Some(entry.value.clone()),
-                None => match std::env::var("OPENCODE_CONFIG_DIR") {
-                    Ok(value) => Some(value),
-                    Err(std::env::VarError::NotPresent) => None,
-                    Err(std::env::VarError::NotUnicode(_)) => {
-                        return Err(DiscussError::Validation {
-                            message: "OpenCode custom configuration directory is not UTF-8".to_string(),
-                        });
-                    }
-                },
-            };
-            if directory.is_some_and(|value| Path::new(&value) != workspace.join(".opencode")) {
-                return Err(DiscussError::Validation {
-                    message: "OpenCode custom configuration directory cannot be combined with Team assets".to_string(),
-                });
-            }
-        }
-        let Some(McpServer::Stdio(mut server)) = self.team_launch_server(server, workspace)? else {
+        // The Team's `.opencode` lives in the session's working directory, where OpenCode loads it
+        // as project config on top of the user's own global configuration.
+        let McpServer::Stdio(mut server) = server.clone() else {
             return Err(DiscussError::Validation {
                 message: "OpenCode requires a stdio provider".to_string(),
             });
@@ -945,30 +904,6 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn team_launch_uses_central_config_without_mutating_provider() {
-        let workspace = tempdir().expect("temporary workspace");
-        let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));
-        let launch = PLUGIN
-            .team_launch_server(&original, workspace.path())
-            .expect("valid launch")
-            .expect("isolated");
-        let McpServer::Stdio(server) = launch else {
-            panic!("expected stdio")
-        };
-        let expected = workspace.path().join(".opencode");
-        assert!(
-            server
-                .env
-                .iter()
-                .any(|entry| entry.name == "OPENCODE_CONFIG_DIR" && entry.value == expected.to_str().unwrap())
-        );
-        let McpServer::Stdio(original) = original else {
-            panic!("expected stdio")
-        };
-        assert!(original.env.is_empty());
-    }
-
-    #[test]
     fn configured_launch_does_not_invent_permissions() {
         let workspace = tempdir().unwrap();
         let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));
@@ -1021,7 +956,7 @@ mod tests {
                 .any(|entry| entry.name == "OPENCODE_CONFIG_CONTENT" && entry.value == original)
         );
         assert!(
-            server
+            !server
                 .env
                 .iter()
                 .any(|entry| entry.name == "OPENCODE_CONFIG_DIR")

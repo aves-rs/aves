@@ -1548,6 +1548,8 @@ pub struct BuiltinSkillEntry {
     pub name: String,
     pub description: String,
     pub version: String,
+    /// Canonical `SKILL.md` contents from the application-supplied definition.
+    pub body: String,
 }
 
 /// Source of an installed asset claim.
@@ -1642,6 +1644,8 @@ pub struct TeamCatalogMember {
     pub name: String,
     /// Human-readable Agent job title.
     pub job_title: String,
+    /// Agent body (system prompt) from its built-in or custom definition.
+    pub body: String,
 }
 
 /// Origin of the currently available Team definition.

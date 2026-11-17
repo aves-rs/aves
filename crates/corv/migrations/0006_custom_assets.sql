@@ -1,0 +1,6 @@
+CREATE TABLE discuss_custom_agents (agent_id TEXT PRIMARY KEY, name TEXT NOT NULL, job_title TEXT NOT NULL, description TEXT NOT NULL, version TEXT NOT NULL, source_kind TEXT NOT NULL CHECK (source_kind IN ('local_markdown','url_markdown','github_file','github_directory')), source_url TEXT, last_pull_at_ms INTEGER, last_pull_ok INTEGER, pull_error TEXT, updated_at_ms INTEGER NOT NULL);
+CREATE TABLE discuss_custom_skills (skill_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, version TEXT NOT NULL, source_kind TEXT NOT NULL CHECK (source_kind IN ('local_markdown','url_markdown','github_file','github_directory')), source_url TEXT, last_pull_at_ms INTEGER, last_pull_ok INTEGER, pull_error TEXT, updated_at_ms INTEGER NOT NULL);
+CREATE TABLE discuss_custom_agent_installations (provider_name TEXT, agent_id TEXT, installed_version TEXT, PRIMARY KEY (provider_name, agent_id));
+CREATE TABLE discuss_custom_skill_installations (provider_name TEXT, skill_id TEXT, installed_version TEXT, PRIMARY KEY (provider_name, skill_id));
+CREATE TABLE discuss_custom_teams (leader_id TEXT PRIMARY KEY, display_name TEXT, followers_json TEXT NOT NULL, skills_json TEXT NOT NULL, version TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);
+CREATE TABLE discuss_asset_instructions (asset_path TEXT PRIMARY KEY, instructions TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);

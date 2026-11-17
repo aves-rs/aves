@@ -1,6 +1,6 @@
 [package]
 name = "aves-corv"
-version = "0.12.0"
+version = "0.14.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Specialized discussion domain for the Aves async application runtime"
 authors = { workspace = true }
@@ -24,7 +24,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # internal
-aves = { path = "../aves", version = "=0.12.0", features = ["test-support"] }
+aves = { path = "../aves", version = "=0.14.0", features = ["test-support"] }
 
 # external
 tempfile = { workspace = true }
@@ -33,21 +33,23 @@ tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves = { path = "../aves", version = "=0.12.0" }
+aves = { path = "../aves", version = "=0.14.0" }
 
 # external
-agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp"] }
+agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp", "unstable_end_turn_token_usage"] }
 async-trait = { workspace = true }
 axum08 = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+quota-core = { workspace = true }
 rmcp = { workspace = true }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
 rspc = { workspace = true }
+rust_decimal = { workspace = true }
 schemars = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 specta = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -10,6 +10,7 @@ use agent_client_protocol::v1::schema::{
     SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionInfo,
     StopReason,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
@@ -34,6 +35,7 @@ use aves::utils::database::{
 use aves::utils::test_support::{MockBus, reply_with};
 use aves::utils::uuid::SpectaUuid;
 
+use super::super::asset_sources::AssetSource;
 use super::super::boot::{DiscussBootOptions, DiscussSettings};
 use super::super::library::AgentId;
 use super::super::migration::MIGRATIONS as DISCUSS_MIGRATIONS;
@@ -99,6 +101,134 @@ async fn session_launch_context_survives_anchor_updates() {
         .unwrap();
     assert_eq!(row.session_mcp_enabled, Some(0));
     assert!(row.session_cwd_json.is_some());
+}
+
+#[tokio::test]
+async fn launch_limitations_are_replaced_and_survive_anchor_updates() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database = open_local_db(temp.path()).await.expect("database");
+    apply_discuss_migrations(&database)
+        .await
+        .expect("migrations");
+    let persistence = DiscussPersistence {
+        database: Arc::new(database),
+    };
+    let session_id = DiscussSessionId::new().to_string();
+    persist_session_anchor_inner(&persistence, &session_id, SessionAnchorMetadata::default())
+        .await
+        .expect("anchor");
+    let conn = persistence.acquire_connection().await.expect("connection");
+    assert!(
+        load_discuss_session(&conn, &session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .launch_limitations
+            .is_empty()
+    );
+    assert!(
+        list_recent_discuss_sessions(&conn).await.unwrap()[0]
+            .launch_limitations
+            .is_empty()
+    );
+
+    let limitations = vec![LaunchLimitation {
+        subject: LaunchLimitationSubject::PluginReference { index: 3 },
+        reason: LaunchLimitationReason::UnsupportedPluginReference,
+    }];
+    let (bus_requester, _bus_requests) = mpsc::channel::<OpaqueRequestEnvelope>(1);
+    let (queue, drain) = spawn_persistence_queue(
+        persistence.clone(),
+        session_id.clone(),
+        "agent".to_string(),
+        "session".to_string(),
+        BusRpcContext::authenticated(bus_requester, Jwt::from_opaque("test-token".to_string())),
+    );
+    queue
+        .persist_launch_limitations(limitations.clone())
+        .await
+        .expect("acknowledged write");
+    assert_eq!(
+        load_discuss_session(&conn, &session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .launch_limitations,
+        limitations
+    );
+    assert_eq!(
+        list_recent_discuss_sessions(&conn).await.unwrap()[0].launch_limitations,
+        limitations
+    );
+    persist_session_anchor_inner(&persistence, &session_id, SessionAnchorMetadata::default())
+        .await
+        .expect("anchor update");
+    assert_eq!(
+        load_discuss_session(&conn, &session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .launch_limitations,
+        limitations
+    );
+
+    queue
+        .persist_launch_limitations(Vec::new())
+        .await
+        .expect("empty replacement");
+    let mut rows = conn
+        .query(
+            "SELECT launch_limitations_json FROM discuss_sessions WHERE discuss_session_id = ?1",
+            (session_id.clone(),),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "[]");
+    assert!(
+        load_discuss_session(&conn, &session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .launch_limitations
+            .is_empty()
+    );
+    drop(rows);
+    conn.execute(
+        "UPDATE discuss_sessions SET launch_limitations_json = ?2 WHERE discuss_session_id = ?1",
+        (session_id.clone(), "not json".to_string()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        load_discuss_session(&conn, &session_id).await,
+        Err(DiscussError::Persistence { .. })
+    ));
+    assert!(matches!(
+        list_recent_discuss_sessions(&conn).await,
+        Err(DiscussError::Persistence { .. })
+    ));
+    drop(queue);
+    drain.await.expect("queue drain");
+}
+
+#[test]
+fn launch_metadata_preserves_leader_and_rejects_conflicts() {
+    use super::super::plugins::merge_metadata;
+    use agent_client_protocol::v1::schema::Meta;
+
+    let leader = Meta::from_iter([("rules".to_owned(), json!({"leader": true}))]);
+    let launch = Meta::from_iter([("settings".to_owned(), json!({"restricted": true}))]);
+    let merged = merge_metadata(Some(leader.clone()), Some(launch))
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.get("rules"), leader.get("rules"));
+    assert!(merged.contains_key("settings"));
+    let conflict = Meta::from_iter([("rules".to_owned(), json!({"leader": false}))]);
+    assert!(matches!(
+        merge_metadata(Some(leader), Some(conflict)),
+        Err(DiscussError::Validation { .. })
+    ));
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -558,8 +688,10 @@ async fn make_actor(
     };
     let (capabilities_update_tx, capabilities_update_rx) =
         mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
+    let (activity_update_tx, activity_update_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
+    let (import_completion_tx, import_completion_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_cancel_tx, pending_permission_cancel_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_elicitation_tx, pending_elicitation_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -611,10 +743,16 @@ async fn make_actor(
         worker_capabilities: HashMap::new(),
         capabilities_update_rx,
         capabilities_update_tx,
+        activity_update_rx,
+        activity_update_tx,
         worker_ready_rx,
         worker_ready_tx,
         transient_worker_rx,
         transient_worker_tx,
+        import_completion_tx,
+        import_completion_rx,
+        next_import_key: 0,
+        pending_imports: HashMap::new(),
         pending_permission_rx,
         pending_permission_tx,
         pending_permission_cancel_rx,
@@ -627,6 +765,12 @@ async fn make_actor(
         pending_elicitations: HashMap::new(),
         pending_provider_tests: HashMap::new(),
         server_running: true,
+        price_index: Default::default(),
+        allowance_snapshot: None,
+        accounting_cancel: None,
+        allowance: None,
+        pricing_task: None,
+        accounting_retention_days: 0,
     }
 }
 
@@ -926,16 +1070,279 @@ fn canonical_test_team() -> (String, AgentId, Version) {
     )
 }
 
+#[tokio::test]
+async fn builtin_skills_return_only_ordered_metadata() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let DiscussResponse::ListBuiltinSkills { entries } = actor.handle_list_builtin_skills().unwrap() else {
+        panic!("expected built-in skill entries");
+    };
+    let ids: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.skill_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "financial-data",
+            "forensics",
+            "valuation",
+            "market-methodology",
+            "equity-outlook",
+            "flow-builder"
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(&entries[0]).unwrap(),
+        json!({
+            "skillId": "financial-data", "name": "Test skill", "description": "Test skill description", "version": "1.0.0"
+        })
+    );
+}
+
+#[tokio::test]
+async fn installed_inventory_retains_standalone_team_and_stale_claims() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    actor
+        .agents
+        .insert("opencode".into(), make_local_mcp_server("unused"));
+    let conn = actor.persistence.acquire_connection().await.unwrap();
+    let asset = CustomAssetRow {
+        id: "custom-agent".into(),
+        name: "Custom".into(),
+        job_title: Some("Role".into()),
+        description: "Custom".into(),
+        version: "1.2.3".into(),
+        source_kind: CustomSourceKind::LocalMarkdown,
+        source_url: None,
+        last_pull_at_ms: None,
+        last_pull_ok: None,
+        pull_error: None,
+        updated_at_ms: 0,
+    };
+    upsert_custom_agent(&conn, &asset).await.unwrap();
+    let skill = CustomAssetRow {
+        id: "custom-skill".into(),
+        ..asset.clone()
+    };
+    upsert_custom_skill(&conn, &skill).await.unwrap();
+    for (kind, provider, id, version) in [
+        (CustomInstallationKind::Agent, "opencode", "custom-agent", "1.2.3"),
+        (CustomInstallationKind::Agent, "removed", "missing-agent", "0.4.0"),
+        (CustomInstallationKind::Skill, "opencode", "custom-skill", "2.0.0"),
+    ] {
+        upsert_custom_installation(
+            &conn,
+            kind,
+            &CustomInstallationRow {
+                provider_name: provider.into(),
+                asset_id: id.into(),
+                installed_version: version.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    upsert_custom_team(
+        &conn,
+        &CustomTeamRow {
+            leader_id: "custom-agent".into(),
+            display_name: None,
+            followers_json: "[\"equity-auditor\"]".into(),
+            skills_json: "[\"custom-skill\",\"missing-skill\"]".into(),
+            version: "1.0.0".into(),
+            updated_at_ms: 0,
+        },
+    )
+    .await
+    .unwrap();
+    for (leader, provider, members) in [
+        ("equity-analyst", "opencode", "[]"),
+        ("custom-agent", "opencode", "[]"),
+        ("retired-team", "removed", "[\"retired-team\",\"equity-auditor\"]"),
+    ] {
+        upsert_discuss_team_installation(&conn, leader, provider, "9.0.0", "{}", members, None)
+            .await
+            .unwrap();
+    }
+    let DiscussResponse::ProviderInstalledAssets {
+        agents,
+        skills,
+        incomplete_teams,
+    } = actor.handle_list_provider_installed_assets().await.unwrap()
+    else {
+        panic!("expected inventory");
+    };
+    let agent_scope = plugins::for_agent("opencode").agent_scope_key();
+    let skill_scope = plugins::for_agent("opencode").skill_scope_key();
+    let standalone = agents
+        .iter()
+        .find(|row| row.asset_id == "custom-agent" && row.basis == InstalledClaimBasis::Standalone)
+        .unwrap();
+    assert_eq!(standalone.installed_version.as_deref(), Some("1.2.3"));
+    assert_eq!(standalone.scope_key.as_deref(), Some(agent_scope));
+    assert!(standalone.provider_installed && standalone.definition_present && standalone.team_leader_id.is_none());
+    let stale = agents
+        .iter()
+        .find(|row| row.asset_id == "missing-agent")
+        .unwrap();
+    assert!(!stale.provider_installed && !stale.definition_present && stale.scope_key.is_none());
+    for id in ["equity-analyst", "equity-auditor", "generalist-reviewer"] {
+        assert!(agents.iter().any(|row| row.asset_id == id
+            && row.team_leader_id.as_deref() == Some("equity-analyst")
+            && row.installed_version.is_none()
+            && row.definition_present));
+    }
+    assert!(
+        agents
+            .iter()
+            .any(|row| row.asset_id == "equity-auditor" && row.team_leader_id.as_deref() == Some("custom-agent"))
+    );
+    assert!(skills.iter().any(|row| row.asset_id == "financial-data"
+        && row.team_leader_id.as_deref() == Some("equity-analyst")
+        && row.scope_key.as_deref() == Some(skill_scope)));
+    assert!(skills.iter().any(|row| row.asset_id == "custom-skill"
+        && row.basis == InstalledClaimBasis::Standalone
+        && row.installed_version.as_deref() == Some("2.0.0")));
+    assert!(skills.iter().any(|row| row.asset_id == "custom-skill"
+        && row.team_leader_id.as_deref() == Some("custom-agent")
+        && row.definition_present
+        && row.installed_version.is_none()));
+    assert!(
+        skills
+            .iter()
+            .any(|row| row.asset_id == "missing-skill" && !row.definition_present)
+    );
+    assert!(agents.iter().any(|row| row.asset_id == "retired-team"
+        && row.team_leader_id.as_deref() == Some("retired-team")
+        && !row.provider_installed
+        && !row.definition_present
+        && row.scope_key.is_none()));
+    assert!(agents.iter().any(|row| row.asset_id == "equity-auditor"
+        && row.team_leader_id.as_deref() == Some("retired-team")
+        && row.definition_present
+        && row.scope_key.is_none()));
+    assert!(
+        !skills
+            .iter()
+            .any(|row| row.team_leader_id.as_deref() == Some("retired-team"))
+    );
+    assert_eq!(
+        incomplete_teams,
+        vec![IncompleteTeamClaim {
+            provider_name: "removed".into(),
+            team_leader_id: "retired-team".into()
+        }]
+    );
+    for claims in [&agents, &skills] {
+        assert!(claims.windows(2).all(|pair| (
+            &pair[0].provider_name,
+            &pair[0].asset_id,
+            pair[0].basis,
+            &pair[0].team_leader_id
+        ) <= (
+            &pair[1].provider_name,
+            &pair[1].asset_id,
+            pair[1].basis,
+            &pair[1].team_leader_id
+        )));
+    }
+}
+
+#[tokio::test]
+async fn provider_mcp_assignments_return_names_and_reject_unknown_provider() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    actor
+        .agents
+        .insert("opencode".into(), make_local_mcp_server("unused"));
+    let conn = actor.persistence.acquire_connection().await.unwrap();
+    for name in ["zeta", "alpha", "other"] {
+        upsert_custom_mcp(&conn, name, make_local_mcp_server("unused").server(), 0)
+            .await
+            .unwrap();
+    }
+    insert_mcp_assignment(&conn, McpAssignmentScope::Provider, "opencode", "zeta")
+        .await
+        .unwrap();
+    insert_mcp_assignment(&conn, McpAssignmentScope::Provider, "opencode", "alpha")
+        .await
+        .unwrap();
+    insert_mcp_assignment(&conn, McpAssignmentScope::Team, "opencode", "other")
+        .await
+        .unwrap();
+    let DiscussResponse::ProviderMcpAssignments { mcp_names } = actor
+        .handle_list_provider_mcp_assignments("opencode")
+        .await
+        .unwrap()
+    else {
+        panic!("expected assignments");
+    };
+    assert_eq!(mcp_names, ["alpha", "zeta"]);
+    assert!(matches!(actor.handle_list_provider_mcp_assignments("removed").await,
+        Err(DiscussError::UnknownAgent { agent_key }) if agent_key == "removed"));
+}
+
 #[test]
 fn agent_versions_use_semver_precedence_and_fail_closed_on_invalid_values() {
     let current = Version::parse("1.2.3+current-build").expect("valid current version");
-    assert!(agent_versions_match("1.2.3+previous-build", &current).expect("valid versions"));
+    assert!(team_versions_match("1.2.3+previous-build", &current).expect("valid versions"));
     let newer = Version::parse("1.2.4").expect("valid current version");
-    assert!(!agent_versions_match("1.2.3", &newer).expect("valid versions"));
+    assert!(!team_versions_match("1.2.3", &newer).expect("valid versions"));
     assert!(matches!(
-        agent_versions_match("invalid", &current),
+        team_versions_match("invalid", &current),
         Err(AgentVersionParseError::Installed(_))
     ));
+}
+
+#[tokio::test]
+async fn updating_custom_skill_removes_stale_installed_files() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    actor
+        .agents
+        .insert("custom-a".to_string(), make_local_mcp_server("cat"));
+    let skill_file = CustomSkillBundleFile {
+        relative_path: "SKILL.md".to_string(),
+        contents: "---\nname: Example\ndescription: Example skill\n---\n\nInstructions".to_string(),
+    };
+    actor
+        .handle_create_custom_skill(
+            Some("example-skill".to_string()),
+            "Example".to_string(),
+            "Example skill".to_string(),
+            vec![
+                skill_file.clone(),
+                CustomSkillBundleFile {
+                    relative_path: "scripts/old.sh".to_string(),
+                    contents: "echo old".to_string(),
+                },
+            ],
+        )
+        .await
+        .expect("create skill");
+    actor
+        .install_custom_asset(CustomInstallationKind::Skill, "custom-a", "example-skill")
+        .await
+        .expect("install skill");
+    let installed = actor.agents_workspace.join(".agents/skills/example-skill");
+    assert!(installed.join("scripts/old.sh").is_file());
+    actor
+        .handle_update_custom_skill(
+            "example-skill".to_string(),
+            "Example".to_string(),
+            "Example skill".to_string(),
+            vec![skill_file],
+        )
+        .await
+        .expect("update skill");
+    assert!(!installed.join("scripts/old.sh").exists());
+    assert!(installed.join("SKILL.md").is_file());
 }
 
 #[tokio::test]
@@ -1328,7 +1735,7 @@ async fn boot_agent_upgrade_rewrites_and_failure_retains_persisted_version() {
     fs::create_dir_all(&actor.agents_workspace).expect("workspace");
     let (agent_id, _typed_id, current_version) = canonical_test_team();
     insert_test_installation(&actor, &agent_id, "custom", "0.0.0").await;
-    actor.upgrade_installed_agents().await;
+    actor.upgrade_installed_teams().await;
     assert!(
         actor
             .agents_workspace
@@ -1350,14 +1757,14 @@ async fn boot_agent_upgrade_rewrites_and_failure_retains_persisted_version() {
         .join(format!("{agent_id}.md"));
     fs::write(&unchanged_path, "unchanged").expect("seed unchanged agent file");
     insert_test_installation(&actor, &agent_id, "custom", &format!("{current_version}+build-a")).await;
-    actor.upgrade_installed_agents().await;
+    actor.upgrade_installed_teams().await;
     assert_eq!(
         fs::read_to_string(&unchanged_path).expect("read unchanged agent file"),
         "unchanged"
     );
 
     insert_test_installation(&actor, &agent_id, "custom", "invalid").await;
-    actor.upgrade_installed_agents().await;
+    actor.upgrade_installed_teams().await;
     assert_eq!(
         load_test_installation(&actor, &agent_id)
             .await
@@ -1385,7 +1792,7 @@ async fn boot_agent_upgrade_rewrites_and_failure_retains_persisted_version() {
     .expect("workspace parent");
     fs::write(&blocked_workspace, "not a directory").expect("block upgrade workspace");
     insert_test_installation(&failed, &agent_id, "custom", "0.0.0").await;
-    failed.upgrade_installed_agents().await;
+    failed.upgrade_installed_teams().await;
     assert_eq!(
         load_test_installation(&failed, &agent_id)
             .await
@@ -1393,6 +1800,49 @@ async fn boot_agent_upgrade_rewrites_and_failure_retains_persisted_version() {
             .installed_version,
         "0.0.0"
     );
+}
+
+#[tokio::test]
+async fn team_at_root_materializes_saved_member_settings_without_central_install() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let root = tempfile::tempdir().expect("root");
+    let (leader, _, _) = canonical_test_team();
+    let overrides = DiscussMemberOverrides::from([(
+        leader.clone(),
+        ConfigSettings::from([("model".to_string(), "test-model".to_string())]),
+    )]);
+    let conn = actor
+        .persistence
+        .acquire_connection()
+        .await
+        .expect("connection");
+    upsert_discuss_team_installation(
+        &conn,
+        &leader,
+        "opencode",
+        "1.0.0",
+        &serde_json::to_string(&overrides).expect("serialize overrides"),
+        "[]",
+        None,
+    )
+    .await
+    .expect("persist installation");
+    drop(conn);
+
+    actor
+        .materialize_custom_team_at_root("opencode", root.path(), &leader)
+        .await
+        .expect("materialize Team");
+    let output = fs::read_to_string(
+        root.path()
+            .join(".opencode/agents")
+            .join(format!("{leader}.md")),
+    )
+    .expect("root Agent output");
+    assert!(output.contains("model: test-model"), "output was: {output}");
+    assert!(!actor.agents_workspace.exists());
 }
 
 #[tokio::test]
@@ -1491,7 +1941,7 @@ async fn boot_team_upgrade_restores_distinct_member_overrides_and_canonical_snap
     .await
     .expect("persist old Team installation");
 
-    actor.upgrade_installed_agents().await;
+    actor.upgrade_installed_teams().await;
 
     let leader_path = actor
         .agents_workspace
@@ -2601,6 +3051,7 @@ async fn remove_provider_cascade_deletes_only_matching_sessions() {
     actor.worker_registry.insert(
         session_a,
         WorkerEntry {
+            active_turn: false,
             agent_name: "provider-a".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx: command_tx_a,
@@ -2612,6 +3063,7 @@ async fn remove_provider_cascade_deletes_only_matching_sessions() {
     actor.worker_registry.insert(
         session_b,
         WorkerEntry {
+            active_turn: false,
             agent_name: "provider-b".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx: command_tx_b,
@@ -2819,6 +3271,7 @@ async fn remove_provider_partial_failure_leaves_provider_present() {
     actor.worker_registry.insert(
         session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "provider-a".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx,
@@ -3207,8 +3660,10 @@ async fn make_migrated_actor(
     };
     let (capabilities_update_tx, capabilities_update_rx) =
         mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
+    let (activity_update_tx, activity_update_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
+    let (import_completion_tx, import_completion_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_cancel_tx, pending_permission_cancel_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_elicitation_tx, pending_elicitation_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -3245,10 +3700,16 @@ async fn make_migrated_actor(
         worker_capabilities: HashMap::new(),
         capabilities_update_rx,
         capabilities_update_tx,
+        activity_update_rx,
+        activity_update_tx,
         worker_ready_rx,
         worker_ready_tx,
         transient_worker_rx,
         transient_worker_tx,
+        import_completion_tx,
+        import_completion_rx,
+        next_import_key: 0,
+        pending_imports: HashMap::new(),
         pending_permission_rx,
         pending_permission_tx,
         pending_permission_cancel_rx,
@@ -3261,8 +3722,89 @@ async fn make_migrated_actor(
         pending_elicitations: HashMap::new(),
         pending_provider_tests: HashMap::new(),
         server_running: true,
+        price_index: Default::default(),
+        allowance_snapshot: None,
+        accounting_cancel: None,
+        allowance: None,
+        pricing_task: None,
+        accounting_retention_days: 0,
     };
     (actor, temp_dir)
+}
+
+#[tokio::test]
+async fn stop_server_aborts_pending_custom_imports() {
+    let (bus, _mock) = MockBus::new(8);
+    let (broadcast_tx, _broadcast_rx) = mpsc::channel(8);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus, broadcast_tx).await;
+    let (reply_to, reply_rx) = oneshot::channel();
+    let task = tokio::spawn(std::future::pending::<()>());
+    actor.pending_imports.insert(
+        0,
+        PendingImport {
+            kind: CustomInstallationKind::Agent,
+            id: "custom-import".to_owned(),
+            url: "https://example.com/agent.md".to_owned(),
+            reply_to,
+            abort: task.abort_handle(),
+        },
+    );
+    actor.handle_stop_server().await.expect("stop server");
+    assert!(matches!(
+        reply_rx.await.expect("reply"),
+        Err(DiscussError::ShuttingDown)
+    ));
+    assert!(actor.pending_imports.is_empty());
+    assert!(task.await.expect_err("task aborted").is_cancelled());
+}
+
+#[tokio::test]
+async fn custom_import_completion_preserves_cached_agent_on_fetch_failure() {
+    let (bus, _mock) = MockBus::new(8);
+    let (broadcast_tx, _broadcast_rx) = mpsc::channel(8);
+    let (actor, _temp_dir) = make_migrated_actor(bus, broadcast_tx).await;
+    let id = "custom-import".to_owned();
+    let url = "https://example.com/agent.md".to_owned();
+    let markdown = "---\nname: Imported Agent\ndescription: Imported description\n---\nOriginal body\n";
+    actor
+        .complete_custom_import(
+            CustomInstallationKind::Agent,
+            id.clone(),
+            url.clone(),
+            Ok(AssetSource::Document(markdown.to_owned())),
+        )
+        .await
+        .expect("import agent");
+    let DiscussResponse::ListCustomAgents { entries } = actor.handle_list_custom_agents().await.expect("list") else {
+        panic!("expected agent list");
+    };
+    assert!(entries.iter().any(|entry| entry.id == id));
+    let DiscussResponse::GetCustomAgent { agent: before } = actor.handle_get_custom_agent(&id).await.expect("get")
+    else {
+        panic!("expected agent detail");
+    };
+    assert!(before.body.contains("Original body"));
+    let result = actor
+        .complete_custom_import(
+            CustomInstallationKind::Agent,
+            id.clone(),
+            url,
+            Err(DiscussError::Validation {
+                message: "fetch failed".to_owned(),
+            }),
+        )
+        .await;
+    assert!(matches!(result, Err(DiscussError::Validation { .. })));
+    let DiscussResponse::GetCustomAgent { agent: after } = actor
+        .handle_get_custom_agent(&id)
+        .await
+        .expect("get cached")
+    else {
+        panic!("expected agent detail");
+    };
+    assert_eq!(after.body, before.body);
+    assert_eq!(after.metadata.version, before.metadata.version);
+    assert_eq!(after.metadata.last_pull_ok, Some(false));
 }
 
 #[tokio::test]
@@ -3896,6 +4438,7 @@ async fn set_config_option_fails_closed_when_capability_unset() {
     actor.worker_registry.insert(
         discuss_session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx,
@@ -3955,6 +4498,7 @@ async fn set_config_option_allowed_once_capability_raised() {
     actor.worker_registry.insert(
         discuss_session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx,
@@ -4080,6 +4624,7 @@ async fn assistant_turn_persists_at_stop_boundary_and_loads_after_reseed() {
     rebooted_actor.worker_registry.insert(
         discuss_session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "agent-a".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx: reseeded_worker_tx,
@@ -4757,6 +5302,7 @@ async fn list_sessions_does_not_materialize_unknown_provider_sessions() {
     actor.worker_registry.insert(
         discuss_session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "agent-a".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx,
@@ -4896,6 +5442,8 @@ async fn list_sessions_returns_local_persisted_rows() {
 fn dedupe_session_list_collapses_identity_and_acp_session_id() {
     let sessions = vec![
         DiscussSessionInfo {
+            launch_limitations: Vec::new(),
+            active_turn: false,
             is_task_session: false,
             team_leader_id: None,
             discuss_session_id: DiscussSessionId::from_str("00000000-0000-0000-0000-000000000001").expect("uuid"),
@@ -4911,6 +5459,8 @@ fn dedupe_session_list_collapses_identity_and_acp_session_id() {
             last_interaction_at: Some(10),
         },
         DiscussSessionInfo {
+            launch_limitations: Vec::new(),
+            active_turn: false,
             is_task_session: false,
             team_leader_id: None,
             discuss_session_id: DiscussSessionId::from_str("00000000-0000-0000-0000-000000000001").expect("uuid"),
@@ -4926,6 +5476,8 @@ fn dedupe_session_list_collapses_identity_and_acp_session_id() {
             last_interaction_at: Some(9),
         },
         DiscussSessionInfo {
+            launch_limitations: Vec::new(),
+            active_turn: false,
             is_task_session: false,
             team_leader_id: None,
             discuss_session_id: DiscussSessionId::from_str("00000000-0000-0000-0000-000000000002").expect("uuid"),
@@ -4941,6 +5493,8 @@ fn dedupe_session_list_collapses_identity_and_acp_session_id() {
             last_interaction_at: Some(8),
         },
         DiscussSessionInfo {
+            launch_limitations: Vec::new(),
+            active_turn: false,
             is_task_session: false,
             team_leader_id: None,
             discuss_session_id: DiscussSessionId::from_str("00000000-0000-0000-0000-000000000003").expect("uuid"),
@@ -5000,6 +5554,53 @@ async fn session_name_agent_name_uniqueness_is_enforced() {
         second.is_err(),
         "primary key on discuss_session_id must reject duplicates"
     );
+}
+
+#[tokio::test]
+async fn remove_session_cascades_identity_binding() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let session_id = DiscussSessionId::new();
+    let issuer: aves::auth::MachineIssuerId = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        .parse()
+        .expect("issuer");
+    let payload = URL_SAFE_NO_PAD.encode(json!({ "iss": issuer.to_string() }).to_string());
+    let token = Jwt::from_opaque(format!("header.{payload}.signature"));
+    let subject = "test-subject";
+    persist_session_anchor_inner(
+        &actor.persistence,
+        &session_id.to_string(),
+        SessionAnchorMetadata::default(),
+    )
+    .await
+    .expect("anchor");
+    super::super::identity::persist_binding(
+        &actor.persistence,
+        super::super::identity::Binding {
+            token: &token,
+            subject,
+            session_id,
+            provider: Some("provider"),
+            agent: Some("agent"),
+            node_id: None,
+        },
+    )
+    .await
+    .expect("binding");
+    assert!(
+        super::super::identity::resolve(&actor.persistence, issuer.clone(), subject.to_owned())
+            .await
+            .is_ok()
+    );
+    actor
+        .handle_remove_session(session_id)
+        .await
+        .expect("remove session");
+    assert!(matches!(
+        super::super::identity::resolve(&actor.persistence, issuer, subject.to_owned()).await,
+        Err(DiscussError::SessionIdentityUnknown)
+    ));
 }
 
 /// `discuss.removeSession` deletes the parent row and cascades child turns,
@@ -5073,6 +5674,7 @@ async fn remove_session_deletes_parent_cascades_turns_and_cleans_worker() {
     actor.worker_registry.insert(
         discuss_session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "agent-a".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx,
@@ -5140,6 +5742,7 @@ async fn remove_session_is_idempotent_for_missing_row() {
     actor.worker_registry.insert(
         discuss_session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx,
@@ -5222,6 +5825,7 @@ async fn desktop_attach_reuses_ready_warmed_worker() {
     actor.worker_registry.insert(
         discuss_session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx,
@@ -5274,6 +5878,7 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
     actor.worker_registry.insert(
         discuss_session_id,
         WorkerEntry {
+            active_turn: false,
             agent_name: "agent".to_string(),
             worker_jti: Some(uuid::Uuid::nil()),
             command_tx,
@@ -5774,12 +6379,14 @@ fn discuss_team_responses_serde_roundtrip() {
                 member_overrides: Some(std::collections::BTreeMap::new()),
                 theme_color: Some(AgentThemeColor::Warning),
                 definition_available: true,
+                definition_kind: TeamDefinitionKind::Builtin,
                 members: Some(vec![TeamCatalogMember {
                     agent_id: "chief-of-staff".to_string(),
                     name: "Chief of Staff".to_string(),
                     job_title: "Operations lead".to_string(),
                 }]),
                 skill_names: Some(Vec::new()),
+                skill_ids: Some(Vec::new()),
             }],
         },
         DiscussResponse::InstallTeam { warnings: Vec::new() },
@@ -5975,12 +6582,14 @@ fn team_catalog_entry_serde_roundtrip() {
         )])),
         theme_color: Some(AgentThemeColor::Warning),
         definition_available: true,
+        definition_kind: TeamDefinitionKind::Builtin,
         members: Some(vec![TeamCatalogMember {
             agent_id: "chief-of-staff".to_string(),
             name: "Chief of Staff".to_string(),
             job_title: "Operations lead".to_string(),
         }]),
         skill_names: Some(vec!["planning".to_string()]),
+        skill_ids: Some(vec!["planning".to_string()]),
     };
 
     let json = serde_json::to_value(&entry).expect("serialize catalog entry");
@@ -6007,8 +6616,10 @@ fn absent_team_definition_omits_optional_metadata() {
         member_overrides: Some(BTreeMap::new()),
         theme_color: None,
         definition_available: false,
+        definition_kind: TeamDefinitionKind::Unavailable,
         members: None,
         skill_names: None,
+        skill_ids: None,
     };
 
     let json = serde_json::to_value(&entry).expect("serialize absent-definition entry");
@@ -6209,6 +6820,8 @@ fn discuss_session_id_string_roundtrip() {
 fn session_dto_keeps_discuss_identity_typed_at_the_domain_boundary() {
     let id = DiscussSessionId::new();
     let dto = DiscussSessionInfo {
+        launch_limitations: Vec::new(),
+        active_turn: false,
         is_task_session: false,
         team_leader_id: Some("sector-analyst".to_string()),
         discuss_session_id: id,

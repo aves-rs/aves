@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 const REGISTRY_URL: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
-const SNAPSHOT: &str = include_str!("registry-snapshot.json");
+const SNAPSHOT: &str = include_str!("../../content/registry-snapshot.json");
 const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 
 /// How the provider catalog was obtained.

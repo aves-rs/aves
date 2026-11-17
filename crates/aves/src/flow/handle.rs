@@ -7,16 +7,13 @@ use crate::machine::MachinePeerServices;
 use crate::utils::buffers::DEFAULT_BUFFER_SIZE;
 
 use super::actor::{Actor, ActorDependencies, run_actor};
-use super::database::FlowStore;
-use super::default_workspace::DefaultWorkspace;
 use super::domain::{
     FlowControlServiceImpl, FlowDomain, FlowGeneratedHandler, FlowKernelServices, FlowTriggerSourceServiceImpl,
 };
-use super::hook::FlowAppWorkspaceHook;
+use super::hook::FlowWorkspaceHookBoot;
 use super::messages::{FlowBroadcast, FlowRequest, FlowRequestPayload};
-use super::mobility::RuntimeFlowMobilityService;
+use super::mobility::{FlowMobilityService, RuntimeFlowMobilityService};
 use super::registration::FlowNodeRegistry;
-use super::snapshot::ExecutionSnapshotStore;
 use super::triggers::TriggerRegistry;
 use super::types::{FlowBootOptions, FlowError, WorkspaceError};
 
@@ -28,7 +25,7 @@ pub(super) async fn new<Root>(
     trigger_registry: TriggerRegistry,
     bus_context: BusRpcContext,
     pairing_owner: PairingOwner,
-    machine: &MachinePeerServices,
+    machine: Option<&MachinePeerServices>,
 ) -> FlowGeneratedHandler<Root, FlowBroadcast>
 where
     Root: Clone + Send + 'static,
@@ -58,30 +55,22 @@ where
     }
     let node_registry = Arc::new(registry);
 
-    // TODO: remove the below switch when we move the default hook implementation out
-    // of this crate and into sluice application; see comment in domain.rs for reasoning
-    let application_workspace = options.app_workspace_hook.is_some();
-    let workspace_hook: Arc<dyn FlowAppWorkspaceHook> = match options.app_workspace_hook {
-        Some(workspace) => workspace,
-        None => Arc::new(
-            DefaultWorkspace::new(
-                options.data_root,
-                machine,
-                node_registry.clone(),
-                services.workspace_source_service,
-                FlowStore::new(options.database.clone()),
-                ExecutionSnapshotStore::new(options.database.clone()),
-            )
-            .await
-            .expect("Flow default workspace must initialize"),
-        ),
-    };
+    let workspace_hook = (options.workspace_hook)(FlowWorkspaceHookBoot {
+        data_root: options.data_root.clone(),
+        database: options.database.clone(),
+        node_registry: node_registry.clone(),
+        workspace_source_service: services.workspace_source_service,
+        context: bus_context.clone(),
+    })
+    .await;
 
-    let mobility_service = Arc::new(RuntimeFlowMobilityService {
-        connectivity: machine.connectivity.clone(),
-        peer_service: services.sync_services.clone(),
-        auth_service: services.auth_service.clone(),
-        pairing_owner,
+    let mobility_service: Option<Arc<dyn FlowMobilityService>> = machine.map(|machine| {
+        Arc::new(RuntimeFlowMobilityService {
+            connectivity: machine.connectivity.clone(),
+            peer_service: services.sync_services.clone(),
+            auth_service: services.auth_service.clone(),
+            pairing_owner,
+        }) as Arc<dyn FlowMobilityService>
     });
 
     let actor = Actor::new(
@@ -92,7 +81,6 @@ where
             auth_service: services.auth_service,
             mcp_bus_service: Some(services.mcp_bus_service),
             bus_context,
-            // TODO: simplify the below when we don't have the default workspace setup
             database_path,
             database: options.database,
             node_registry,
@@ -100,7 +88,6 @@ where
             mobility_service,
             retention_completed_runs: options.retention_completed_runs,
             workspace_hook,
-            application_workspace,
         },
     )
     .await

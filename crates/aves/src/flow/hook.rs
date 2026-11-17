@@ -1,21 +1,60 @@
 use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use specta::Type;
+use turso::Database;
 
 use crate::auth::MachineIssuerId;
+use crate::bus::BusRpcContext;
+use crate::runtime::ServiceReader;
 
 use super::ast::{ContentAddressedPath, ContentAddressedRoot, ContentHash};
 use super::messages::LifecycleCorrelation;
 use super::mobility::FlowMobilitySnapshot;
+use super::registration::FlowNodeRegistry;
 use super::snapshot::NodeExecutionSnapshot;
 use super::types::{
     FlowDefinition, FlowError, FlowExecutionId, FlowExecutionStatus, FlowId, FlowInvocationKind, FlowWorkspaceMapping,
-    ScriptSourceLocation, WorkspaceError,
+    FlowWorkspaceSourceService, ScriptSourceLocation, WorkspaceError,
 };
 
+/// Dependencies available when constructing an application's workspace hook.
+#[derive(Clone)]
+pub struct FlowWorkspaceHookBoot {
+    /// Root directory for Flow data.
+    pub data_root: PathBuf,
+    /// Flow's open database.
+    pub database: Database,
+    /// Registry assembled from the installed node owners.
+    pub node_registry: Arc<FlowNodeRegistry>,
+    /// Late-bound provider of workspace source mappings.
+    pub workspace_source_service: ServiceReader<dyn FlowWorkspaceSourceService>,
+    /// Bus context for initializing the application workspace.
+    pub context: BusRpcContext,
+}
+
+impl Debug for FlowWorkspaceHookBoot {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FlowWorkspaceHookBoot")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Future that constructs the application workspace hook.
+pub type FlowWorkspaceHookFuture = Pin<Box<dyn Future<Output = Arc<dyn FlowAppWorkspaceHook>> + Send>>;
+
+/// Capture-capable application factory called after Flow assembles its node registry.
+pub type FlowWorkspaceHookFactory = Arc<dyn Fn(FlowWorkspaceHookBoot) -> FlowWorkspaceHookFuture + Send + Sync>;
+
 /// Complete application-facing context for one Flow execution hook step.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, Type, JsonSchema)]
 pub struct FlowAppHookContext {
     pub execution_id: FlowExecutionId,
     pub flow_id: FlowId,
@@ -25,7 +64,7 @@ pub struct FlowAppHookContext {
 }
 
 /// Inputs for preparing a newly started execution workspace.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, Type, JsonSchema)]
 pub struct FlowAppTakeoffContext {
     pub execution: FlowAppHookContext,
     pub definition: FlowDefinition,
@@ -63,7 +102,7 @@ pub struct FlowAppCheckpointCommittedContext {
 }
 
 /// Context delivered when an execution reaches a terminal outcome.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, Type, JsonSchema)]
 pub struct FlowAppLandingContext {
     pub execution: FlowAppHookContext,
     pub status: FlowExecutionStatus,
@@ -73,7 +112,7 @@ pub struct FlowAppLandingContext {
 }
 
 /// Workspace selected by an application for a newly started execution.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, Type, JsonSchema)]
 pub struct FlowAppTakeoffResult {
     /// Directory used as the execution root by Flow nodes.
     pub execution_root: PathBuf,

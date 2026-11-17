@@ -78,7 +78,7 @@ impl DecidePlugin for Mock {
 }
 
 fn lookup(name: &str) -> Result<&'static dyn DecidePlugin, DecideError> {
-    if name == "mock" {
+    if name == "jev" || name == "mock" {
         Ok(&MOCK)
     } else {
         Err(DecideError::UnknownProvider { provider: name.into() })
@@ -144,7 +144,7 @@ fn ask(
     endpoint: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> DecideRequestPayload {
-    let provider = "mock".into();
+    let provider = "jev".into();
     let model = model.into();
     let state = DecideContent::Text("state".into());
     let endpoint = endpoint.map(str::to_owned);
@@ -180,35 +180,29 @@ fn ask(
 }
 
 fn config(model: &str, variant: Variant) -> DecideNodeConfig {
-    let provider = "mock".into();
+    let credential_id = SpectaUuid(Uuid::nil());
     let model = model.into();
     let state = DecideContent::Text("state".into());
     match variant {
         Variant::Bool => DecideNodeConfig::Bool(BoolNodeConfig {
-            provider,
             model,
             state,
             question: bool_question(),
-            credential_id: None,
-            endpoint: None,
+            credential_id,
             timeout_secs: 0,
         }),
         Variant::Choice => DecideNodeConfig::Choice(ChoiceNodeConfig {
-            provider,
             model,
             state,
             question: choice_question(),
-            credential_id: None,
-            endpoint: None,
+            credential_id,
             timeout_secs: 0,
         }),
         Variant::Score => DecideNodeConfig::Score(ScoreNodeConfig {
-            provider,
             model,
             state,
             question: score_question(),
-            credential_id: None,
-            endpoint: None,
+            credential_id,
             timeout_secs: 0,
         }),
     }
@@ -225,12 +219,24 @@ fn correlation(variant: Variant) -> LifecycleCorrelation {
 }
 fn credential(endpoint: &str, key: &str) -> DecideCredential {
     DecideCredential {
-        api_key: Zeroizing::new(key.into()),
+        provider: "jev".into(),
+        api_key: Some(Zeroizing::new(key.into())),
         endpoint: Url::parse(endpoint).unwrap(),
     }
 }
 fn actor() -> mpsc::Sender<DecideRequest> {
     let (tx, rx) = mpsc::channel(128);
+    let (reply_to, _reply) = oneshot::channel();
+    assert!(
+        tx.try_send(DecideRequest {
+            payload: DecideRequestPayload::SupplyCredential {
+                credential_id: SpectaUuid(Uuid::nil()),
+                credential: credential("https://example.test/", "key"),
+            },
+            reply_to,
+        })
+        .is_ok()
+    );
     let (reply_to, _reply) = oneshot::channel();
     assert!(
         tx.try_send(DecideRequest {
@@ -421,21 +427,48 @@ async fn credentials_endpoint_binding_and_keyless_overrides() {
     let tx = actor();
     let (model, state) = script(vec![]);
     let id = SpectaUuid(Uuid::new_v4());
-    for cred in [
-        credential("https://example.test", "  "),
-        credential("http://example.test", "key"),
+    assert!(matches!(
+        send(
+            &tx,
+            DecideRequestPayload::SupplyCredential {
+                credential_id: id,
+                credential: super::super::types::empty_decide_credential(),
+            }
+        )
+        .await,
+        Err(DecideError::UnknownProvider { .. })
+    ));
+    assert!(matches!(
+        send(
+            &tx,
+            DecideRequestPayload::SupplyCredential {
+                credential_id: id,
+                credential: DecideCredential::new("ollama", None, "http://localhost").unwrap(),
+            }
+        )
+        .await,
+        Ok(DecideResponse::Success)
+    ));
+    send(&tx, DecideRequestPayload::RemoveCredential { credential_id: id })
+        .await
+        .unwrap();
+    for (cred, missing_key) in [
+        (credential("https://example.test", "  "), true),
+        (credential("http://example.test", "key"), false),
     ] {
-        assert!(matches!(
-            send(
-                &tx,
-                DecideRequestPayload::SupplyCredential {
-                    credential_id: id,
-                    credential: cred
-                }
-            )
-            .await,
-            Err(DecideError::Validation { .. })
-        ));
+        let result = send(
+            &tx,
+            DecideRequestPayload::SupplyCredential {
+                credential_id: id,
+                credential: cred,
+            },
+        )
+        .await;
+        if missing_key {
+            assert!(matches!(result, Err(DecideError::AuthenticationRequired)));
+        } else {
+            assert!(matches!(result, Err(DecideError::Validation { .. })));
+        }
     }
     assert!(matches!(
         send(&tx, ask(&model, Variant::Bool, Some(id), None, None)).await,
@@ -512,6 +545,29 @@ async fn credentials_endpoint_binding_and_keyless_overrides() {
 }
 
 #[tokio::test]
+async fn credentialed_asks_reject_a_different_provider_before_inference() {
+    let tx = actor();
+    let (model, state) = script(vec![]);
+    let id = SpectaUuid(Uuid::nil());
+    for variant in [Variant::Bool, Variant::Choice, Variant::Score] {
+        let mut request = ask(&model, variant, Some(id), None, None);
+        match &mut request {
+            DecideRequestPayload::AskBool { provider, .. }
+            | DecideRequestPayload::AskChoice { provider, .. }
+            | DecideRequestPayload::AskScore { provider, .. } => *provider = "mock".into(),
+            _ => unreachable!(),
+        }
+        let error = send(&tx, request).await.unwrap_err();
+        assert_eq!(error.rpc_code(), "provider_credential_mismatch");
+        assert!(
+            matches!(error, DecideError::ProviderCredentialMismatch { credential_id, provider }
+            if credential_id == id && provider == "mock")
+        );
+    }
+    assert!(state.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn node_start_uses_same_credential_endpoint_policy() {
     let tx = actor();
     let (model, state) = script(vec![Step::Wait]);
@@ -532,14 +588,13 @@ async fn node_start_uses_same_credential_endpoint_policy() {
         DecideNodeConfig::Bool(node) => node,
         _ => unreachable!(),
     };
-    node.credential_id = Some(id);
-    node.endpoint = Some("https://other.test/".into());
+    node.credential_id = SpectaUuid(Uuid::new_v4());
     assert!(matches!(
         start(&tx, &corr, DecideNodeConfig::Bool(node.clone())).await,
-        Err(DecideError::EndpointUnauthorized)
+        Err(DecideError::CredentialUnavailable { .. })
     ));
     assert!(state.seen.lock().unwrap().is_empty());
-    node.endpoint = Some("HTTPS://EXAMPLE.TEST:443".into());
+    node.credential_id = id;
     assert!(
         start(&tx, &corr, DecideNodeConfig::Bool(node))
             .await
@@ -695,6 +750,17 @@ async fn starts_stopped_and_stop_cancels_nodes() {
         send(&tx, DecideRequestPayload::StartServer).await,
         Ok(DecideResponse::Success)
     ));
+    assert!(
+        send(
+            &tx,
+            DecideRequestPayload::SupplyCredential {
+                credential_id: SpectaUuid(Uuid::nil()),
+                credential: credential("https://example.test/", "key"),
+            }
+        )
+        .await
+        .is_ok()
+    );
     assert!(matches!(
         start(&tx, &corr, config(&model, Variant::Bool)).await,
         Ok(DecideResponse::NodeStarted { .. })

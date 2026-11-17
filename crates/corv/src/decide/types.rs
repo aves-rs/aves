@@ -18,6 +18,8 @@ use specta::Type;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use super::plugins::{DecideAuth, decide_providers};
+
 /// Structured or textual content supplied with a decision.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Type, JsonSchema)]
 #[serde(untagged)]
@@ -34,6 +36,12 @@ pub enum DecideError {
     UnknownProvider { provider: String },
     #[error("Credential unavailable")]
     CredentialUnavailable { credential_id: SpectaUuid },
+    /// The requested provider does not own the supplied credential.
+    #[error("Provider does not match credential")]
+    ProviderCredentialMismatch {
+        credential_id: SpectaUuid,
+        provider: String,
+    },
     #[error("Authentication required")]
     AuthenticationRequired,
     #[error("The supplied endpoint does not match the credential's authorized binding")]
@@ -88,6 +96,7 @@ impl DecideError {
         match self {
             Self::UnknownProvider { .. } => "unknown_provider",
             Self::CredentialUnavailable { .. } => "credential_unavailable",
+            Self::ProviderCredentialMismatch { .. } => "provider_credential_mismatch",
             Self::AuthenticationRequired => "authentication_required",
             Self::EndpointUnauthorized => "endpoint_unauthorized",
             Self::InvalidQuestion { .. } => "invalid_question",
@@ -317,8 +326,33 @@ pub struct DecideOutcome {
 /// Secret and its application-authorized endpoint binding; never serialized.
 #[derive(Clone)]
 pub struct DecideCredential {
-    pub api_key: Zeroizing<String>,
+    pub provider: String,
+    pub api_key: Option<Zeroizing<String>>,
     pub endpoint: Url,
+}
+
+impl DecideCredential {
+    /// Validate provider authentication and bind the credential to its endpoint.
+    pub fn new(provider_id: &str, api_key: Option<Zeroizing<String>>, endpoint: &str) -> Result<Self, DecideError> {
+        let provider = decide_providers()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| DecideError::UnknownProvider {
+                provider: provider_id.to_owned(),
+            })?;
+        let api_key = api_key.filter(|key| !key.trim().is_empty());
+        if provider.credential == DecideAuth::Required && api_key.is_none() {
+            return Err(DecideError::AuthenticationRequired);
+        }
+        let endpoint = validate_keyless_endpoint(endpoint)?;
+        if api_key.is_some() {
+            validate_credentialed_endpoint(&endpoint)?;
+        }
+        Ok(Self {
+            provider: provider_id.to_owned(),
+            api_key,
+            endpoint,
+        })
+    }
 }
 
 impl Debug for DecideCredential {
@@ -330,7 +364,8 @@ impl Debug for DecideCredential {
 /// Serde default for a skipped privileged field; supply validation prevents custody of this empty key.
 pub fn empty_decide_credential() -> DecideCredential {
     DecideCredential {
-        api_key: Zeroizing::new(String::new()),
+        provider: String::new(),
+        api_key: None,
         endpoint: Url::parse("http://127.0.0.1/").expect("static loopback URL is valid"),
     }
 }
@@ -389,12 +424,8 @@ pub fn canonical_endpoint(url: &Url) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct BoolNodeConfig {
-    pub(super) provider: String,
     pub(super) model: String,
-    #[serde(default)]
-    pub(super) credential_id: Option<SpectaUuid>,
-    #[serde(default)]
-    pub(super) endpoint: Option<String>,
+    pub(super) credential_id: SpectaUuid,
     #[serde(default)]
     pub(super) timeout_secs: u64,
     pub(super) state: DecideContent,
@@ -405,12 +436,8 @@ pub(super) struct BoolNodeConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ChoiceNodeConfig {
-    pub(super) provider: String,
     pub(super) model: String,
-    #[serde(default)]
-    pub(super) credential_id: Option<SpectaUuid>,
-    #[serde(default)]
-    pub(super) endpoint: Option<String>,
+    pub(super) credential_id: SpectaUuid,
     #[serde(default)]
     pub(super) timeout_secs: u64,
     pub(super) state: DecideContent,
@@ -421,12 +448,8 @@ pub(super) struct ChoiceNodeConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ScoreNodeConfig {
-    pub(super) provider: String,
     pub(super) model: String,
-    #[serde(default)]
-    pub(super) credential_id: Option<SpectaUuid>,
-    #[serde(default)]
-    pub(super) endpoint: Option<String>,
+    pub(super) credential_id: SpectaUuid,
     #[serde(default)]
     pub(super) timeout_secs: u64,
     pub(super) state: DecideContent,
@@ -500,5 +523,27 @@ mod tests {
             format!("{:?}", empty_decide_credential()),
             "DecideCredential(<redacted>)"
         );
+    }
+
+    #[test]
+    fn credential_constructor_enforces_provider_and_key_admission() {
+        assert!(matches!(
+            DecideCredential::new("unknown", None, "http://localhost"),
+            Err(DecideError::UnknownProvider { .. })
+        ));
+        for key in [None, Some(Zeroizing::new("  ".into()))] {
+            assert!(matches!(
+                DecideCredential::new("jev", key, "https://example.com"),
+                Err(DecideError::AuthenticationRequired)
+            ));
+        }
+        let keyless = DecideCredential::new("ollama", Some(Zeroizing::new("  ".into())), "http://localhost").unwrap();
+        assert!(keyless.api_key.is_none());
+        assert!(DecideCredential::new("ollama", Some(Zeroizing::new("key".into())), "http://localhost").is_err());
+        assert!(DecideCredential::new("ollama", Some(Zeroizing::new("key".into())), "https://example.com").is_ok());
+        assert!(matches!(
+            DecideCredential::new("", None, "http://127.0.0.1"),
+            Err(DecideError::UnknownProvider { .. })
+        ));
     }
 }

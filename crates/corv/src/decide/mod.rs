@@ -12,6 +12,7 @@ pub use messages::{
     ScoreOutput, SuccessOutput, SupplyCredentialInput, decide_operation_descriptors_with_root_error, dispatch_ask_bool,
     dispatch_ask_choice, dispatch_ask_score, rpc_router,
 };
+pub use plugins::{DecideAuth, DecideProviderDescriptor, decide_providers};
 pub use types::{
     BoolAnswer, BoolQuestion, ChoiceAnswer, ChoiceQuestion, DecideContent, DecideCredential, DecideError, ScoreAnswer,
     ScoreQuestion,

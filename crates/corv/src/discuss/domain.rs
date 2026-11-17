@@ -1,3 +1,6 @@
+// The aves::domain! expansion builds a few sudo services and as such gets overloaded.
+#![allow(clippy::too_many_arguments)]
+
 use aves::auth::AuthSudoService;
 use aves::bus::{BusRpcContext, BusSudoService, EventBus};
 use aves::config::{ConfigRegistrationSudoService, RegisterSectionInput, SectionRegistration};
@@ -11,16 +14,22 @@ use aves::utils::errors::SharedInfraError;
 use super::boot::{DiscussBootOptions, DiscussSettings};
 use super::handle::new as construct_discuss_domain;
 use super::messages::{
-    AgentNodeStartedOutput, AgentNodeTickedOutput, AnswerElicitationInput, AnswerPermissionInput,
-    CancelAgentExecutionInput, CancelElicitationInput, CancelSessionInput, CancelTurnInput, DiscussBroadcast,
-    DiscussPrivilegedAnswerElicitation, DiscussPrivilegedAnswerPermission, DiscussPrivilegedCancelAgentExecution,
-    DiscussPrivilegedCancelElicitation, DiscussPrivilegedCancelSession, DiscussPrivilegedCancelTurn,
-    DiscussPrivilegedDisposeInspector, DiscussPrivilegedInstallProviderConfig, DiscussPrivilegedRemoveProviderConfig,
-    DiscussPrivilegedReserveInspector, DiscussPrivilegedSendUserTurn, DiscussPrivilegedStartAgent,
-    DiscussPrivilegedStartInspector, DiscussPrivilegedTickAgent, DiscussRequest, DiscussRequestPayload,
-    DiscussResponse, DiscussSudoServicePrivilegeMapping, DisposeInspectorInput, InstallProviderConfigInput,
-    RemoveProviderConfigInput, ReserveInspectorInput, ReserveInspectorOutput, SendUserTurnInput, StartAgentInput,
-    StartInspectorInput, SuccessOutput, TickAgentInput,
+    AgentNodeStartedOutput, AgentNodeTickedOutput, AnswerElicitationInput, AnswerPermissionInput, AssignMcpInput,
+    CancelAgentExecutionInput, CancelElicitationInput, CancelSessionInput, CancelTurnInput, CreateCustomMcpInput,
+    DeleteCustomMcpInput, DiscussBroadcast, DiscussPrivilegedAnswerElicitation, DiscussPrivilegedAnswerPermission,
+    DiscussPrivilegedAssignMcp, DiscussPrivilegedCancelAgentExecution, DiscussPrivilegedCancelElicitation,
+    DiscussPrivilegedCancelSession, DiscussPrivilegedCancelTurn, DiscussPrivilegedCreateCustomMcp,
+    DiscussPrivilegedDeleteCustomMcp, DiscussPrivilegedDisposeInspector, DiscussPrivilegedImportCustomAgentFromUrl,
+    DiscussPrivilegedImportCustomSkillFromUrl, DiscussPrivilegedInstallProviderConfig,
+    DiscussPrivilegedRemoveProviderConfig, DiscussPrivilegedReserveInspector, DiscussPrivilegedResolveSessionIdentity,
+    DiscussPrivilegedSendUserTurn, DiscussPrivilegedSetProviderManagedConfig, DiscussPrivilegedStartAgent,
+    DiscussPrivilegedStartInspector, DiscussPrivilegedTickAgent, DiscussPrivilegedUnassignMcp,
+    DiscussPrivilegedUpdateCustomMcp, DiscussRequest, DiscussRequestPayload, DiscussResponse,
+    DiscussSudoServicePrivilegeMapping, DisposeInspectorInput, GetCustomAgentOutput, GetCustomSkillOutput,
+    ImportCustomAgentFromUrlInput, ImportCustomSkillFromUrlInput, InstallProviderConfigInput,
+    RemoveProviderConfigInput, ReserveInspectorInput, ReserveInspectorOutput, ResolveSessionIdentityInput,
+    SendUserTurnInput, SessionIdentityResolvedOutput, SetProviderManagedConfigInput, StartAgentInput,
+    StartInspectorInput, SuccessOutput, TickAgentInput, UnassignMcpInput, UpdateCustomMcpInput,
 };
 use super::types::{DiscussError, WorkspaceCopySourcePort};
 
@@ -34,6 +43,7 @@ pub(super) struct DiscussKernelServices {
     pub(super) bus_service: ServiceReader<dyn BusSudoService>,
     pub(super) auth_service: ServiceReader<dyn AuthSudoService>,
     pub(super) streaming_service: ServicePublisher<dyn DiscussStreamingService>,
+    pub(super) identity_service: ServicePublisher<dyn DiscussIdentityService>,
     pub(super) provider_config_service: ServicePublisher<dyn DiscussProviderConfigSudoService>,
     pub(super) workspace_copy_source_port: ServicePublisher<WorkspaceCopySourcePort>,
     pub(super) agent_node_lifecycle_service: ServicePublisher<dyn DiscussAgentNodeLifecycleService>,
@@ -51,6 +61,13 @@ aves::domain! {
     target = "discuss";
 
     pub service DiscussStreamingService {
+        ImportCustomAgentFromUrl => GetCustomAgent,
+        ImportCustomSkillFromUrl => GetCustomSkill,
+        CreateCustomMcp => Success,
+        UpdateCustomMcp => Success,
+        DeleteCustomMcp => Success,
+        AssignMcp => Success,
+        UnassignMcp => Success,
         SendUserTurn => Success,
         AnswerPermission => Success,
         AnswerElicitation => Success,
@@ -62,9 +79,14 @@ aves::domain! {
         DisposeInspector => Success,
     }
 
+    pub service DiscussIdentityService {
+        ResolveSessionIdentity => SessionIdentityResolved,
+    }
+
     pub service DiscussProviderConfigSudoService {
         InstallProviderConfig => Success,
         RemoveProviderConfig => Success,
+        SetProviderManagedConfig => Success,
     }
 
     pub service DiscussAgentNodeLifecycleService {
@@ -74,6 +96,9 @@ aves::domain! {
     }
 
     outbound DiscussResponse => DiscussBroadcast {
+        DiscussResponse::SessionActivity { discuss_session_id, active } => DiscussBroadcast::SessionActivity {
+            discuss_session_id, active,
+        },
         DiscussResponse::NewSession { session_id } => DiscussBroadcast::SessionReady {
             discuss_session_id: session_id,
         },
@@ -156,6 +181,7 @@ where
                 bus_service: facade.reader(),
                 auth_service: facade.reader(),
                 streaming_service: facade.publisher(),
+                identity_service: facade.publisher(),
                 provider_config_service: facade.publisher(),
                 workspace_copy_source_port: facade.publisher(),
                 agent_node_lifecycle_service: facade.publisher(),

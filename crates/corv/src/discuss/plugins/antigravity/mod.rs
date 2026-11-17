@@ -4,13 +4,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use agent_client_protocol::v1::schema::McpServer;
 use serde::Serialize;
 
-use super::super::library::{AgentDefinition, AgentId, AssetLibrary, SkillDefinition, SkillId, TeamDefinition};
-use super::super::types::DiscussError;
+use super::super::library::{
+    AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
+    TeamDefinition,
+};
+use super::super::types::{DiscussError, SessionCliLogin, SessionLaunchConfig};
+use super::files::{RenderedFile, write_rendered_files};
 use super::{
-    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PrimaryAgentSelection, render_skill_file, resolve_agent,
-    resolve_skill,
+    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, ManagedConfig, PrimaryAgentSelection, render_skill_file,
+    resolve_agent, resolve_skill,
 };
 
 pub(super) const ANTIGRAVITY_PLUGIN_NAME: &str = "antigravity-acp";
@@ -35,12 +40,49 @@ struct AgentFrontmatter<'a> {
     settings: BTreeMap<String, String>,
 }
 
-struct RenderedFile {
-    path: PathBuf,
-    contents: String,
-}
-
 impl DiscussAgentPlugin for AntigravityPlugin {
+    fn configured_launch_server(
+        &self,
+        server: &McpServer,
+        _workspace: &Path,
+        config: &SessionLaunchConfig,
+    ) -> Result<McpServer, DiscussError> {
+        if config
+            .cli_tools
+            .iter()
+            .any(|tool| tool.login == SessionCliLogin::Required)
+        {
+            return Err(DiscussError::SessionCliLoginUnsupported);
+        }
+        if !config.cli_tools.is_empty() {
+            return Err(DiscussError::SessionCliToolUnsupported);
+        }
+        let mut server = server.clone();
+        if config
+            .mcp_servers
+            .iter()
+            .any(|mcp| matches!(mcp, McpServer::Http(_)))
+        {
+            let McpServer::Stdio(server) = &mut server else {
+                return Err(DiscussError::Validation {
+                    message: "Antigravity HTTP MCP requires a stdio provider".to_owned(),
+                });
+            };
+            if !server.args.iter().any(|arg| arg == "--process-per-session") {
+                server.args.push("--process-per-session".to_owned());
+            }
+        }
+        Ok(server)
+    }
+
+    fn managed_config(&self) -> Option<ManagedConfig> {
+        Some(ManagedConfig::WorkspaceFile {
+            plugin: ANTIGRAVITY_PLUGIN_NAME,
+            path: ".agents/mcp_config.json",
+            default: || Ok(r#"{"mcpServers":{}}"#.to_owned()),
+            validate: validate_managed_config,
+        })
+    }
     /// Each session needs its own process because `--agent` is chosen per launch.
     fn connection_strategy(&self) -> ConnectionStrategy {
         ConnectionStrategy::Isolated
@@ -57,48 +99,29 @@ impl DiscussAgentPlugin for AntigravityPlugin {
     }
 
     /// `agy acp` advertises no ACP system prompt; it selects the main agent with `--agent <name>`.
-    fn primary_agent_selection(&self, agent: &AgentDefinition) -> PrimaryAgentSelection {
+    fn primary_agent_selection(&self, agent: &AgentSelectionView<'_>) -> PrimaryAgentSelection {
         PrimaryAgentSelection::LaunchArguments(vec![AGENT_FLAG.to_string(), agent.id.to_string()])
     }
 
-    fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
+    fn render_agent(
+        &self,
+        library: AssetLibrary,
+        agent_id: &AgentId,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<Vec<RenderedFile>, DiscussError> {
         let agent = resolve_agent(library, agent_id)?;
-        let file = render_agent(agent, None)?;
-        write_file(root, &file.path, &file.contents)
+        Ok(vec![render_agent(
+            &AgentSelectionView::from_builtin(agent),
+            member_settings,
+        )?])
+    }
+
+    fn workspace_label(&self) -> &'static str {
+        ANTIGRAVITY_PLUGIN_NAME
     }
 
     fn destroy_agent(&self, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
         remove_file(root, &agent_path(agent_id))
-    }
-
-    fn install_team_with_member_overrides(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        team: &TeamDefinition,
-        member_settings: &BTreeMap<AgentId, ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        self.install_team_member(library, root, &team.leader, member_settings.get(&team.leader))?;
-        for follower in &team.followers {
-            self.install_team_member(library, root, follower, member_settings.get(follower))?;
-        }
-        for skill_id in &team.skills {
-            let skill = resolve_skill(library, skill_id)?;
-            self.install_skill(root, skill)?;
-        }
-        Ok(())
-    }
-
-    fn install_team_member(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        agent_id: &AgentId,
-        member_settings: Option<&ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        let agent = resolve_agent(library, agent_id)?;
-        let file = render_agent(agent, member_settings)?;
-        write_file(root, &file.path, &file.contents)
     }
 
     fn destroy_team(
@@ -126,13 +149,64 @@ impl DiscussAgentPlugin for AntigravityPlugin {
         Ok(())
     }
 
-    fn install_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
+    fn install_custom_agent(
+        &self,
+        root: &Path,
+        agent: &CustomAgentDefinition,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<(), DiscussError> {
+        let file = render_agent(&AgentSelectionView::from_custom(agent), member_settings)?;
+        write_rendered_files(ANTIGRAVITY_PLUGIN_NAME, root, &[file])
+    }
+
+    fn install_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        let mut files = Vec::new();
+        for file in &skill.bundle {
+            let path = Path::new(SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            let body = if file.relative_path == "SKILL.md" {
+                super::markdown_metadata(&file.contents)?.2
+            } else {
+                &file.contents
+            };
+            let contents = super::render_skill_contents(
+                ANTIGRAVITY_PLUGIN_NAME,
+                &path,
+                &skill.id,
+                &skill.description,
+                &file.relative_path,
+                body,
+            )?;
+            files.push(RenderedFile {
+                relative_path: path,
+                contents,
+            });
+        }
+        write_rendered_files(ANTIGRAVITY_PLUGIN_NAME, root, &files)
+    }
+
+    fn destroy_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        for file in &skill.bundle {
+            let path = Path::new(SKILLS_DIRECTORY)
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            remove_file(root, &path)?;
+        }
+        Ok(())
+    }
+
+    fn render_skill(&self, skill: &SkillDefinition) -> Result<Vec<RenderedFile>, DiscussError> {
+        let mut files = Vec::new();
         for file in &skill.bundle {
             let relative_path = skill_path(skill, file.relative_path);
             let contents = render_skill_file(ANTIGRAVITY_PLUGIN_NAME, &relative_path, skill, file)?;
-            write_file(root, &relative_path, &contents)?;
+            files.push(RenderedFile {
+                relative_path,
+                contents,
+            });
         }
-        Ok(())
+        Ok(files)
     }
 
     fn destroy_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
@@ -141,6 +215,42 @@ impl DiscussAgentPlugin for AntigravityPlugin {
         }
         Ok(())
     }
+}
+
+fn validate_managed_config(document: &str) -> Result<(), DiscussError> {
+    let value = super::json_object(ANTIGRAVITY_PLUGIN_NAME, document)?;
+    let valid = value
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|servers| {
+            servers.values().all(|server| {
+                let Some(server) = server.as_object() else { return false };
+                let command = server
+                    .get("command")
+                    .is_some_and(serde_json::Value::is_string);
+                let url = server
+                    .get("serverUrl")
+                    .is_some_and(serde_json::Value::is_string);
+                let args = server.get("args").is_none_or(|value| {
+                    value
+                        .as_array()
+                        .is_some_and(|args| args.iter().all(serde_json::Value::is_string))
+                });
+                let env = server.get("env").is_none_or(|value| {
+                    value
+                        .as_object()
+                        .is_some_and(|env| env.values().all(serde_json::Value::is_string))
+                });
+                (command || url) && args && env
+            })
+        });
+    if !valid {
+        return Err(DiscussError::ManagedConfigValidation {
+            plugin: ANTIGRAVITY_PLUGIN_NAME.to_owned(),
+            reason: "expected mcpServers entries with command or serverUrl and valid args/env".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn agent_path(agent_id: &AgentId) -> PathBuf {
@@ -154,10 +264,10 @@ fn skill_path(skill: &SkillDefinition, relative_path: &str) -> PathBuf {
 }
 
 fn render_agent(
-    agent: &AgentDefinition,
+    agent: &AgentSelectionView<'_>,
     member_settings: Option<&ConfigSettings>,
 ) -> Result<RenderedFile, DiscussError> {
-    let path = agent_path(&agent.id);
+    let path = agent_path(agent.id);
     let yaml = yaml_serde::to_string(&AgentFrontmatter {
         name: agent.id.as_ref(),
         description: agent.description,
@@ -170,17 +280,9 @@ fn render_agent(
         message: source.to_string(),
     })?;
     Ok(RenderedFile {
-        path,
+        relative_path: path,
         contents: format!("---\n{yaml}---\n\n{}", agent.body),
     })
-}
-
-fn write_file(root: &Path, relative_path: &Path, contents: &str) -> Result<(), DiscussError> {
-    let path = root.join(relative_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| capture_write_error(&path, error))?;
-    }
-    fs::write(&path, contents).map_err(|error| capture_write_error(&path, error))
 }
 
 fn remove_file(root: &Path, relative_path: &Path) -> Result<(), DiscussError> {
@@ -203,8 +305,117 @@ fn capture_write_error(path: &Path, error: std::io::Error) -> DiscussError {
 #[cfg(test)]
 mod tests {
     use super::super::super::test_library;
+    use super::super::super::types::{RuleSet, SessionCliTool};
     use super::*;
+    use agent_client_protocol::v1::schema::{McpServerHttp, McpServerStdio};
     use tempfile::tempdir;
+
+    #[test]
+    fn http_mcp_requires_per_session_process() {
+        let provider = McpServer::Stdio(McpServerStdio::new("provider", "agy"));
+        let mut config = SessionLaunchConfig::default();
+        config
+            .mcp_servers
+            .push(McpServer::Stdio(McpServerStdio::new("local", "server")));
+        assert_eq!(
+            PLUGIN
+                .configured_launch_server(&provider, Path::new("."), &config)
+                .unwrap(),
+            provider
+        );
+        config
+            .mcp_servers
+            .push(McpServer::Http(McpServerHttp::new("remote", "https://example.test")));
+        let McpServer::Stdio(launch) = PLUGIN
+            .configured_launch_server(&provider, Path::new("."), &config)
+            .unwrap()
+        else {
+            panic!("expected stdio")
+        };
+        assert_eq!(
+            launch
+                .args
+                .iter()
+                .filter(|arg| *arg == "--process-per-session")
+                .count(),
+            1
+        );
+        let repeated = PLUGIN
+            .configured_launch_server(&McpServer::Stdio(launch), Path::new("."), &config)
+            .unwrap();
+        let McpServer::Stdio(repeated) = repeated else {
+            panic!("expected stdio")
+        };
+        assert_eq!(
+            repeated
+                .args
+                .iter()
+                .filter(|arg| *arg == "--process-per-session")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rules_and_plugin_references_pass_through_without_mcp() {
+        let provider = McpServer::Stdio(McpServerStdio::new("provider", "agy"));
+        let config = SessionLaunchConfig {
+            rule_sources: vec![RuleSet::default()],
+            plugin_references: vec!["plugin".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            PLUGIN
+                .configured_launch_server(&provider, Path::new("."), &config)
+                .unwrap(),
+            provider
+        );
+    }
+
+    #[test]
+    fn cli_tools_return_typed_errors() {
+        let provider = McpServer::Stdio(McpServerStdio::new("provider", "agy"));
+        let mut config = SessionLaunchConfig {
+            cli_tools: vec![SessionCliTool {
+                command: "tool".into(),
+                login: SessionCliLogin::None,
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            PLUGIN.configured_launch_server(&provider, Path::new("."), &config),
+            Err(DiscussError::SessionCliToolUnsupported)
+        ));
+        config.cli_tools[0].login = SessionCliLogin::Required;
+        assert!(matches!(
+            PLUGIN.configured_launch_server(&provider, Path::new("."), &config),
+            Err(DiscussError::SessionCliLoginUnsupported)
+        ));
+    }
+
+    #[test]
+    fn renders_portable_agent_and_skill_layout() {
+        let library = test_library::library();
+        let agent = library.agents_for().next().expect("agent");
+        let files = PLUGIN
+            .render_agent(library, &agent.id, None)
+            .expect("agent rendering");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, agent_path(&agent.id));
+        assert!(files[0].contents.starts_with("---\n"));
+        assert!(files[0].contents.ends_with(agent.body));
+        let skill = library.skills_for().next().expect("skill");
+        let files = PLUGIN.render_skill(skill).expect("skill rendering");
+        assert_eq!(files.len(), skill.bundle.len());
+        for (rendered, source) in files.iter().zip(&skill.bundle) {
+            assert_eq!(rendered.relative_path, skill_path(skill, source.relative_path));
+            assert_eq!(
+                rendered.contents,
+                render_skill_file(ANTIGRAVITY_PLUGIN_NAME, &rendered.relative_path, skill, source).unwrap()
+            );
+        }
+        assert_eq!(PLUGIN.workspace_label(), "antigravity-acp");
+    }
 
     #[test]
     fn install_is_idempotent_and_destroy_is_absent_noop() {
@@ -219,7 +430,7 @@ mod tests {
         fs::write(&peer_path, "peer agent").expect("peer file");
 
         PLUGIN
-            .install_agent(library, directory.path(), &agent.id)
+            .install_team_member(library, directory.path(), &agent.id, None)
             .expect("install succeeds");
         let first = fs::read_to_string(&target_path).expect("agent file exists");
         assert!(first.starts_with("---\n"));
@@ -229,7 +440,7 @@ mod tests {
 
         fs::write(&target_path, "stale target").expect("stale target");
         PLUGIN
-            .install_agent(library, directory.path(), &agent.id)
+            .install_team_member(library, directory.path(), &agent.id, None)
             .expect("repeat install succeeds");
         assert_eq!(fs::read_to_string(&target_path).expect("agent file exists"), first);
 
@@ -271,7 +482,7 @@ mod tests {
     fn primary_agent_is_selected_with_the_agent_launch_flag() {
         let agent = test_library::library().agents_for().next().expect("agent");
         assert_eq!(
-            PLUGIN.primary_agent_selection(agent),
+            PLUGIN.primary_agent_selection(&AgentSelectionView::from_builtin(agent)),
             PrimaryAgentSelection::LaunchArguments(vec!["--agent".to_string(), agent.id.to_string()])
         );
     }

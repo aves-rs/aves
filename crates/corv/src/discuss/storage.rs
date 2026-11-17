@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
+use agent_client_protocol::v1::schema::McpServer;
 use turso::{Connection, Database};
 
 use aves::utils::database::{DatabaseError, connect_database};
 
 use super::types::{
-    ConfigSettings, DiscussConfigOption, DiscussError, DiscussSessionId, DiscussSubagentRecord,
-    DiscussSubagentSurfaceState, SessionLaunchConfig,
+    ConfigSettings, DiscussCompletionKind, DiscussConfigOption, DiscussError, DiscussHarnessCostKind,
+    DiscussModelUsageEntry, DiscussSessionId, DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTurnRecord,
+    DiscussUsageEvidenceSource, LaunchLimitation, SessionLaunchConfig,
 };
+
+pub(super) const INSERT_IDENTITY_BINDING_SQL: &str = include_str!("queries/insert_identity_binding.sql");
+pub(super) const READ_IDENTITY_BINDING_SQL: &str = include_str!("queries/read_identity_binding.sql");
 
 pub const DISCUSS_SESSIONS_UPSERT_SQL: &str = include_str!("queries/discuss_sessions_upsert.sql");
 pub const DISCUSS_SESSIONS_UPDATE_SQL: &str = include_str!("queries/discuss_sessions_update.sql");
@@ -18,6 +23,7 @@ pub const DISCUSS_SESSIONS_LOAD_SQL: &str = include_str!("queries/discuss_sessio
 const DISCUSS_SESSIONS_SETUP_KIND_SQL: &str = include_str!("queries/discuss_sessions_setup_kind.sql");
 const DISCUSS_SESSIONS_LAUNCH_CONTEXT_SQL: &str = include_str!("queries/discuss_sessions_launch_context.sql");
 const DISCUSS_SESSIONS_LAUNCH_CONFIG_SQL: &str = include_str!("queries/discuss_sessions_launch_config.sql");
+const DISCUSS_SESSIONS_LAUNCH_LIMITATIONS_SQL: &str = include_str!("queries/update_session_launch_limitations.sql");
 pub const DISCUSS_SESSIONS_DELETE_SQL: &str = include_str!("queries/session_delete.sql");
 pub const DISCUSS_SESSIONS_RENAME_SQL: &str = include_str!("queries/discuss_sessions_rename.sql");
 pub const DISCUSS_CHAT_TURNS_INSERT_SQL: &str = include_str!("queries/discuss_chat_turns_insert.sql");
@@ -35,6 +41,207 @@ pub const DISCUSS_TEAM_INSTALLATION_UPSERT_SQL: &str = include_str!("queries/dis
 pub const DISCUSS_SUBAGENTS_UPSERT_SQL: &str = include_str!("queries/discuss_subagents_upsert.sql");
 pub const DISCUSS_SUBAGENTS_PRUNE_DONE_SQL: &str = include_str!("queries/discuss_subagents_prune_done.sql");
 pub const DISCUSS_SUBAGENTS_LOAD_SQL: &str = include_str!("queries/discuss_subagents_load.sql");
+const USAGE_TURNS_INSERT_SQL: &str = include_str!("queries/discuss_usage_turns_insert.sql");
+const USAGE_MODEL_ENTRIES_INSERT_SQL: &str = include_str!("queries/discuss_usage_model_entries_insert.sql");
+const USAGE_MODEL_ENTRIES_UPSERT_SQL: &str = include_str!("queries/discuss_usage_model_entries_upsert.sql");
+const USAGE_TURNS_UPDATE_SQL: &str = include_str!("queries/discuss_usage_turns_update.sql");
+const USAGE_RANGE_SELECT_SQL: &str = include_str!("queries/discuss_usage_range_select.sql");
+const USAGE_MODEL_ENTRIES_RANGE_SELECT_SQL: &str = include_str!("queries/discuss_usage_model_entries_range_select.sql");
+const USAGE_NEXT_ORDINAL_SQL: &str = include_str!("queries/discuss_usage_next_ordinal.sql");
+const ALLOWANCE_INSERT_SQL: &str = include_str!("queries/discuss_allowance_insert.sql");
+const ALLOWANCE_RANGE_SELECT_SQL: &str = include_str!("queries/discuss_allowance_range_select.sql");
+const MODELS_CATALOG_LOAD_SQL: &str = include_str!("queries/discuss_models_catalog_load.sql");
+const MODELS_CATALOG_REPLACE_SQL: &str = include_str!("queries/discuss_models_catalog_replace.sql");
+const LEDGER_PRUNE_MODEL_ENTRIES_SQL: &str = include_str!("queries/discuss_ledger_prune_model_entries.sql");
+const LEDGER_PRUNE_TURNS_SQL: &str = include_str!("queries/discuss_ledger_prune_turns.sql");
+const LEDGER_PRUNE_ALLOWANCE_SQL: &str = include_str!("queries/discuss_ledger_prune_allowance.sql");
+const CUSTOM_AGENTS_UPSERT_SQL: &str = include_str!("queries/discuss_custom_agents_upsert.sql");
+const CUSTOM_AGENTS_LOAD_SQL: &str = include_str!("queries/discuss_custom_agents_load.sql");
+const CUSTOM_AGENTS_LIST_SQL: &str = include_str!("queries/discuss_custom_agents_list.sql");
+const CUSTOM_AGENTS_DELETE_SQL: &str = include_str!("queries/discuss_custom_agents_delete.sql");
+const CUSTOM_AGENTS_PULL_FAILED_SQL: &str = include_str!("queries/discuss_custom_agents_pull_failed.sql");
+const CUSTOM_SKILLS_UPSERT_SQL: &str = include_str!("queries/discuss_custom_skills_upsert.sql");
+const CUSTOM_SKILLS_LOAD_SQL: &str = include_str!("queries/discuss_custom_skills_load.sql");
+const CUSTOM_SKILLS_LIST_SQL: &str = include_str!("queries/discuss_custom_skills_list.sql");
+const CUSTOM_SKILLS_DELETE_SQL: &str = include_str!("queries/discuss_custom_skills_delete.sql");
+const CUSTOM_SKILLS_PULL_FAILED_SQL: &str = include_str!("queries/discuss_custom_skills_pull_failed.sql");
+const CUSTOM_AGENT_INSTALLATIONS_UPSERT_SQL: &str =
+    include_str!("queries/discuss_custom_agent_installations_upsert.sql");
+const CUSTOM_AGENT_INSTALLATIONS_LOAD_SQL: &str = include_str!("queries/discuss_custom_agent_installations_load.sql");
+const CUSTOM_AGENT_INSTALLATIONS_LIST_SQL: &str = include_str!("queries/discuss_custom_agent_installations_list.sql");
+const CUSTOM_AGENT_INSTALLATIONS_DELETE_SQL: &str =
+    include_str!("queries/discuss_custom_agent_installations_delete.sql");
+const CUSTOM_SKILL_INSTALLATIONS_UPSERT_SQL: &str =
+    include_str!("queries/discuss_custom_skill_installations_upsert.sql");
+const CUSTOM_SKILL_INSTALLATIONS_LOAD_SQL: &str = include_str!("queries/discuss_custom_skill_installations_load.sql");
+const CUSTOM_SKILL_INSTALLATIONS_LIST_SQL: &str = include_str!("queries/discuss_custom_skill_installations_list.sql");
+const CUSTOM_SKILL_INSTALLATIONS_DELETE_SQL: &str =
+    include_str!("queries/discuss_custom_skill_installations_delete.sql");
+const CUSTOM_TEAMS_UPSERT_SQL: &str = include_str!("queries/discuss_custom_teams_upsert.sql");
+const CUSTOM_TEAMS_LOAD_SQL: &str = include_str!("queries/discuss_custom_teams_load.sql");
+const CUSTOM_TEAMS_LIST_SQL: &str = include_str!("queries/discuss_custom_teams_list.sql");
+const CUSTOM_TEAMS_DELETE_SQL: &str = include_str!("queries/discuss_custom_teams_delete.sql");
+const ASSET_INSTRUCTIONS_UPSERT_SQL: &str = include_str!("queries/discuss_asset_instructions_upsert.sql");
+const ASSET_INSTRUCTIONS_LOAD_SQL: &str = include_str!("queries/discuss_asset_instructions_load.sql");
+const CUSTOM_MCP_UPSERT_SQL: &str = include_str!("queries/discuss_custom_mcp_upsert.sql");
+const CUSTOM_MCP_LOAD_SQL: &str = include_str!("queries/discuss_custom_mcp_load.sql");
+const CUSTOM_MCP_LIST_SQL: &str = include_str!("queries/discuss_custom_mcp_list.sql");
+const CUSTOM_MCP_DELETE_SQL: &str = include_str!("queries/discuss_custom_mcp_delete.sql");
+const MCP_ASSIGNMENT_INSERT_SQL: &str = include_str!("queries/discuss_mcp_assignment_insert.sql");
+const MCP_ASSIGNMENT_DELETE_SQL: &str = include_str!("queries/discuss_mcp_assignment_delete.sql");
+const MCP_ASSIGNMENT_LIST_BY_SCOPE_SQL: &str = include_str!("queries/discuss_mcp_assignment_list_by_scope.sql");
+const MCP_ASSIGNMENT_DELETE_BY_SCOPE_SQL: &str = include_str!("queries/discuss_mcp_assignment_delete_by_scope.sql");
+const MCP_ASSIGNMENT_DELETE_BY_NAME_SQL: &str = include_str!("queries/discuss_mcp_assignment_delete_by_name.sql");
+
+/// Stored descriptor; it may contain sensitive environment variables or headers.
+pub(super) struct CustomMcpRow {
+    pub(super) name: String,
+    pub(super) descriptor: McpServer,
+    pub(super) updated_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum McpAssignmentScope {
+    Provider,
+    Team,
+    Session,
+}
+
+impl McpAssignmentScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Team => "team",
+            Self::Session => "session",
+        }
+    }
+}
+
+fn custom_mcp_error() -> DiscussError {
+    DiscussError::Persistence {
+        code: "db_query".to_owned(),
+        message: "custom MCP storage operation failed".to_owned(),
+    }
+}
+
+fn decode_custom_mcp(row: &turso::Row) -> Result<CustomMcpRow, DiscussError> {
+    let descriptor_json: String = row.get(1).map_err(|_| custom_mcp_error())?;
+    Ok(CustomMcpRow {
+        name: row.get(0).map_err(|_| custom_mcp_error())?,
+        descriptor: serde_json::from_str(&descriptor_json).map_err(|_| custom_mcp_error())?,
+        updated_at_ms: row.get(2).map_err(|_| custom_mcp_error())?,
+    })
+}
+
+pub(super) async fn upsert_custom_mcp(
+    conn: &Connection,
+    name: &str,
+    descriptor: &McpServer,
+    updated_at_ms: i64,
+) -> Result<(), DiscussError> {
+    let descriptor_json = serde_json::to_string(descriptor).map_err(|_| custom_mcp_error())?;
+    conn.execute(CUSTOM_MCP_UPSERT_SQL, (name.to_owned(), descriptor_json, updated_at_ms))
+        .await
+        .map_err(|_| custom_mcp_error())?;
+    Ok(())
+}
+
+pub(super) async fn load_custom_mcp(conn: &Connection, name: &str) -> Result<Option<CustomMcpRow>, DiscussError> {
+    let mut rows = conn
+        .query(CUSTOM_MCP_LOAD_SQL, (name.to_owned(),))
+        .await
+        .map_err(|_| custom_mcp_error())?;
+    rows.next()
+        .await
+        .map_err(|_| custom_mcp_error())?
+        .as_ref()
+        .map(decode_custom_mcp)
+        .transpose()
+}
+
+pub(super) async fn list_custom_mcps(conn: &Connection) -> Result<Vec<CustomMcpRow>, DiscussError> {
+    let mut rows = conn
+        .query(CUSTOM_MCP_LIST_SQL, ())
+        .await
+        .map_err(|_| custom_mcp_error())?;
+    let mut servers = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|_| custom_mcp_error())? {
+        servers.push(decode_custom_mcp(&row)?);
+    }
+    Ok(servers)
+}
+
+pub(super) async fn delete_custom_mcp(conn: &Connection, name: &str) -> Result<(), DiscussError> {
+    conn.execute(CUSTOM_MCP_DELETE_SQL, (name.to_owned(),))
+        .await
+        .map_err(|_| custom_mcp_error())?;
+    Ok(())
+}
+
+pub(super) async fn insert_mcp_assignment(
+    conn: &Connection,
+    scope: McpAssignmentScope,
+    scope_id: &str,
+    name: &str,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        MCP_ASSIGNMENT_INSERT_SQL,
+        (scope.as_str().to_owned(), scope_id.to_owned(), name.to_owned()),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn delete_mcp_assignment(
+    conn: &Connection,
+    scope: McpAssignmentScope,
+    scope_id: &str,
+    name: &str,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        MCP_ASSIGNMENT_DELETE_SQL,
+        (scope.as_str().to_owned(), scope_id.to_owned(), name.to_owned()),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn list_mcp_assignments_by_scope(
+    conn: &Connection,
+    scope: McpAssignmentScope,
+    scope_id: &str,
+) -> Result<Vec<String>, DiscussError> {
+    let mut rows = conn
+        .query(
+            MCP_ASSIGNMENT_LIST_BY_SCOPE_SQL,
+            (scope.as_str().to_owned(), scope_id.to_owned()),
+        )
+        .await?;
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await? {
+        names.push(row_get(&row, 0, "mcp_name")?);
+    }
+    Ok(names)
+}
+
+pub(super) async fn delete_mcp_assignments_by_scope(
+    conn: &Connection,
+    scope: McpAssignmentScope,
+    scope_id: &str,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        MCP_ASSIGNMENT_DELETE_BY_SCOPE_SQL,
+        (scope.as_str().to_owned(), scope_id.to_owned()),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn delete_mcp_assignments_by_name(conn: &Connection, name: &str) -> Result<(), DiscussError> {
+    conn.execute(MCP_ASSIGNMENT_DELETE_BY_NAME_SQL, (name.to_owned(),))
+        .await?;
+    Ok(())
+}
 
 /// Row projection for `discuss_sessions` chat anchor rows.
 ///
@@ -42,6 +249,7 @@ pub const DISCUSS_SUBAGENTS_LOAD_SQL: &str = include_str!("queries/discuss_subag
 /// can restore cached state in one round-trip. `discuss_session_id` is the
 /// canonical identity; `session_name` and `agent_name` are metadata only.
 pub struct DiscussSessionRow {
+    pub(super) launch_limitations: Vec<LaunchLimitation>,
     pub(super) is_task_session: bool,
     pub(super) session_cwd_json: Option<String>,
     pub(super) session_mcp_enabled: Option<i64>,
@@ -343,6 +551,25 @@ pub(super) async fn update_session_setup_kind(
         (session_id.to_string(), setup_kind.map(str::to_string)),
     )
     .await?;
+    Ok(())
+}
+
+/// Replace all launch limitations on an existing anchor.
+pub(super) async fn update_session_launch_limitations(
+    conn: &Connection,
+    session_id: &str,
+    limitations: &[LaunchLimitation],
+) -> Result<(), DiscussError> {
+    let json = serde_json::to_string(limitations)?;
+    let updated = conn
+        .execute(DISCUSS_SESSIONS_LAUNCH_LIMITATIONS_SQL, (session_id.to_string(), json))
+        .await?;
+    if updated == 0 {
+        return Err(DiscussError::Persistence {
+            code: "db_query".to_string(),
+            message: "session anchor missing while persisting launch limitations".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -659,9 +886,23 @@ pub async fn load_discuss_chat_turns_window(
 /// `DISCUSS_SESSIONS_LOAD_SQL`:
 /// `discuss_session_id, agent_name, session_name, display_title, acp_session_id,
 /// last_user_prompt, latest_todo_snapshot_json, latest_config_options_json, config_settings_json,
-/// available_commands_json, first_prompt_at, last_interaction_at`.
+/// available_commands_json, first_prompt_at, last_interaction_at, team_leader_id,
+/// is_task_session, session_cwd_json, session_mcp_enabled, session_launch_config_json,
+/// session_setup_kind, launch_limitations_json`.
 fn decode_discuss_session_row(row: &turso::Row) -> Result<DiscussSessionRow, DiscussError> {
+    let limitations_json = row_get_optional_string(row, 18, "discuss_sessions.launch_limitations_json")?;
+    let launch_limitations = limitations_json
+        .as_deref()
+        .map(|json| {
+            serde_json::from_str(json).map_err(|error| DiscussError::Persistence {
+                code: "db_query".to_string(),
+                message: format!("failed to decode discuss_sessions.launch_limitations_json: {error}"),
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(DiscussSessionRow {
+        launch_limitations,
         is_task_session: row_get::<i64>(row, 13, "discuss_sessions.is_task_session")? != 0,
         session_cwd_json: row_get(row, 14, "discuss_sessions.session_cwd_json")?,
         session_mcp_enabled: row_get(row, 15, "discuss_sessions.session_mcp_enabled")?,
@@ -727,4 +968,737 @@ pub(super) fn provider_updated_at_ms(updated_at: Option<&str>) -> i64 {
         .and_then(|iso| chrono::DateTime::parse_from_rfc3339(iso).ok())
         .map(|timestamp| timestamp.timestamp_millis())
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+}
+
+/// One sampled allowance observation.
+#[derive(Clone, Debug)]
+pub(super) struct DiscussAllowanceObservation {
+    pub provider: String,
+    pub account_key: Option<String>,
+    pub fetched_at_ms: Option<i64>,
+    pub observed_at_ms: i64,
+    pub stale_since_ms: Option<i64>,
+    pub error_class: Option<String>,
+    pub entry_json: String,
+    pub created_at_ms: i64,
+}
+
+/// Persisted model catalog and HTTP cache metadata.
+#[derive(Clone, Debug)]
+pub(super) struct DiscussModelsCatalog {
+    pub body: String,
+    pub metadata_json: String,
+    pub fetched_at_ms: i64,
+}
+
+fn ledger_count(value: Option<u64>, field: &'static str) -> Option<i64> {
+    value.and_then(|value| match i64::try_from(value) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::warn!(
+                field,
+                "Discuss accounting count exceeds SQLite integer range; storing NULL"
+            );
+            None
+        }
+    })
+}
+
+fn decode_ledger_count(row: &turso::Row, index: usize, label: &str) -> Result<Option<u64>, DiscussError> {
+    row_get::<Option<i64>>(row, index, label)?
+        .map(|value| u64::try_from(value).map_err(|_| DiscussError::UsageValueOutOfRange))
+        .transpose()
+}
+
+fn completion_value(value: DiscussCompletionKind) -> &'static str {
+    match value {
+        DiscussCompletionKind::Completed => "completed",
+        DiscussCompletionKind::Cancelled => "cancelled",
+        DiscussCompletionKind::Failed => "failed",
+    }
+}
+
+fn cost_kind_value(value: DiscussHarnessCostKind) -> &'static str {
+    match value {
+        DiscussHarnessCostKind::PerTurn => "per_turn",
+        DiscussHarnessCostKind::SessionCumulative => "session_cumulative",
+    }
+}
+
+fn evidence_value(value: DiscussUsageEvidenceSource) -> &'static str {
+    match value {
+        DiscussUsageEvidenceSource::Response => "prompt_response",
+        DiscussUsageEvidenceSource::ResponseMeta => "prompt_response_meta",
+        DiscussUsageEvidenceSource::Complete => "prompt_complete",
+    }
+}
+
+async fn write_usage_turn(conn: &Connection, sql: &str, turn: &DiscussTurnRecord) -> Result<u64, DiscussError> {
+    Ok(conn
+        .execute(
+            sql,
+            turso::params![
+                turn.discuss_session_id.clone(),
+                turn.turn_ordinal,
+                turn.provider_name.clone(),
+                turn.model_id.clone(),
+                turn.turn_started_at_ms,
+                turn.turn_completed_at_ms,
+                turn.end_to_end_ms,
+                completion_value(turn.completion_kind),
+                turn.stop_reason.clone(),
+                ledger_count(turn.context_used_tokens, "context_used_tokens"),
+                ledger_count(turn.context_window_tokens, "context_window_tokens"),
+                turn.harness_cost_amount.clone(),
+                turn.harness_cost_currency.clone(),
+                turn.harness_cost_kind.map(cost_kind_value),
+                i64::from(turn.usage_is_incomplete),
+                i64::from(turn.cost_is_partial),
+                evidence_value(turn.evidence_source),
+                turn.evidence_json.clone(),
+                turn.created_at_ms,
+            ],
+        )
+        .await?)
+}
+
+async fn write_model_entry(conn: &Connection, sql: &str, entry: &DiscussModelUsageEntry) -> Result<(), DiscussError> {
+    conn.execute(
+        sql,
+        turso::params![
+            entry.discuss_session_id.clone(),
+            entry.turn_ordinal,
+            entry.provider_name.clone(),
+            entry.turn_started_at_ms,
+            entry.model_id.clone(),
+            ledger_count(entry.input_tokens, "input_tokens"),
+            ledger_count(entry.output_tokens, "output_tokens"),
+            ledger_count(entry.thought_tokens, "thought_tokens"),
+            ledger_count(entry.cached_read_tokens, "cached_read_tokens"),
+            ledger_count(entry.cached_write_tokens, "cached_write_tokens"),
+            ledger_count(entry.total_tokens, "total_tokens"),
+            entry.calculated_cost_usd.clone(),
+            entry.incomplete_categories,
+            i64::from(entry.usage_is_incomplete),
+            i64::from(entry.cost_is_partial),
+            entry.pricing_basis.clone(),
+            entry.price_snapshot_json.clone(),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+fn validate_usage_entries(turn: &DiscussTurnRecord, entries: &[DiscussModelUsageEntry]) -> Result<(), DiscussError> {
+    if entries.iter().any(|entry| {
+        entry.discuss_session_id != turn.discuss_session_id
+            || entry.turn_ordinal != turn.turn_ordinal
+            || entry.provider_name != turn.provider_name
+            || entry.turn_started_at_ms != turn.turn_started_at_ms
+    }) {
+        return Err(DiscussError::Validation {
+            message: "accounting model entry does not match its turn".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Insert one terminal turn and its children atomically, ignoring duplicate turns.
+pub(super) async fn insert_usage_turn(
+    conn: &mut Connection,
+    turn: &DiscussTurnRecord,
+    entries: &[DiscussModelUsageEntry],
+) -> Result<(), DiscussError> {
+    validate_usage_entries(turn, entries)?;
+    let transaction = conn.transaction().await?;
+    if write_usage_turn(&transaction, USAGE_TURNS_INSERT_SQL, turn).await? != 0 {
+        for entry in entries {
+            write_model_entry(&transaction, USAGE_MODEL_ENTRIES_INSERT_SQL, entry).await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Update late turn evidence and upsert its model rows atomically.
+pub(super) async fn update_turn_usage(
+    conn: &mut Connection,
+    turn: &DiscussTurnRecord,
+    entries: &[DiscussModelUsageEntry],
+) -> Result<(), DiscussError> {
+    validate_usage_entries(turn, entries)?;
+    let transaction = conn.transaction().await?;
+    if write_usage_turn(&transaction, USAGE_TURNS_UPDATE_SQL, turn).await? != 0 {
+        for entry in entries {
+            write_model_entry(&transaction, USAGE_MODEL_ENTRIES_UPSERT_SQL, entry).await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+fn decode_usage_turn(row: &turso::Row) -> Result<DiscussTurnRecord, DiscussError> {
+    let decode = |index, label| -> Result<DiscussCompletionKind, DiscussError> {
+        row_get::<String>(row, index, label)
+            .and_then(|value| Ok(serde_json::from_value(serde_json::Value::String(value))?))
+    };
+    let kind = row_get::<Option<String>>(row, 13, "harness_cost_kind")?
+        .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+        .transpose()?;
+    Ok(DiscussTurnRecord {
+        discuss_session_id: row_get(row, 0, "discuss_session_id")?,
+        turn_ordinal: row_get(row, 1, "turn_ordinal")?,
+        provider_name: row_get(row, 2, "provider_name")?,
+        model_id: row_get(row, 3, "model_id")?,
+        turn_started_at_ms: row_get(row, 4, "turn_started_at_ms")?,
+        turn_completed_at_ms: row_get(row, 5, "turn_completed_at_ms")?,
+        end_to_end_ms: row_get(row, 6, "end_to_end_ms")?,
+        completion_kind: decode(7, "completion_kind")?,
+        stop_reason: row_get(row, 8, "stop_reason")?,
+        context_used_tokens: decode_ledger_count(row, 9, "context_used_tokens")?,
+        context_window_tokens: decode_ledger_count(row, 10, "context_window_tokens")?,
+        harness_cost_amount: row_get(row, 11, "harness_cost_amount")?,
+        harness_cost_currency: row_get(row, 12, "harness_cost_currency")?,
+        harness_cost_kind: kind,
+        usage_is_incomplete: row_get::<i64>(row, 14, "usage_is_incomplete")? != 0,
+        cost_is_partial: row_get::<i64>(row, 15, "cost_is_partial")? != 0,
+        evidence_source: serde_json::from_value(serde_json::Value::String(row_get(row, 16, "evidence_source")?))?,
+        evidence_json: row_get(row, 17, "evidence_json")?,
+        created_at_ms: row_get(row, 18, "created_at_ms")?,
+    })
+}
+
+fn decode_model_entry(row: &turso::Row) -> Result<DiscussModelUsageEntry, DiscussError> {
+    Ok(DiscussModelUsageEntry {
+        discuss_session_id: row_get(row, 0, "discuss_session_id")?,
+        turn_ordinal: row_get(row, 1, "turn_ordinal")?,
+        provider_name: row_get(row, 2, "provider_name")?,
+        turn_started_at_ms: row_get(row, 3, "turn_started_at_ms")?,
+        model_id: row_get(row, 4, "model_id")?,
+        input_tokens: decode_ledger_count(row, 5, "input_tokens")?,
+        output_tokens: decode_ledger_count(row, 6, "output_tokens")?,
+        thought_tokens: decode_ledger_count(row, 7, "thought_tokens")?,
+        cached_read_tokens: decode_ledger_count(row, 8, "cached_read_tokens")?,
+        cached_write_tokens: decode_ledger_count(row, 9, "cached_write_tokens")?,
+        total_tokens: decode_ledger_count(row, 10, "total_tokens")?,
+        calculated_cost_usd: row_get(row, 11, "calculated_cost_usd")?,
+        incomplete_categories: row_get(row, 12, "incomplete_categories")?,
+        usage_is_incomplete: row_get::<i64>(row, 13, "usage_is_incomplete")? != 0,
+        cost_is_partial: row_get::<i64>(row, 14, "cost_is_partial")? != 0,
+        pricing_basis: row_get(row, 15, "pricing_basis")?,
+        price_snapshot_json: row_get(row, 16, "price_snapshot_json")?,
+    })
+}
+
+/// Load turn and model observations in an inclusive UTC millisecond range.
+pub(super) async fn select_usage_range(
+    conn: &Connection,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<(Vec<DiscussTurnRecord>, Vec<DiscussModelUsageEntry>), DiscussError> {
+    let mut rows = conn.query(USAGE_RANGE_SELECT_SQL, (from_ms, to_ms)).await?;
+    let mut turns = Vec::new();
+    while let Some(row) = rows.next().await? {
+        turns.push(decode_usage_turn(&row)?);
+    }
+    let mut rows = conn
+        .query(USAGE_MODEL_ENTRIES_RANGE_SELECT_SQL, (from_ms, to_ms))
+        .await?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        entries.push(decode_model_entry(&row)?);
+    }
+    Ok((turns, entries))
+}
+
+/// Resolve the next surviving ledger ordinal for a session.
+pub(super) async fn next_usage_ordinal(conn: &Connection, session_id: &str) -> Result<i64, DiscussError> {
+    let mut rows = conn
+        .query(USAGE_NEXT_ORDINAL_SQL, (session_id.to_owned(),))
+        .await?;
+    match rows.next().await? {
+        Some(row) => row_get(&row, 0, "next turn ordinal"),
+        None => Err(DiscussError::Persistence {
+            code: "db_query".to_owned(),
+            message: "ordinal query returned no row".to_owned(),
+        }),
+    }
+}
+
+/// Insert an allowance snapshot without changing session state.
+pub(super) async fn insert_allowance_observation(
+    conn: &Connection,
+    value: &DiscussAllowanceObservation,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        ALLOWANCE_INSERT_SQL,
+        (
+            value.provider.clone(),
+            value.account_key.clone(),
+            value.fetched_at_ms,
+            value.observed_at_ms,
+            value.stale_since_ms,
+            value.error_class.clone(),
+            value.entry_json.clone(),
+            value.created_at_ms,
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Read allowance snapshots in an inclusive UTC millisecond range.
+pub(super) async fn select_allowance_range(
+    conn: &Connection,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<DiscussAllowanceObservation>, DiscussError> {
+    let mut rows = conn
+        .query(ALLOWANCE_RANGE_SELECT_SQL, (from_ms, to_ms))
+        .await?;
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().await? {
+        values.push(DiscussAllowanceObservation {
+            provider: row_get(&row, 0, "provider")?,
+            account_key: row_get(&row, 1, "account_key")?,
+            fetched_at_ms: row_get(&row, 2, "fetched_at_ms")?,
+            observed_at_ms: row_get(&row, 3, "observed_at_ms")?,
+            stale_since_ms: row_get(&row, 4, "stale_since_ms")?,
+            error_class: row_get(&row, 5, "error_class")?,
+            entry_json: row_get(&row, 6, "entry_json")?,
+            created_at_ms: row_get(&row, 7, "created_at_ms")?,
+        });
+    }
+    Ok(values)
+}
+
+/// Load the last successfully persisted models catalog, if any.
+pub(super) async fn load_models_catalog(conn: &Connection) -> Result<Option<DiscussModelsCatalog>, DiscussError> {
+    let mut rows = conn.query(MODELS_CATALOG_LOAD_SQL, ()).await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(DiscussModelsCatalog {
+            body: row_get(&row, 0, "body")?,
+            metadata_json: row_get(&row, 1, "metadata_json")?,
+            fetched_at_ms: row_get(&row, 2, "fetched_at_ms")?,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Replace the persisted singleton models catalog.
+pub(super) async fn replace_models_catalog(
+    conn: &Connection,
+    value: &DiscussModelsCatalog,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        MODELS_CATALOG_REPLACE_SQL,
+        (value.body.clone(), value.metadata_json.clone(), value.fetched_at_ms),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Prune all ledger families at the same cutoff in one transaction.
+pub(super) async fn prune_accounting_ledger(conn: &mut Connection, cutoff_ms: i64) -> Result<(), DiscussError> {
+    let transaction = conn.transaction().await?;
+    transaction
+        .execute(LEDGER_PRUNE_MODEL_ENTRIES_SQL, (cutoff_ms,))
+        .await?;
+    transaction
+        .execute(LEDGER_PRUNE_TURNS_SQL, (cutoff_ms,))
+        .await?;
+    transaction
+        .execute(LEDGER_PRUNE_ALLOWANCE_SQL, (cutoff_ms,))
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Origin of a custom asset's last successful content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CustomSourceKind {
+    LocalMarkdown,
+    UrlMarkdown,
+    GithubFile,
+    GithubDirectory,
+}
+
+impl CustomSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalMarkdown => "local_markdown",
+            Self::UrlMarkdown => "url_markdown",
+            Self::GithubFile => "github_file",
+            Self::GithubDirectory => "github_directory",
+        }
+    }
+    fn parse(value: &str) -> Result<Self, DiscussError> {
+        match value {
+            "local_markdown" => Ok(Self::LocalMarkdown),
+            "url_markdown" => Ok(Self::UrlMarkdown),
+            "github_file" => Ok(Self::GithubFile),
+            "github_directory" => Ok(Self::GithubDirectory),
+            _ => Err(DiscussError::Persistence {
+                code: "db_query".into(),
+                message: format!("invalid custom source kind: {value}"),
+            }),
+        }
+    }
+}
+
+/// Custom asset metadata and source provenance.
+#[derive(Clone, Debug)]
+pub(super) struct CustomAssetRow {
+    pub id: String,
+    pub name: String,
+    pub job_title: Option<String>,
+    pub description: String,
+    pub version: String,
+    pub source_kind: CustomSourceKind,
+    pub source_url: Option<String>,
+    pub last_pull_at_ms: Option<i64>,
+    pub last_pull_ok: Option<bool>,
+    pub pull_error: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+/// Persisted custom team metadata.
+#[derive(Clone, Debug)]
+pub(super) struct CustomTeamRow {
+    pub leader_id: String,
+    pub display_name: Option<String>,
+    pub followers_json: String,
+    pub skills_json: String,
+    pub version: String,
+    pub updated_at_ms: i64,
+}
+
+/// Installed version for one provider and custom asset.
+#[derive(Clone, Debug)]
+pub(super) struct CustomInstallationRow {
+    pub provider_name: String,
+    pub asset_id: String,
+    pub installed_version: String,
+}
+
+/// Instructions associated with a physical workspace path.
+#[derive(Clone, Debug)]
+pub(super) struct AssetInstructionsRow {
+    pub asset_path: String,
+    pub instructions: String,
+    pub updated_at_ms: i64,
+}
+
+/// Persist an agent row after its cache swap succeeds.
+pub(super) async fn upsert_custom_agent(conn: &Connection, row: &CustomAssetRow) -> Result<(), DiscussError> {
+    let title = row
+        .job_title
+        .as_ref()
+        .ok_or_else(|| DiscussError::Validation {
+            message: "agent job title is missing".into(),
+        })?;
+    conn.execute(
+        CUSTOM_AGENTS_UPSERT_SQL,
+        turso::params![
+            row.id.clone(),
+            row.name.clone(),
+            title.clone(),
+            row.description.clone(),
+            row.version.clone(),
+            row.source_kind.as_str(),
+            row.source_url.clone(),
+            row.last_pull_at_ms,
+            row.last_pull_ok.map(i64::from),
+            row.pull_error.clone(),
+            row.updated_at_ms
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Persist a skill row after its cache swap succeeds.
+pub(super) async fn upsert_custom_skill(conn: &Connection, row: &CustomAssetRow) -> Result<(), DiscussError> {
+    conn.execute(
+        CUSTOM_SKILLS_UPSERT_SQL,
+        turso::params![
+            row.id.clone(),
+            row.name.clone(),
+            row.description.clone(),
+            row.version.clone(),
+            row.source_kind.as_str(),
+            row.source_url.clone(),
+            row.last_pull_at_ms,
+            row.last_pull_ok.map(i64::from),
+            row.pull_error.clone(),
+            row.updated_at_ms
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+fn decode_custom_asset(row: &turso::Row, agent: bool) -> Result<CustomAssetRow, DiscussError> {
+    let offset = usize::from(agent);
+    let kind: String = row_get(row, 4 + offset, "source_kind")?;
+    let pull_ok: Option<i64> = row_get(row, 7 + offset, "last_pull_ok")?;
+    Ok(CustomAssetRow {
+        id: row_get(row, 0, "id")?,
+        name: row_get(row, 1, "name")?,
+        job_title: if agent {
+            Some(row_get(row, 2, "job_title")?)
+        } else {
+            None
+        },
+        description: row_get(row, 2 + offset, "description")?,
+        version: row_get(row, 3 + offset, "version")?,
+        source_kind: CustomSourceKind::parse(&kind)?,
+        source_url: row_get(row, 5 + offset, "source_url")?,
+        last_pull_at_ms: row_get(row, 6 + offset, "last_pull_at_ms")?,
+        last_pull_ok: pull_ok.map(|v| v != 0),
+        pull_error: row_get(row, 8 + offset, "pull_error")?,
+        updated_at_ms: row_get(row, 9 + offset, "updated_at_ms")?,
+    })
+}
+
+async fn load_custom_asset(
+    conn: &Connection,
+    sql: &str,
+    id: &str,
+    agent: bool,
+) -> Result<Option<CustomAssetRow>, DiscussError> {
+    let mut rows = conn.query(sql, (id.to_owned(),)).await?;
+    rows.next()
+        .await?
+        .map(|row| decode_custom_asset(&row, agent))
+        .transpose()
+}
+
+async fn list_custom_assets(conn: &Connection, sql: &str, agent: bool) -> Result<Vec<CustomAssetRow>, DiscussError> {
+    let mut rows = conn.query(sql, ()).await?;
+    let mut assets = Vec::new();
+    while let Some(row) = rows.next().await? {
+        assets.push(decode_custom_asset(&row, agent)?);
+    }
+    Ok(assets)
+}
+
+/// List cached agent metadata and provenance in identity order.
+pub(super) async fn list_custom_agents(conn: &Connection) -> Result<Vec<CustomAssetRow>, DiscussError> {
+    list_custom_assets(conn, CUSTOM_AGENTS_LIST_SQL, true).await
+}
+
+/// List cached skill metadata and provenance in identity order.
+pub(super) async fn list_custom_skills(conn: &Connection) -> Result<Vec<CustomAssetRow>, DiscussError> {
+    list_custom_assets(conn, CUSTOM_SKILLS_LIST_SQL, false).await
+}
+
+/// Load one agent's metadata.
+pub(super) async fn load_custom_agent(conn: &Connection, id: &str) -> Result<Option<CustomAssetRow>, DiscussError> {
+    load_custom_asset(conn, CUSTOM_AGENTS_LOAD_SQL, id, true).await
+}
+/// Load one skill's metadata.
+pub(super) async fn load_custom_skill(conn: &Connection, id: &str) -> Result<Option<CustomAssetRow>, DiscussError> {
+    load_custom_asset(conn, CUSTOM_SKILLS_LOAD_SQL, id, false).await
+}
+/// Delete one agent's metadata.
+pub(super) async fn delete_custom_agent(conn: &Connection, id: &str) -> Result<(), DiscussError> {
+    conn.execute(CUSTOM_AGENTS_DELETE_SQL, (id.to_owned(),))
+        .await?;
+    Ok(())
+}
+/// Delete one skill's metadata.
+pub(super) async fn delete_custom_skill(conn: &Connection, id: &str) -> Result<(), DiscussError> {
+    conn.execute(CUSTOM_SKILLS_DELETE_SQL, (id.to_owned(),))
+        .await?;
+    Ok(())
+}
+/// Record a failed agent pull without changing last successful pull time.
+pub(super) async fn fail_custom_agent_pull(
+    conn: &Connection,
+    id: &str,
+    error: &str,
+    now: i64,
+) -> Result<(), DiscussError> {
+    conn.execute(CUSTOM_AGENTS_PULL_FAILED_SQL, (id.to_owned(), error.to_owned(), now))
+        .await?;
+    Ok(())
+}
+/// Record a failed skill pull without changing last successful pull time.
+pub(super) async fn fail_custom_skill_pull(
+    conn: &Connection,
+    id: &str,
+    error: &str,
+    now: i64,
+) -> Result<(), DiscussError> {
+    conn.execute(CUSTOM_SKILLS_PULL_FAILED_SQL, (id.to_owned(), error.to_owned(), now))
+        .await?;
+    Ok(())
+}
+
+/// Persist custom team metadata.
+pub(super) async fn upsert_custom_team(conn: &Connection, row: &CustomTeamRow) -> Result<(), DiscussError> {
+    conn.execute(
+        CUSTOM_TEAMS_UPSERT_SQL,
+        (
+            row.leader_id.clone(),
+            row.display_name.clone(),
+            row.followers_json.clone(),
+            row.skills_json.clone(),
+            row.version.clone(),
+            row.updated_at_ms,
+        ),
+    )
+    .await?;
+    Ok(())
+}
+/// Load custom team metadata.
+pub(super) async fn load_custom_team(conn: &Connection, id: &str) -> Result<Option<CustomTeamRow>, DiscussError> {
+    let mut rows = conn.query(CUSTOM_TEAMS_LOAD_SQL, (id.to_owned(),)).await?;
+    let Some(row) = rows.next().await? else { return Ok(None) };
+    Ok(Some(decode_custom_team(&row)?))
+}
+
+/// List custom teams in leader identity order.
+pub(super) async fn list_custom_teams(conn: &Connection) -> Result<Vec<CustomTeamRow>, DiscussError> {
+    let mut rows = conn.query(CUSTOM_TEAMS_LIST_SQL, ()).await?;
+    let mut teams = Vec::new();
+    while let Some(row) = rows.next().await? {
+        teams.push(decode_custom_team(&row)?);
+    }
+    Ok(teams)
+}
+
+fn decode_custom_team(row: &turso::Row) -> Result<CustomTeamRow, DiscussError> {
+    Ok(CustomTeamRow {
+        leader_id: row_get(row, 0, "leader_id")?,
+        display_name: row_get(row, 1, "display_name")?,
+        followers_json: row_get(row, 2, "followers_json")?,
+        skills_json: row_get(row, 3, "skills_json")?,
+        version: row_get(row, 4, "version")?,
+        updated_at_ms: row_get(row, 5, "updated_at_ms")?,
+    })
+}
+/// Delete custom team metadata.
+pub(super) async fn delete_custom_team(conn: &Connection, id: &str) -> Result<(), DiscussError> {
+    conn.execute(CUSTOM_TEAMS_DELETE_SQL, (id.to_owned(),))
+        .await?;
+    Ok(())
+}
+
+/// Persist instructions for one physical path.
+pub(super) async fn upsert_asset_instructions(
+    conn: &Connection,
+    row: &AssetInstructionsRow,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        ASSET_INSTRUCTIONS_UPSERT_SQL,
+        (row.asset_path.clone(), row.instructions.clone(), row.updated_at_ms),
+    )
+    .await?;
+    Ok(())
+}
+/// Load instructions for one physical path.
+pub(super) async fn load_asset_instructions(
+    conn: &Connection,
+    path: &str,
+) -> Result<Option<AssetInstructionsRow>, DiscussError> {
+    let mut rows = conn
+        .query(ASSET_INSTRUCTIONS_LOAD_SQL, (path.to_owned(),))
+        .await?;
+    let Some(row) = rows.next().await? else { return Ok(None) };
+    Ok(Some(AssetInstructionsRow {
+        asset_path: row_get(&row, 0, "asset_path")?,
+        instructions: row_get(&row, 1, "instructions")?,
+        updated_at_ms: row_get(&row, 2, "updated_at_ms")?,
+    }))
+}
+
+/// Selects the appropriate installation table without using dynamic SQL.
+#[derive(Clone, Copy)]
+pub(super) enum CustomInstallationKind {
+    Agent,
+    Skill,
+}
+impl CustomInstallationKind {
+    fn statements(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Agent => (
+                CUSTOM_AGENT_INSTALLATIONS_UPSERT_SQL,
+                CUSTOM_AGENT_INSTALLATIONS_LOAD_SQL,
+                CUSTOM_AGENT_INSTALLATIONS_DELETE_SQL,
+            ),
+            Self::Skill => (
+                CUSTOM_SKILL_INSTALLATIONS_UPSERT_SQL,
+                CUSTOM_SKILL_INSTALLATIONS_LOAD_SQL,
+                CUSTOM_SKILL_INSTALLATIONS_DELETE_SQL,
+            ),
+        }
+    }
+}
+/// Persist a provider's installed asset version.
+pub(super) async fn upsert_custom_installation(
+    conn: &Connection,
+    kind: CustomInstallationKind,
+    row: &CustomInstallationRow,
+) -> Result<(), DiscussError> {
+    conn.execute(
+        kind.statements().0,
+        (
+            row.provider_name.clone(),
+            row.asset_id.clone(),
+            row.installed_version.clone(),
+        ),
+    )
+    .await?;
+    Ok(())
+}
+/// Load a provider's installed asset version.
+pub(super) async fn load_custom_installation(
+    conn: &Connection,
+    kind: CustomInstallationKind,
+    provider: &str,
+    id: &str,
+) -> Result<Option<CustomInstallationRow>, DiscussError> {
+    let mut rows = conn
+        .query(kind.statements().1, (provider.to_owned(), id.to_owned()))
+        .await?;
+    let Some(row) = rows.next().await? else { return Ok(None) };
+    Ok(Some(CustomInstallationRow {
+        provider_name: row_get(&row, 0, "provider_name")?,
+        asset_id: row_get(&row, 1, "asset_id")?,
+        installed_version: row_get(&row, 2, "installed_version")?,
+    }))
+}
+/// Delete a provider's installed asset version.
+pub(super) async fn delete_custom_installation(
+    conn: &Connection,
+    kind: CustomInstallationKind,
+    provider: &str,
+    id: &str,
+) -> Result<(), DiscussError> {
+    conn.execute(kind.statements().2, (provider.to_owned(), id.to_owned()))
+        .await?;
+    Ok(())
+}
+
+/// List installation records across all providers, including removed providers.
+pub(super) async fn list_custom_installations(
+    conn: &Connection,
+    kind: CustomInstallationKind,
+) -> Result<Vec<CustomInstallationRow>, DiscussError> {
+    let sql = match kind {
+        CustomInstallationKind::Agent => CUSTOM_AGENT_INSTALLATIONS_LIST_SQL,
+        CustomInstallationKind::Skill => CUSTOM_SKILL_INSTALLATIONS_LIST_SQL,
+    };
+    let mut rows = conn.query(sql, ()).await?;
+    let mut installations = Vec::new();
+    while let Some(row) = rows.next().await? {
+        installations.push(CustomInstallationRow {
+            provider_name: row_get(&row, 0, "provider_name")?,
+            asset_id: row_get(&row, 1, "asset_id")?,
+            installed_version: row_get(&row, 2, "installed_version")?,
+        });
+    }
+    Ok(installations)
 }

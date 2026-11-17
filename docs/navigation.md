@@ -1,7 +1,7 @@
 ---
 title: Aves Engineering Navigation
 type: reference
-updated: 2026-11-15
+updated: 2026-11-17
 references:
   - AGENTS.md
   - crates/aves/AGENTS.md
@@ -36,6 +36,7 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 | [Iroh Peer Runtime](architecture/aves/iroh-peer-runtime.md) | Native transport and trust |
 | [Pluggable Flow Nodes](architecture/aves/pluggable-flow-nodes.md) | Node registration and dispatch |
 | [Discuss Domain](architecture/corv/discuss-domain.md) | ACP sessions, providers and MCP |
+| [Harness Configuration](architecture/corv/harness-configuration.md) | Provider launch configuration, permissions and disclosed limitations |
 | [Decide Domain](architecture/corv/decide-domain.md) | Bounded bool/choice/score model questions and Decide nodes |
 | [Knowledge Domain](architecture/kea/knowledge-domain.md) | Notes, Data and Canvas |
 | [Tyto Credentials](architecture/tyto/credentials.md) | Credential supply boundary |
@@ -49,6 +50,11 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 |---|---|
 | [Bus JWT Admission](concepts/bus-jwt-admission.md) | Authenticated bus ingress |
 | [Declaration-Driven Routing](concepts/declaration-driven-handler-routing.md) | Generated domain handlers |
+| [Discuss Accepted Limits](concepts/discuss-accepted-limits.md) | Settled Discuss behaviour that must not be re-raised |
+| [Discuss Accounting Ledgers](concepts/discuss-accounting-ledgers.md) | Token, spend and allowance capture, pricing and retention |
+| [Discuss Accounting Reports](concepts/discuss-accounting-reports.md) | Report operations, grouping, coverage and throughput |
+| [Discuss Custom Content](concepts/discuss-custom-content.md) | Custom agents, skills, Teams, imports and instructions |
+| [Discuss Custom MCP](concepts/discuss-custom-mcp.md) | User-supplied MCP servers and their scopes |
 | [Flow Dataflow](concepts/flow-dataflow.md) | Node inputs, outputs and blackboard |
 | [Flow Execution Workspace](concepts/flow-execution-workspace.md) | Checkpoints and workspace files |
 | [Flow Workspace Trait](concepts/flow-workspace-trait.md) | Workspace ownership and lifecycle |

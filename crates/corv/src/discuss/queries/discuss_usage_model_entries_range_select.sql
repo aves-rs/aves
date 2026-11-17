@@ -1,0 +1,2 @@
+SELECT discuss_session_id, turn_ordinal, provider_name, turn_started_at_ms, model_id, input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens, total_tokens, calculated_cost_usd, incomplete_categories, usage_is_incomplete, cost_is_partial, pricing_basis, price_snapshot_json
+FROM discuss_usage_model_entries WHERE turn_started_at_ms >= ?1 AND turn_started_at_ms <= ?2 ORDER BY turn_started_at_ms, id;

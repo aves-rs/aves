@@ -17,15 +17,17 @@ use tokio::{
 };
 
 use super::super::library::{
-    AgentDefinition, AgentId, AgentRole, AssetLibrary, SkillDefinition, SkillId, TeamDefinition,
+    AgentId, AgentRole, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
+    SkillDefinition, SkillId, TeamDefinition,
 };
 use super::super::types::{
     DiscussError, DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTodoItem, DiscussTodoSnapshot,
     DiscussTodoStatus, DiscussUtilityPayload, SessionCliLogin, SessionLaunchConfig,
 };
+use super::files::{RenderedFile, write_rendered_files};
 use super::{
-    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, PluginCaptureState, PrimaryAgentSelection,
-    render_skill_file, resolve_agent, resolve_skill,
+    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig,
+    PluginCaptureState, PrimaryAgentSelection, render_skill_file, resolve_agent, resolve_skill,
 };
 
 pub const OPENCODE_PLUGIN_NAME: &str = "opencode";
@@ -76,12 +78,6 @@ impl OpenCodeCaptureState {
 }
 
 #[derive(Serialize)]
-struct RenderedFile {
-    path: PathBuf,
-    contents: String,
-}
-
-#[derive(Serialize)]
 struct AgentFrontmatter<'a> {
     name: &'a str,
     mode: &'static str,
@@ -116,7 +112,7 @@ impl DiscussAgentPlugin for OpenCodePlugin {
     }
 
     /// OpenCode lists primary agents as values of its `mode` option.
-    fn primary_agent_selection(&self, _agent: &AgentDefinition) -> PrimaryAgentSelection {
+    fn primary_agent_selection(&self, _agent: &AgentSelectionView<'_>) -> PrimaryAgentSelection {
         PrimaryAgentSelection::ConfigOption(MODE_CONFIG_ID)
     }
 
@@ -137,6 +133,21 @@ impl DiscussAgentPlugin for OpenCodePlugin {
             .env
             .push(EnvVariable::new("OPENCODE_CONFIG_DIR", directory));
         Ok(Some(McpServer::Stdio(server)))
+    }
+
+    fn uses_mcp_launch_env(&self) -> bool {
+        true
+    }
+
+    fn launch_preparation(
+        &self,
+        _context: &LaunchContext,
+        _config: &SessionLaunchConfig,
+    ) -> Result<LaunchPreparation, DiscussError> {
+        Ok(LaunchPreparation {
+            meta: None,
+            limitations: Vec::new(),
+        })
     }
 
     fn configured_launch_server(
@@ -382,10 +393,13 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         "plugin.opencode"
     }
 
-    /// Materialize this Provider's shared configuration in the Agent workspace.
-    fn install_config(&self, root: &Path) -> Result<(), DiscussError> {
-        let config = render_config()?;
-        write_file(root, Path::new(CONFIG_PATH), &config)
+    fn managed_config(&self) -> Option<ManagedConfig> {
+        Some(ManagedConfig::WorkspaceFile {
+            plugin: OPENCODE_PLUGIN_NAME,
+            path: CONFIG_PATH,
+            default: render_config,
+            validate: |document| super::json_object(OPENCODE_PLUGIN_NAME, document).map(|_| ()),
+        })
     }
 
     /// Remove this Provider's shared configuration from the Agent workspace.
@@ -398,10 +412,22 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         }
     }
 
-    fn install_agent(&self, library: AssetLibrary, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
+    fn workspace_label(&self) -> &'static str {
+        OPENCODE_PLUGIN_NAME
+    }
+
+    fn render_agent(
+        &self,
+        library: AssetLibrary,
+        agent_id: &AgentId,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<Vec<RenderedFile>, DiscussError> {
         let agent = resolve_agent(library, agent_id)?;
-        let file = render_agent(agent, None)?;
-        write_file(root, &file.path, &file.contents)
+        Ok(vec![render_agent(
+            &AgentSelectionView::from_builtin(agent),
+            Some(agent.role),
+            member_settings,
+        )?])
     }
 
     fn destroy_agent(&self, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
@@ -409,33 +435,6 @@ impl DiscussAgentPlugin for OpenCodePlugin {
             root,
             &Path::new(AGENTS_DIRECTORY).join(format!("{}.md", agent_id.normalized_destination())),
         )
-    }
-
-    fn install_team_with_member_overrides(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        team: &TeamDefinition,
-        member_settings: &BTreeMap<AgentId, ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        install_team_members(library, self, root, team, member_settings)?;
-        for skill_id in &team.skills {
-            let skill = resolve_skill(library, skill_id)?;
-            self.install_skill(root, skill)?;
-        }
-        Ok(())
-    }
-
-    fn install_team_member(
-        &self,
-        library: AssetLibrary,
-        root: &Path,
-        agent_id: &AgentId,
-        member_settings: Option<&ConfigSettings>,
-    ) -> Result<(), DiscussError> {
-        let agent = resolve_agent(library, agent_id)?;
-        let file = render_agent(agent, member_settings)?;
-        write_file(root, &file.path, &file.contents)
     }
 
     fn destroy_team(
@@ -463,15 +462,76 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         Ok(())
     }
 
-    fn install_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
+    fn installed_agent_path(&self, id: &AgentId) -> PathBuf {
+        Path::new(AGENTS_DIRECTORY).join(format!("{}.md", id.normalized_destination()))
+    }
+
+    fn installed_skill_path(&self, id: &SkillId) -> PathBuf {
+        Path::new(".opencode/skills")
+            .join(id.normalized_destination())
+            .join("SKILL.md")
+    }
+
+    fn install_custom_agent(
+        &self,
+        root: &Path,
+        agent: &CustomAgentDefinition,
+        member_settings: Option<&ConfigSettings>,
+    ) -> Result<(), DiscussError> {
+        let file = render_agent(&AgentSelectionView::from_custom(agent), None, member_settings)?;
+        write_rendered_files(self.workspace_label(), root, &[file])
+    }
+
+    fn install_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        let mut files = Vec::new();
+        for file in &skill.bundle {
+            let path = Path::new(".opencode/skills")
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            let body = if file.relative_path == "SKILL.md" {
+                super::markdown_metadata(&file.contents)?.2
+            } else {
+                &file.contents
+            };
+            let contents = super::render_skill_contents(
+                OPENCODE_PLUGIN_NAME,
+                &path,
+                &skill.id,
+                &skill.description,
+                &file.relative_path,
+                body,
+            )?;
+            files.push(RenderedFile {
+                relative_path: path,
+                contents,
+            });
+        }
+        write_rendered_files(self.workspace_label(), root, &files)
+    }
+
+    fn destroy_custom_skill(&self, root: &Path, skill: &CustomSkillDefinition) -> Result<(), DiscussError> {
+        for file in &skill.bundle {
+            let path = Path::new(".opencode/skills")
+                .join(skill.id.normalized_destination())
+                .join(&file.relative_path);
+            remove_file(root, &path)?;
+        }
+        Ok(())
+    }
+
+    fn render_skill(&self, skill: &SkillDefinition) -> Result<Vec<RenderedFile>, DiscussError> {
+        let mut files = Vec::new();
         for file in &skill.bundle {
             let relative_path = Path::new(".opencode/skills")
                 .join(skill.id.normalized_destination())
                 .join(file.relative_path);
             let contents = render_skill_file(OPENCODE_PLUGIN_NAME, &relative_path, skill, file)?;
-            write_file(root, &relative_path, &contents)?;
+            files.push(RenderedFile {
+                relative_path,
+                contents,
+            });
         }
-        Ok(())
+        Ok(files)
     }
 
     fn destroy_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError> {
@@ -809,34 +869,22 @@ fn parse_subagent_state(update: &serde_json::Value) -> Option<DiscussSubagentSur
 }
 
 fn render_agent(
-    agent: &AgentDefinition,
+    agent: &AgentSelectionView<'_>,
+    role: Option<AgentRole>,
     member_settings: Option<&ConfigSettings>,
 ) -> Result<RenderedFile, DiscussError> {
     let path = PathBuf::from(AGENTS_DIRECTORY).join(format!("{}.md", agent.id.normalized_destination()));
     let frontmatter = AgentFrontmatter {
         name: agent.id.as_ref(),
         description: agent.description,
-        mode: match agent.role {
-            AgentRole::Leader => "primary",
-            AgentRole::Follower => "subagent",
+        mode: match role {
+            Some(AgentRole::Leader) => "primary",
+            Some(AgentRole::Follower) => "subagent",
+            None => "all",
         },
         settings: member_settings.cloned().unwrap_or_default(),
     };
     render_markdown(&path, &frontmatter, agent.body)
-}
-
-fn install_team_members(
-    library: AssetLibrary,
-    plugin: &OpenCodePlugin,
-    root: &Path,
-    team: &TeamDefinition,
-    member_settings: &BTreeMap<AgentId, ConfigSettings>,
-) -> Result<(), DiscussError> {
-    plugin.install_team_member(library, root, &team.leader, member_settings.get(&team.leader))?;
-    for follower in &team.followers {
-        plugin.install_team_member(library, root, follower, member_settings.get(follower))?;
-    }
-    Ok(())
 }
 
 fn render_config() -> Result<String, DiscussError> {
@@ -866,17 +914,9 @@ fn render_markdown<T: Serialize>(path: &Path, frontmatter: &T, body: &str) -> Re
         message: source.to_string(),
     })?;
     Ok(RenderedFile {
-        path: path.to_path_buf(),
+        relative_path: path.to_path_buf(),
         contents: format!("---\n{yaml}---\n\n{body}"),
     })
-}
-
-fn write_file(root: &Path, relative_path: &Path, contents: &str) -> Result<(), DiscussError> {
-    let path = root.join(relative_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| capture_write_error(&path, error))?;
-    }
-    fs::write(&path, contents).map_err(|error| capture_write_error(&path, error))
 }
 
 fn remove_file(root: &Path, relative_path: &Path) -> Result<(), DiscussError> {
@@ -1236,7 +1276,7 @@ mod tests {
         fs::write(&skill_path, "peer skill").expect("skill file");
         fs::write(&command_path, "peer command").expect("command file");
         PLUGIN
-            .install_agent(library, directory.path(), &agent.id)
+            .install_team_member(library, directory.path(), &agent.id, None)
             .expect("install succeeds");
         let first = fs::read(
             directory
@@ -1258,7 +1298,7 @@ mod tests {
         )
         .expect("stale target");
         PLUGIN
-            .install_agent(library, directory.path(), &agent.id)
+            .install_team_member(library, directory.path(), &agent.id, None)
             .expect("repeat install succeeds");
         let second = fs::read(
             directory

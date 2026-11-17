@@ -21,4 +21,29 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "session_setup_kind",
         sql: include_str!("../../migrations/0004_session_setup_kind.sql"),
     },
+    Migration {
+        version: 5,
+        name: "accounting_ledgers",
+        sql: include_str!("../../migrations/0005_accounting_ledgers.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "custom_assets",
+        sql: include_str!("../../migrations/0006_custom_assets.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "discuss_identity",
+        sql: include_str!("../../migrations/0007_discuss_identity.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "custom_mcp",
+        sql: include_str!("../../migrations/0008_custom_mcp.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "session_launch_limitations",
+        sql: include_str!("../../migrations/0009_session_launch_limitations.sql"),
+    },
 ];

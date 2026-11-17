@@ -52,7 +52,9 @@ impl DecidePlugin for JevPlugin {
         request: &DecideAskRequest,
         credential: Option<&DecideCredential>,
     ) -> Result<DecideOutcome, DecideError> {
-        let credential = credential.ok_or(DecideError::AuthenticationRequired)?;
+        let key = credential
+            .and_then(|value| value.api_key.as_ref())
+            .ok_or(DecideError::AuthenticationRequired)?;
         let endpoint = request
             .endpoint
             .as_ref()
@@ -61,7 +63,7 @@ impl DecidePlugin for JevPlugin {
             })?;
         let question = question_json(&request.question)?;
         let body = systemone::request_envelope(&request.model, json!(request.state), question);
-        let response = post_json(endpoint, Some(&credential.api_key), &body, request.timeout, retryable).await?;
+        let response = post_json(endpoint, Some(key.as_str()), &body, request.timeout, retryable).await?;
         systemone::decode(&response, &request.question)
     }
 }
@@ -110,7 +112,8 @@ mod tests {
 
     fn credential(base: &reqwest::Url) -> DecideCredential {
         DecideCredential {
-            api_key: Zeroizing::new("test-key".into()),
+            provider: PROVIDER_ID.into(),
+            api_key: Some(Zeroizing::new("test-key".into())),
             endpoint: base.clone(),
         }
     }
@@ -261,6 +264,14 @@ mod tests {
         assert!(matches!(
             PLUGIN
                 .ask(&request(Some(server.base.clone()), boolean()), None)
+                .await,
+            Err(DecideError::AuthenticationRequired)
+        ));
+        let mut keyless = credential(&server.base);
+        keyless.api_key = None;
+        assert!(matches!(
+            PLUGIN
+                .ask(&request(Some(server.base.clone()), boolean()), Some(&keyless))
                 .await,
             Err(DecideError::AuthenticationRequired)
         ));

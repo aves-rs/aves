@@ -53,6 +53,8 @@ pub struct DiscussSettings {
     pub agents: HashMap<String, AcpProvider>,
     pub agents_workspace: Option<PathBuf>,
     pub subagent_retention_limit: u32,
+    /// Days to retain accounting records; zero disables pruning.
+    pub accounting_retention_days: u32,
 }
 
 impl Default for DiscussSettings {
@@ -61,6 +63,7 @@ impl Default for DiscussSettings {
             agents: HashMap::new(),
             agents_workspace: None,
             subagent_retention_limit: 10,
+            accounting_retention_days: 90,
         }
     }
 }

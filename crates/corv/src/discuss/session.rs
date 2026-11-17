@@ -11,9 +11,9 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AuthCapabilities, AuthMethod, ClientCapabilities, ContentBlock, CreateElicitationRequest,
     CreateElicitationResponse, ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities,
-    ElicitationScope, InitializeRequest, LoadSessionRequest, McpServer, Meta, NewSessionRequest, NewSessionResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionConfigOptionValue, SessionId, SessionInfo,
-    SetSessionConfigOptionRequest, SystemPrompt, TextContent,
+    ElicitationScope, ImageContent, InitializeRequest, LoadSessionRequest, McpServer, Meta, NewSessionRequest,
+    NewSessionResponse, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOptionValue, SessionId,
+    SessionInfo, SetSessionConfigOptionRequest, SystemPrompt, TextContent,
 };
 use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
 use agent_client_protocol::{
@@ -28,7 +28,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::types::AgentNodeTerminalResult;
+use super::types::{AgentNodeTerminalResult, DiscussImageAttachment};
 use aves::auth::messages::{IssueJwtInput, RevokeJtiInput};
 use aves::auth::{AuthCapability, AuthSudoService, Jwt};
 use aves::bus::{BusMcpEndpoint, BusRpcContext, BusSudoService};
@@ -37,10 +37,11 @@ use aves::runtime::ServiceReader;
 use super::agents::{AssistantTurnBuffer, FlushPayload};
 use super::boot::DiscussMcpDomain;
 use super::config::{ConfigPreferenceReconciler, primary_agent_option_selection};
-use super::library::AgentDefinition;
+use super::library::{AgentSelectionView, ResolvedAgent};
 use super::messages::DiscussResponse;
 use super::plugins::PrimaryAgentSelection;
 use super::plugins::{self, ConfigSettings};
+use super::pricing::PriceIndex;
 use super::storage::DiscussPersistence;
 use super::supervisor::{
     CallbackEvent, CallbackRouteRegistry, CallbackRouteTarget, CallbackRouter, ElicitationCorrelationId,
@@ -48,8 +49,8 @@ use super::supervisor::{
 };
 use super::types::{
     DiscussConfigOption, DiscussError, DiscussMcpStatus, DiscussSessionId, DiscussStreamEvent, ElicitationRequestId,
-    PendingElicitation, PendingPermission, PermissionRequestId, ProviderSessionInfo, SessionLaunchConfig,
-    WorkerCommand,
+    LaunchLimitation, PendingElicitation, PendingPermission, PermissionRequestId, ProviderSessionInfo,
+    SessionLaunchConfig, WorkerCommand,
 };
 use super::worker::{run_connected_session, run_isolated};
 
@@ -98,17 +99,21 @@ impl AgentNodeTerminalState {
 
 pub(super) struct WorkerSessionParams {
     pub(super) launch_config: Option<SessionLaunchConfig>,
+    pub(super) launch_meta: Option<Meta>,
+    pub(super) launch_limitations: Vec<LaunchLimitation>,
     pub(super) stream_tx: mpsc::Sender<DiscussStreamEvent>,
     pub(super) discuss_session_id: DiscussSessionId,
     pub(super) auth_launch_server: McpServer,
     pub(super) session_name: String,
     pub(super) agent_name: String,
-    pub(super) primary_agent: Option<&'static AgentDefinition>,
+    pub(super) primary_agent: Option<ResolvedAgent>,
     pub(super) reconnect_acp_session_id: Option<SessionId>,
     pub(super) persisted_config_options: Vec<DiscussConfigOption>,
     pub(super) session_settings: ConfigSettings,
     pub(super) restored_persisted_transcript: bool,
     pub(super) next_turn_position: i64,
+    pub(super) next_usage_ordinal: i64,
+    pub(super) price_index: PriceIndex,
     pub(super) agents_workspace: PathBuf,
     pub(super) application_mcp_enabled: bool,
     pub(super) bus_service: ServiceReader<dyn BusSudoService>,
@@ -120,6 +125,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) persistence: DiscussPersistence,
     pub(super) worker_command_rx: mpsc::Receiver<WorkerCommand>,
     pub(super) capabilities_update_tx: mpsc::Sender<(DiscussSessionId, SessionCapabilitiesCache)>,
+    pub(super) activity_update_tx: mpsc::Sender<(DiscussSessionId, bool)>,
     pub(super) worker_ready_tx: mpsc::Sender<WorkerReady>,
     pub(super) agent_defaults: ConfigSettings,
     pub(super) pending_permission_tx: mpsc::Sender<PendingPermissionRegistration>,
@@ -212,6 +218,7 @@ pub(super) fn load_session_request(
 
 pub(super) async fn issue_worker_jwt(
     auth_service: Option<&ServiceReader<dyn AuthSudoService>>,
+    discuss_session_id: DiscussSessionId,
     exp: ChronoDuration,
 ) -> Result<IssuedWorkerToken, DiscussError> {
     let service = auth_service
@@ -219,7 +226,7 @@ pub(super) async fn issue_worker_jwt(
         .ok_or(DiscussError::WorkerTokenServiceUnavailable)?;
     let output = service
         .issue_jwt(IssueJwtInput {
-            sub: "agent".to_owned(),
+            sub: worker_subject(discuss_session_id),
             cap: vec![AuthCapability::AllBus],
             exp: (Utc::now() + exp).to_rfc3339(),
         })
@@ -229,6 +236,12 @@ pub(super) async fn issue_worker_jwt(
         token: output.token,
         jti: output.jti,
     })
+}
+
+pub(super) fn worker_subject(discuss_session_id: DiscussSessionId) -> String {
+    let mut subject = String::from("discuss-session:");
+    subject.push_str(&discuss_session_id.to_string());
+    subject
 }
 
 pub(super) fn provider_sessions_from_schema(sessions: Vec<SessionInfo>) -> Vec<ProviderSessionInfo> {
@@ -819,13 +832,31 @@ impl WorkerSession {
     }
 
     pub fn send_prompt(&mut self, prompt: impl ToString) -> Result<(), agent_client_protocol::Error> {
+        self.send_blocks(vec![prompt.to_string().into()])
+    }
+
+    pub fn send_user_turn(
+        &mut self,
+        text: String,
+        images: Vec<DiscussImageAttachment>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let mut blocks = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
+        if !text.is_empty() {
+            blocks.push(ContentBlock::Text(TextContent::new(text)));
+        }
+        blocks.extend(
+            images
+                .into_iter()
+                .map(|image| ContentBlock::Image(ImageContent::new(image.data, image.mime_type))),
+        );
+        self.send_blocks(blocks)
+    }
+
+    fn send_blocks(&mut self, blocks: Vec<ContentBlock>) -> Result<(), agent_client_protocol::Error> {
         self.connection
             .send_request_to(
                 Agent,
-                agent_client_protocol::v1::schema::PromptRequest::new(
-                    self.session_id.clone(),
-                    vec![prompt.to_string().into()],
-                ),
+                agent_client_protocol::v1::schema::PromptRequest::new(self.session_id.clone(), blocks),
             )
             .on_receiving_result({
                 let update_tx = self.update_tx.clone();
@@ -861,10 +892,12 @@ impl Drop for WorkerSession {
 }
 
 pub(super) struct OpenConfiguredSessionOptions {
+    pub(super) launch_meta: Option<Meta>,
+    pub(super) launch_config: Option<SessionLaunchConfig>,
     pub(super) reconnect_session_id: Option<SessionId>,
     pub(super) cwd: PathBuf,
     pub(super) mcp_servers: Vec<McpServer>,
-    pub(super) primary_agent: Option<&'static AgentDefinition>,
+    pub(super) primary_agent: Option<ResolvedAgent>,
     pub(super) system_prompt_supported: bool,
     pub(super) resolved_config: ConfigSettings,
     pub(super) persisted_config_options: Vec<DiscussConfigOption>,
@@ -878,7 +911,7 @@ struct PrimaryAgentOpen {
 
 impl PrimaryAgentOpen {
     fn for_selection(
-        primary_agent: Option<&(&'static AgentDefinition, PrimaryAgentSelection)>,
+        primary_agent: Option<&(AgentSelectionView<'_>, PrimaryAgentSelection)>,
         system_prompt_supported: bool,
     ) -> Result<Self, DiscussError> {
         let mut open = Self {
@@ -909,6 +942,7 @@ pub(super) struct ConfiguredSession {
     pub(super) config_options: Vec<DiscussConfigOption>,
     pub(super) applied_settings: ConfigSettings,
     pub(super) supports_config_updates: bool,
+    pub(super) launch_limitations: Vec<LaunchLimitation>,
 }
 
 pub(super) async fn open_configured_session(
@@ -922,10 +956,13 @@ pub(super) async fn open_configured_session(
 ) -> Result<ConfiguredSession, DiscussError> {
     tracing::debug!(provider = provider_name, cwd = %options.cwd.display(), reconnect = options.reconnect_session_id.is_some(), "Requesting ACP session open");
     let agent_plugin = plugins::for_agent(provider_name);
-    let primary_agent = options
-        .primary_agent
-        .map(|agent| (agent, agent_plugin.primary_agent_selection(agent)));
-    let open = PrimaryAgentOpen::for_selection(primary_agent.as_ref(), options.system_prompt_supported)?;
+    let primary_agent = options.primary_agent.as_ref().map(|agent| {
+        let view = agent.selection_view();
+        let selection = agent_plugin.primary_agent_selection(&view);
+        (view, selection)
+    });
+    let mut open = PrimaryAgentOpen::for_selection(primary_agent.as_ref(), options.system_prompt_supported)?;
+    open.meta = plugins::merge_metadata(open.meta, options.launch_meta)?;
     let session_response = if let Some(session_id) = options.reconnect_session_id {
         let response = connection
             .send_request(
@@ -1015,11 +1052,33 @@ pub(super) async fn open_configured_session(
         );
     }
 
+    let mut provider_options = reconciler.finish();
+    let mut launch_limitations = Vec::new();
+    if let Some(config) = options.launch_config.as_ref() {
+        let selections = agent_plugin.launch_option_selections(config, &provider_options);
+        launch_limitations = selections.limitations;
+        for (config_id, value) in selections.settings {
+            let response = session
+                .connection()
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session.session_id().clone(),
+                    config_id.clone(),
+                    SessionConfigOptionValue::value_id(value.clone()),
+                ))
+                .block_task()
+                .await?;
+            provider_options = agent_plugin
+                .initial_config_options(Some(response.config_options), None)
+                .unwrap_or_default();
+            applied_settings.insert(config_id, value);
+        }
+    }
     Ok(ConfiguredSession {
         session,
-        config_options: reconciler.finish(),
+        config_options: provider_options,
         applied_settings,
         supports_config_updates,
+        launch_limitations,
     })
 }
 
@@ -1043,8 +1102,14 @@ mod tests {
             .next()
             .expect("agent");
 
-        let open =
-            PrimaryAgentOpen::for_selection(Some(&(agent, PrimaryAgentSelection::SystemPrompt)), true).expect("open");
+        let open = PrimaryAgentOpen::for_selection(
+            Some(&(
+                AgentSelectionView::from_builtin(agent),
+                PrimaryAgentSelection::SystemPrompt,
+            )),
+            true,
+        )
+        .expect("open");
         assert_eq!(
             open.system_prompt,
             Some(SystemPrompt::new(vec![ContentBlock::Text(TextContent::new(
@@ -1054,19 +1119,30 @@ mod tests {
         assert!(open.meta.is_none());
 
         assert!(matches!(
-            PrimaryAgentOpen::for_selection(Some(&(agent, PrimaryAgentSelection::SystemPrompt)), false),
+            PrimaryAgentOpen::for_selection(Some(&(AgentSelectionView::from_builtin(agent), PrimaryAgentSelection::SystemPrompt)), false),
             Err(DiscussError::UnsupportedCapability { ref capability }) if capability == "system_prompt"
         ));
 
         let meta = Meta::from_iter([("agentProfile".to_string(), serde_json::json!("leader"))]);
-        let open =
-            PrimaryAgentOpen::for_selection(Some(&(agent, PrimaryAgentSelection::SessionMeta(meta.clone()))), false)
-                .expect("open");
+        let open = PrimaryAgentOpen::for_selection(
+            Some(&(
+                AgentSelectionView::from_builtin(agent),
+                PrimaryAgentSelection::SessionMeta(meta.clone()),
+            )),
+            false,
+        )
+        .expect("open");
         assert_eq!(open.meta, Some(meta));
         assert!(open.system_prompt.is_none());
 
-        let open = PrimaryAgentOpen::for_selection(Some(&(agent, PrimaryAgentSelection::ConfigOption("agent"))), false)
-            .expect("open");
+        let open = PrimaryAgentOpen::for_selection(
+            Some(&(
+                AgentSelectionView::from_builtin(agent),
+                PrimaryAgentSelection::ConfigOption("agent"),
+            )),
+            false,
+        )
+        .expect("open");
         assert!(open.system_prompt.is_none() && open.meta.is_none());
     }
 

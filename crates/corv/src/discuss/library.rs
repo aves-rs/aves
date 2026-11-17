@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,143 @@ pub struct AgentAssetDefinition<Id> {
 }
 
 pub type AgentDefinition = AgentAssetDefinition<AgentId>;
+
+/// An owned, user-defined agent.
+#[derive(Debug, Clone)]
+pub(crate) struct CustomAgentDefinition {
+    pub(crate) id: AgentId,
+    pub(crate) name: String,
+    pub(crate) job_title: String,
+    pub(crate) description: String,
+    pub(crate) body: String,
+    pub(crate) version: Version,
+}
+
+/// An owned file in a custom skill bundle.
+#[derive(Debug, Clone)]
+pub(crate) struct CustomSkillFile {
+    pub(crate) relative_path: String,
+    pub(crate) contents: String,
+}
+
+/// An owned, user-defined skill and its files.
+#[derive(Debug, Clone)]
+pub(crate) struct CustomSkillDefinition {
+    pub(crate) id: SkillId,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) bundle: Vec<CustomSkillFile>,
+    pub(crate) version: Version,
+}
+
+/// An owned, user-defined team identified by its leader.
+#[derive(Debug, Clone)]
+pub(crate) struct CustomTeamDefinition {
+    pub(crate) leader: AgentId,
+    pub(crate) followers: Vec<AgentId>,
+    pub(crate) skills: Vec<SkillId>,
+    pub(crate) version: Version,
+}
+
+/// A resolved built-in or custom agent.
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedAgent {
+    /// An application-supplied definition.
+    Builtin(&'static AgentDefinition),
+    /// A runtime-owned definition.
+    Custom(Arc<CustomAgentDefinition>),
+}
+
+impl ResolvedAgent {
+    /// Borrows the fields needed to select this agent at session launch.
+    pub(crate) fn selection_view(&self) -> AgentSelectionView<'_> {
+        match self {
+            Self::Builtin(agent) => AgentSelectionView::from_builtin(agent),
+            Self::Custom(agent) => AgentSelectionView::from_custom(agent),
+        }
+    }
+}
+
+/// A resolved built-in or custom skill.
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedSkill {
+    /// An application-supplied definition.
+    Builtin(&'static SkillDefinition),
+    /// A runtime-owned definition.
+    Custom(Arc<CustomSkillDefinition>),
+}
+
+/// A resolved built-in or custom team.
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedTeam {
+    /// An application-supplied definition.
+    Builtin(&'static TeamDefinition),
+    /// A runtime-owned definition.
+    Custom(Arc<CustomTeamDefinition>),
+}
+
+/// Borrowed agent fields needed for provider selection.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentSelectionView<'a> {
+    pub(crate) id: &'a AgentId,
+    pub(crate) description: &'a str,
+    pub(crate) body: &'a str,
+}
+
+impl<'a> AgentSelectionView<'a> {
+    /// Borrows selection fields from a static built-in definition.
+    pub(crate) fn from_builtin(agent: &'static AgentDefinition) -> Self {
+        Self {
+            id: &agent.id,
+            description: agent.description,
+            body: agent.body,
+        }
+    }
+
+    /// Borrows selection fields from a custom definition.
+    pub(crate) fn from_custom(agent: &'a CustomAgentDefinition) -> Self {
+        Self {
+            id: &agent.id,
+            description: &agent.description,
+            body: &agent.body,
+        }
+    }
+}
+
+/// The initial backend-assigned version of a custom asset.
+pub(crate) fn initial_custom_version() -> Version {
+    Version::new(0, 1, 0)
+}
+
+/// Returns the next patch version, or `None` when the patch is exhausted.
+pub(crate) fn bump_custom_version(version: &Version) -> Option<Version> {
+    Some(Version::new(
+        version.major,
+        version.minor,
+        version.patch.checked_add(1)?,
+    ))
+}
+
+/// Validates a custom bundle destination path.
+pub(crate) fn validate_custom_relative_path(path: &str) -> Result<(), Error> {
+    validate_relative_path(path)
+}
+
+/// Validates custom bundle destinations and the required first `SKILL.md` file.
+pub(crate) fn validate_custom_skill_bundle(bundle: &[CustomSkillFile]) -> Result<(), Error> {
+    for file in bundle {
+        validate_relative_path(&file.relative_path)?;
+    }
+    if bundle.first().map(|file| file.relative_path.as_str()) != Some("SKILL.md") {
+        return Err(Error::InvalidAssetId {
+            asset_id: bundle
+                .first()
+                .map_or_else(String::new, |file| file.relative_path.clone()),
+            violation: AssetIdViolation::Empty,
+        });
+    }
+    Ok(())
+}
 
 /// The role an agent occupies in a canonical team.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

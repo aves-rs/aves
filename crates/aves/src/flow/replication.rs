@@ -6,7 +6,7 @@ use super::mobility::{
     FlowAuthorityState, FlowMobilityCommitAcknowledgement, FlowMobilitySnapshot, FlowYieldAcknowledgement,
     mobility_snapshot_generation,
 };
-use super::types::{FlowError, FlowId};
+use super::types::{FlowError, FlowId, WorkspaceError};
 
 impl Actor {
     /// Finalizes source cleanup only after destination activation is acknowledged.
@@ -40,6 +40,8 @@ impl Actor {
         };
         let acknowledgement = self
             .mobility_service
+            .as_deref()
+            .ok_or(WorkspaceError::ProviderUnavailable)?
             .promote_replica(destination, yield_acknowledgement)
             .await?;
         if acknowledgement.flow_id != flow_id || acknowledgement.snapshot_generation != generation {
@@ -71,15 +73,6 @@ impl Actor {
         source_peer_key: MachineIssuerId,
     ) -> Result<FlowResponse, FlowError> {
         self.require_peer_service()?;
-        if let Some(execution) = snapshot
-            .executions
-            .iter()
-            .find(|execution| execution.workspace.is_application())
-        {
-            return Err(FlowError::AppWorkspaceMobilityUnsupported {
-                execution_id: execution.execution.execution_id,
-            });
-        }
         let flow_id = snapshot.flow_id;
         for trigger in &snapshot.triggers {
             self.trigger_registry.validate_configuration(trigger)?;

@@ -62,6 +62,7 @@ impl Actor {
         let limits = resolve_agent_node_limits(max_turns, max_tool_calls, max_duration)?;
         let started = self
             .start_task_session(TaskSessionStart {
+                node_execution_id: id,
                 launch_config,
                 provider_name,
                 agent_name,

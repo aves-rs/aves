@@ -141,21 +141,21 @@ pub struct FlowGraph {
 
 impl FlowGraph {
     /// Decode a persisted JSON AST and reject it before it can be executed.
-    pub(super) fn load_json(value: &str) -> Result<Self, FlowGraphLoadError> {
+    pub fn load_json(value: &str) -> Result<Self, FlowGraphLoadError> {
         Ok(Self {
             ast: FlowGraphAst::load_json(value)?,
         })
     }
 
     /// Returns the validated persisted AST.
-    pub(super) fn ast(&self) -> &FlowGraphAst {
+    pub fn ast(&self) -> &FlowGraphAst {
         &self.ast
     }
 }
 
 impl GraphNode {
     /// Visits every leaf in depth-first, left-to-right order.
-    pub(super) fn for_each_leaf<'a>(&'a self, visitor: &mut impl FnMut(&'a FlowNode)) {
+    pub fn for_each_leaf<'a>(&'a self, visitor: &mut impl FnMut(&'a FlowNode)) {
         match self {
             GraphNode::AlwaysSucceed { child } => child.for_each_leaf(visitor),
             GraphNode::Leaf { node } => visitor(node),

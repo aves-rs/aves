@@ -12,17 +12,19 @@ use aves::utils::buffers::DEFAULT_BUFFER_SIZE;
 use super::agents::FlushPayload;
 use super::boot::load_discuss_settings;
 use super::config::{config_options_from_json, config_settings_from_json};
-use super::library::{AgentId, AssetLibrary, SkillId, TeamDefinition};
+use super::library::{AgentId, AssetLibrary, CustomTeamDefinition, SkillId, TeamDefinition};
 use super::plugins;
 use super::session::{SessionAnchorClear, SessionAnchorMetadata};
 use super::storage::{
-    DiscussChatTurnInsert, DiscussPersistence, DiscussSessionUpsert, DiscussTeamInstallationRow,
-    ElicitationPersistenceInput, insert_discuss_chat_turn, load_discuss_agent_config, load_discuss_session,
-    prune_discuss_chat_turns_window, upsert_discuss_agent_config, upsert_discuss_session_with_task_tag,
+    DiscussAllowanceObservation, DiscussChatTurnInsert, DiscussModelsCatalog, DiscussPersistence, DiscussSessionUpsert,
+    DiscussTeamInstallationRow, ElicitationPersistenceInput, insert_discuss_chat_turn, load_discuss_agent_config,
+    load_discuss_session, prune_discuss_chat_turns_window, upsert_discuss_agent_config,
+    upsert_discuss_session_with_task_tag,
 };
 use super::types::{
     CleanupWarning, ConfigSettings, DiscussConfigOption, DiscussElicitationAnswer, DiscussError,
-    DiscussMemberOverrides, DiscussSubagentRecord, DiscussUtilityPayload, RetainedTeamAssetsByScope,
+    DiscussMemberOverrides, DiscussModelUsageEntry, DiscussSubagentRecord, DiscussTurnRecord, DiscussUtilityPayload,
+    LaunchLimitation, RetainedTeamAssetsByScope,
 };
 
 /// One ordered persistence unit for a session's serialized write queue.
@@ -30,7 +32,7 @@ use super::types::{
 /// Each variant owns its data so the job can be moved across the queue without
 /// borrowing worker state; the drain task acquires a fresh connection per job
 /// through the shared `DiscussPersistence` factory.
-pub enum PersistenceJob {
+pub(super) enum PersistenceJob {
     /// Anchor upsert for a live ACP session that has not yet received a user
     /// prompt. Writes `acp_session_id` so the parent row exists before any
     /// later config/turn writes, without inventing a user turn.
@@ -63,6 +65,11 @@ pub enum PersistenceJob {
         session_settings: Option<ConfigSettings>,
         completion_tx: Option<oneshot::Sender<Result<(), DiscussError>>>,
     },
+    /// Replace the final launch limitations and acknowledge durable storage.
+    LaunchLimitations {
+        limitations: Vec<LaunchLimitation>,
+        completion_tx: oneshot::Sender<Result<(), DiscussError>>,
+    },
     /// Assistant turn persisted exactly at its `StopReason` boundary.
     AssistantTurn {
         assistant_position: i64,
@@ -72,6 +79,16 @@ pub enum PersistenceJob {
     TodoSnapshot { snapshot_json: String },
     /// Typed parent-session subagent capture, upserted and retained atomically.
     Subagent { subagent: DiscussSubagentRecord },
+    /// Persist a terminal accounting turn and its model observations.
+    UsageTurn {
+        turn: DiscussTurnRecord,
+        entries: Vec<DiscussModelUsageEntry>,
+    },
+    /// Replace usage evidence for a previously persisted terminal turn.
+    UpdateTurnUsage {
+        turn: DiscussTurnRecord,
+        entries: Vec<DiscussModelUsageEntry>,
+    },
 }
 
 // ── Serialized per-session persistence queue ──────────────────────────────
@@ -164,6 +181,18 @@ pub(super) fn spawn_persistence_queue(
                         tracing::warn!(?error, "Discuss worker: failed to persist config state");
                     }
                 }
+                PersistenceJob::LaunchLimitations {
+                    limitations,
+                    completion_tx,
+                } => {
+                    let result = async {
+                        let conn = persistence.acquire_connection().await?;
+                        super::storage::update_session_launch_limitations(&conn, &discuss_session_id, &limitations)
+                            .await
+                    }
+                    .await;
+                    let _ = completion_tx.send(result);
+                }
                 PersistenceJob::AssistantTurn {
                     assistant_position,
                     flush,
@@ -191,10 +220,49 @@ pub(super) fn spawn_persistence_queue(
                         tracing::warn!(?error, "Discuss worker: failed to persist subagent capture");
                     }
                 }
+                PersistenceJob::UsageTurn { turn, entries } => {
+                    if let Err(error) =
+                        persist_usage_turn(&persistence, &discuss_session_id, &turn, &entries, false).await
+                    {
+                        tracing::warn!(?error, "Discuss worker: failed to persist accounting turn");
+                    }
+                }
+                PersistenceJob::UpdateTurnUsage { turn, entries } => {
+                    if let Err(error) =
+                        persist_usage_turn(&persistence, &discuss_session_id, &turn, &entries, true).await
+                    {
+                        tracing::warn!(?error, "Discuss worker: failed to update accounting turn");
+                    }
+                }
             }
         }
     });
     (tx, drain)
+}
+
+/// Acknowledged launch-fact writes on the worker's ordered persistence sender.
+pub(super) trait LaunchLimitationsPersistence {
+    async fn persist_launch_limitations(&self, limitations: Vec<LaunchLimitation>) -> Result<(), DiscussError>;
+}
+
+impl LaunchLimitationsPersistence for mpsc::Sender<PersistenceJob> {
+    async fn persist_launch_limitations(&self, limitations: Vec<LaunchLimitation>) -> Result<(), DiscussError> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.send(PersistenceJob::LaunchLimitations {
+            limitations,
+            completion_tx,
+        })
+        .await
+        .map_err(|error| super::actor::channel_send_error("persist_launch_limitations", error.to_string()))?;
+        completion_rx
+            .await
+            .map_err(|error| DiscussError::Infrastructure {
+                kind: "oneshot_reply_missing".to_string(),
+                target_domain: "discuss".to_string(),
+                operation: "persist_launch_limitations".to_string(),
+                message: error.to_string(),
+            })?
+    }
 }
 
 /// Enqueue a persistence job on the ordered per-session queue (fire-and-forget).
@@ -231,6 +299,54 @@ pub(super) async fn enqueue_utility_persistence(
 }
 
 // ── Worker persistence helpers ─────────────────────────────────────────────
+
+/// Apply an accounting write on a fresh connection in queue order.
+pub(super) async fn persist_usage_turn(
+    persistence: &DiscussPersistence,
+    session_id: &str,
+    turn: &DiscussTurnRecord,
+    entries: &[DiscussModelUsageEntry],
+    update: bool,
+) -> Result<(), DiscussError> {
+    if turn.discuss_session_id != session_id {
+        return Err(DiscussError::Validation {
+            message: "accounting turn identity mismatch".to_owned(),
+        });
+    }
+    let mut conn = persistence.acquire_connection().await?;
+    if update {
+        super::storage::update_turn_usage(&mut conn, turn, entries).await
+    } else {
+        super::storage::insert_usage_turn(&mut conn, turn, entries).await
+    }
+}
+
+/// Write a non-session allowance observation using the shared connection factory.
+pub(super) async fn persist_allowance_observation(
+    persistence: &DiscussPersistence,
+    observation: &DiscussAllowanceObservation,
+) -> Result<(), DiscussError> {
+    let conn = persistence.acquire_connection().await?;
+    super::storage::insert_allowance_observation(&conn, observation).await
+}
+
+/// Replace the non-session models catalog using the shared connection factory.
+pub(super) async fn persist_models_catalog(
+    persistence: &DiscussPersistence,
+    catalog: &DiscussModelsCatalog,
+) -> Result<(), DiscussError> {
+    let conn = persistence.acquire_connection().await?;
+    super::storage::replace_models_catalog(&conn, catalog).await
+}
+
+/// Run ledger retention using the shared connection factory.
+pub(super) async fn persist_accounting_prune(
+    persistence: &DiscussPersistence,
+    cutoff_ms: i64,
+) -> Result<(), DiscussError> {
+    let mut conn = persistence.acquire_connection().await?;
+    super::storage::prune_accounting_ledger(&mut conn, cutoff_ms).await
+}
 
 /// Persist a user prompt as a `discuss_chat_turns` row (fire-and-forget).
 ///
@@ -717,6 +833,7 @@ pub(super) async fn persist_session_open(
 
 pub(super) fn retained_team_assets(
     library: AssetLibrary,
+    custom_teams: &[CustomTeamDefinition],
     installations: &[DiscussTeamInstallationRow],
     current_leader_id: &str,
     agent_scope_key: &str,
@@ -740,6 +857,18 @@ pub(super) fn retained_team_assets(
             if plugin.skill_scope_key() == skill_scope_key {
                 retain_skills.extend(team.skills.iter().cloned());
             }
+        } else if let Some(team) = custom_teams
+            .iter()
+            .find(|team| team.leader.as_ref() == installation.leader_id)
+        {
+            let plugin = plugins::for_agent(&installation.provider_name);
+            if plugin.agent_scope_key() == agent_scope_key {
+                retain_agents.insert(team.leader.clone());
+                retain_agents.extend(team.followers.iter().cloned());
+            }
+            if plugin.skill_scope_key() == skill_scope_key {
+                retain_skills.extend(team.skills.iter().cloned());
+            }
         }
     }
     (retain_agents, retain_skills)
@@ -747,14 +876,21 @@ pub(super) fn retained_team_assets(
 
 pub(super) fn retained_team_assets_by_scope(
     library: AssetLibrary,
+    custom_teams: &[CustomTeamDefinition],
     installations: &[DiscussTeamInstallationRow],
 ) -> RetainedTeamAssetsByScope {
     let mut retained_agents = BTreeMap::new();
     let mut retained_skills = BTreeMap::new();
     for installation in installations {
-        let Some(team) = library
+        let builtin = library
             .teams_for()
-            .find(|team| team.leader.as_ref() == installation.leader_id)
+            .find(|team| team.leader.as_ref() == installation.leader_id);
+        let custom = custom_teams
+            .iter()
+            .find(|team| team.leader.as_ref() == installation.leader_id);
+        let Some((leader, followers, skills)) = builtin
+            .map(|team| (&team.leader, team.followers.as_ref(), team.skills.as_ref()))
+            .or_else(|| custom.map(|team| (&team.leader, team.followers.as_slice(), team.skills.as_slice())))
         else {
             continue;
         };
@@ -762,12 +898,12 @@ pub(super) fn retained_team_assets_by_scope(
         let retain_agents = retained_agents
             .entry(plugin.agent_scope_key())
             .or_insert_with(BTreeSet::new);
-        retain_agents.insert(team.leader.clone());
-        retain_agents.extend(team.followers.iter().cloned());
+        retain_agents.insert(leader.clone());
+        retain_agents.extend(followers.iter().cloned());
         let retain_skills = retained_skills
             .entry(plugin.skill_scope_key())
             .or_insert_with(BTreeSet::new);
-        retain_skills.extend(team.skills.iter().cloned());
+        retain_skills.extend(skills.iter().cloned());
     }
     (retained_agents, retained_skills)
 }
@@ -784,7 +920,16 @@ pub async fn validate_member_overrides(
     team: &TeamDefinition,
     overrides: DiscussMemberOverrides,
 ) -> Result<DiscussMemberOverrides, DiscussError> {
-    let valid_members = team_member_ids(team).into_iter().collect::<BTreeSet<_>>();
+    validate_member_overrides_for_ids(conn, provider_name, team_member_ids(team), overrides).await
+}
+
+pub(super) async fn validate_member_overrides_for_ids(
+    conn: &Connection,
+    provider_name: &str,
+    members: Vec<String>,
+    overrides: DiscussMemberOverrides,
+) -> Result<DiscussMemberOverrides, DiscussError> {
+    let valid_members = members.into_iter().collect::<BTreeSet<_>>();
     let options = load_discuss_agent_config(conn, provider_name)
         .await?
         .and_then(|row| row.config_options_json)

@@ -9,7 +9,6 @@ mod checkpoints;
 mod controllers;
 mod cron;
 mod database;
-mod default_workspace;
 mod domain;
 mod graph;
 mod handle;
@@ -37,13 +36,14 @@ pub use ast::{
 };
 pub use blackboard::{BoundInputs, BoundOutputs};
 pub use cron::{CronExpression, CronTriggerConfig, FlowTriggerRecord};
+pub use database::{ExecutionDocumentLink, FlowStore};
 pub use domain::{FlowControlService, FlowDomain, FlowTriggerSourceService};
-pub use graph::{FlowGraphAst, GraphNode};
+pub use graph::{FlowGraph, FlowGraphAst, GraphNode};
 pub use hook::{
     FlowAppCheckpointCommittedContext, FlowAppCheckpointContext, FlowAppCheckpointFuture, FlowAppCheckpointResult,
     FlowAppHookContext, FlowAppHookError, FlowAppHookFuture, FlowAppLandingContext, FlowAppRestoreContext,
     FlowAppRestoreFuture, FlowAppTakeoffContext, FlowAppTakeoffFuture, FlowAppTakeoffResult, FlowAppWorkspaceHook,
-    FlowWorkspaceFuture,
+    FlowWorkspaceFuture, FlowWorkspaceHookBoot, FlowWorkspaceHookFactory, FlowWorkspaceHookFuture,
 };
 pub use messages::{
     AbortInput, CreateFlowInput, CreateFlowTriggerInput, DeleteFlowInput, DeleteFlowTriggerInput,
@@ -58,15 +58,15 @@ pub use messages::{
     dispatch_update_flow_trigger, flow_operation_descriptors_with_root_error, rpc_router,
 };
 pub use mobility::{
-    FlowActivationAcknowledgement, FlowAuthorityState, FlowMobilityCommitAcknowledgement, FlowMobilitySnapshot,
-    FlowYieldAcknowledgement,
+    FlowActivationAcknowledgement, FlowAuthorityState, FlowExecutionNativeReferences,
+    FlowMobilityCommitAcknowledgement, FlowMobilitySnapshot, FlowYieldAcknowledgement,
 };
 pub use registration::{
-    CancellationDisposition, NodeKind, NodeKindDescriptor, NodeKindRegistration, NodeLifecycleContext,
-    NodeLifecycleDispatchError, NodeLifecycleResult, NodeRegistrationSupply, SideEffectDisposition,
-    WorkspacePreparation, WorkspacePreparationError, WorkspaceSeed,
+    CancellationDisposition, FlowNodeRegistry, NodeKind, NodeKindDescriptor, NodeKindRegistration,
+    NodeLifecycleContext, NodeLifecycleDispatchError, NodeLifecycleResult, NodeRegistrationSupply,
+    SideEffectDisposition, WorkspacePreparation, WorkspacePreparationError, WorkspaceSeed,
 };
-pub use snapshot::{NodeExecutionSnapshot, NodeExecutionStatus};
+pub use snapshot::{ExecutionSnapshot, ExecutionSnapshotStore, NodeExecutionSnapshot, NodeExecutionStatus};
 pub use triggers::{FlowStartRequest, TriggerAdapterRegistration, TriggerRegistry};
 pub use types::{
     BlackboardError, ControllerError, FlowAdapterError, FlowBootOptions, FlowCronError, FlowDefinition, FlowError,
@@ -74,4 +74,5 @@ pub use types::{
     FlowInvocationKind, FlowMobilityDestination, FlowNodeId, FlowRegistrationError, FlowSettings, FlowTimestamp,
     FlowWorkspaceMapping, FlowWorkspaceMappingMode, FlowWorkspaceSourceError, FlowWorkspaceSourceService,
     NodeExecutionId, ScriptSourceLocation, SnapshotError, TickError, TriggerRegistrationError, WorkspaceError,
+    checked_relative, mapping_destination, validate_mappings,
 };

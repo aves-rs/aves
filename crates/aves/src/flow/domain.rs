@@ -128,16 +128,7 @@ where
                 .cloned()
                 .unwrap_or_default();
 
-            // TODO: when the "default" impl of the workspace trait moves into sluice
-            // revert this hard wiring so that machine is an optional peer to flow and
-            // flow simply turns off the machine sync services when not connected.
-            //
-            // The only reason this block is here is because the current default workspace
-            // implementation requires blobs and docs.
-            let machine = facade
-                .input::<MachinePeerServices>()
-                .expect("peer services must be supplied")
-                .clone();
+            let machine = facade.input::<MachinePeerServices>().cloned();
             let bus = facade.bus_mut();
 
             Box::pin(async move {
@@ -166,7 +157,7 @@ where
                     trigger_registry,
                     config_context,
                     pairing_owner,
-                    &machine,
+                    machine.as_ref(),
                 )
                 .await;
 

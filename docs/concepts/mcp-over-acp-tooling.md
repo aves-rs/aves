@@ -1,7 +1,7 @@
 ---
 title: MCP-over-ACP Tooling
 type: concept
-updated: 2026-10-23
+updated: 2026-11-17
 references:
   - crates/corv/src/discuss/mcp.rs
   - crates/corv/src/discuss/mcp_http.rs
@@ -23,8 +23,7 @@ references:
 
 Corv exposes eligible application bus operations as flat MCP tools to opted-in
 ACP agents. The preferred transport is native MCP-over-ACP; a loopback HTTP
-lease is the fallback when the agent lacks native ACP. External MCP access is
-not permitted.
+lease is the fallback. External MCP access is not permitted.
 
 ## Key points
 
@@ -96,6 +95,6 @@ Both transports reach the same `ApplicationMcpService` with a worker-local `BusR
 ## Related
 
 - [Discuss Domain Architecture](../architecture/corv/discuss-domain.md) — worker-token lifecycle and typed errors
-- [Bus JWT Admission](bus-jwt-admission.md) — worker JWT admission boundary
-- [Aves Auth Domain Architecture](../architecture/aves/auth-domain.md) — delegated worker JWT issuance and JTI revocation
+- [Bus JWT Admission](bus-jwt-admission.md) and [Aves Auth Domain Architecture](../architecture/aves/auth-domain.md) — worker JWT admission, issuance and JTI revocation
+- [Discuss Custom MCP](discuss-custom-mcp.md) — user-supplied MCP servers composed into a session
 - `crates/aves/AGENTS.md`

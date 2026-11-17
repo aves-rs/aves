@@ -77,16 +77,25 @@ mod tests {
             json!({"criteria": ["low"]}),
         ];
         for (registration, question) in registrations.iter().zip(questions) {
-            let config = json!({"provider": "neutral", "model": "model", "state": "state", "question": question});
+            let config =
+                json!({"credentialId": uuid::Uuid::nil(), "model": "model", "state": "state", "question": question});
             assert!(registration.decode_configuration(config.clone()).is_ok());
             let mut invalid = config.clone();
             invalid["unexpected"] = json!(true);
             assert!(registration.decode_configuration(invalid).is_err());
-            for field in ["provider", "model"] {
+            for field in ["model"] {
                 let mut invalid = config.clone();
                 invalid[field] = json!("  ");
                 assert!(registration.decode_configuration(invalid).is_err());
             }
+            for field in ["provider", "endpoint"] {
+                let mut invalid = config.clone();
+                invalid[field] = json!("unexpected");
+                assert!(registration.decode_configuration(invalid).is_err());
+            }
+            let mut missing = config.clone();
+            missing.as_object_mut().unwrap().remove("credentialId");
+            assert!(registration.decode_configuration(missing).is_err());
         }
         for criteria in [
             json!({}),
@@ -96,7 +105,7 @@ mod tests {
             assert!(
                 registrations[1]
                     .decode_configuration(
-                        json!({"provider":"p", "model":"m", "state":"s", "question":{"criteria": criteria}})
+                        json!({"credentialId": uuid::Uuid::nil(), "model":"m", "state":"s", "question":{"criteria": criteria}})
                     )
                     .is_err()
             );
@@ -104,7 +113,7 @@ mod tests {
         assert!(
             registrations[2]
                 .decode_configuration(
-                    json!({"provider":"p", "model":"m", "state":"s", "question":{"criteria": vec!["level"; 11]}})
+                    json!({"credentialId": uuid::Uuid::nil(), "model":"m", "state":"s", "question":{"criteria": vec!["level"; 11]}})
                 )
                 .is_err()
         );
@@ -141,7 +150,7 @@ mod tests {
             DECIDE_SCORE_NODE_KIND => json!({"criteria": ["low"]}),
             _ => unreachable!(),
         };
-        let value = json!({"provider": "p", "model": "m", "state": "original", "question": question});
+        let value = json!({"credentialId": uuid::Uuid::nil(), "model": "m", "state": "original", "question": question});
         match kind {
             DECIDE_BOOL_NODE_KIND => DecideNodeConfig::Bool(serde_json::from_value(value).unwrap()),
             DECIDE_CHOICE_NODE_KIND => DecideNodeConfig::Choice(serde_json::from_value(value).unwrap()),
@@ -273,10 +282,10 @@ fn owner_error(error: DecideError) -> NodeLifecycleDispatchError {
     NodeLifecycleDispatchError::Owner(Box::new(error))
 }
 
-fn validate_names(provider: &str, model: &str) -> Result<(), FlowRegistrationError> {
-    if provider.trim().is_empty() || model.trim().is_empty() {
+fn validate_names(model: &str) -> Result<(), FlowRegistrationError> {
+    if model.trim().is_empty() {
         return Err(FlowRegistrationError::Configuration {
-            message: "provider and model must not be empty".into(),
+            message: "model must not be empty".into(),
         });
     }
     Ok(())
@@ -443,7 +452,7 @@ pub(super) fn decide_node_registrations(service: Arc<dyn DecideNodeLifecycleServ
         NodeKindRegistration::typed::<BoolNodeConfig, _, _, _, _, _, _, _>(
             descriptor(DECIDE_BOOL_NODE_KIND),
             |config| {
-                validate_names(&config.provider, &config.model)?;
+                validate_names(&config.model)?;
                 validate_question(config.question.validate())
             },
             |context, config| start(context, DecideNodeConfig::Bool(config)),
@@ -455,7 +464,7 @@ pub(super) fn decide_node_registrations(service: Arc<dyn DecideNodeLifecycleServ
         NodeKindRegistration::typed::<ChoiceNodeConfig, _, _, _, _, _, _, _>(
             descriptor(DECIDE_CHOICE_NODE_KIND),
             |config| {
-                validate_names(&config.provider, &config.model)?;
+                validate_names(&config.model)?;
                 validate_question(config.question.validate())
             },
             |context, config| start(context, DecideNodeConfig::Choice(config)),
@@ -467,7 +476,7 @@ pub(super) fn decide_node_registrations(service: Arc<dyn DecideNodeLifecycleServ
         NodeKindRegistration::typed::<ScoreNodeConfig, _, _, _, _, _, _, _>(
             descriptor(DECIDE_SCORE_NODE_KIND),
             |config| {
-                validate_names(&config.provider, &config.model)?;
+                validate_names(&config.model)?;
                 validate_question(config.question.validate())
             },
             |context, config| start(context, DecideNodeConfig::Score(config)),

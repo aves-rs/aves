@@ -19,7 +19,6 @@ use super::plugins::{
 use super::storage::{DiscussModelsCatalog, DiscussPersistence, load_models_catalog};
 use super::types::DiscussModelUsageEntry;
 
-const BASIS: &str = "base tier; tiered/batch/long-context rates not applied";
 const DAY: Duration = Duration::from_secs(86_400);
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
@@ -34,6 +33,7 @@ struct ProviderData {
 #[derive(Deserialize)]
 struct ModelData {
     cost: Option<RawCost>,
+    experimental: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +42,33 @@ struct RawCost {
     output: Box<RawValue>,
     cache_read: Option<Box<RawValue>>,
     cache_write: Option<Box<RawValue>>,
+    tiers: Option<Box<RawValue>>,
+}
+
+#[derive(Deserialize)]
+struct RawTier {
+    input: Box<RawValue>,
+    output: Box<RawValue>,
+    cache_read: Option<Box<RawValue>>,
+    cache_write: Option<Box<RawValue>>,
+    tier: RawTierBound,
+}
+
+#[derive(Deserialize)]
+struct RawTierBound {
+    #[serde(rename = "type")]
+    kind: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct RawExperimental {
+    modes: Option<HashMap<String, RawMode>>,
+}
+
+#[derive(Deserialize)]
+struct RawMode {
+    cost: Option<RawCost>,
 }
 
 struct Price {
@@ -49,11 +76,46 @@ struct Price {
     value: Decimal,
 }
 
-struct ModelCost {
+struct Rates {
     input: Price,
     output: Price,
     cache_read: Option<Price>,
     cache_write: Option<Price>,
+}
+
+/// Rates charged once the turn's context exceeds `above` tokens.
+struct ContextTier {
+    above: u64,
+    rates: Rates,
+}
+
+struct ModelCost {
+    base: Rates,
+    tiers: Vec<ContextTier>,
+    mode: Option<String>,
+}
+
+impl ModelCost {
+    /// Select the highest context tier the turn exceeds; unknown context uses base rates.
+    fn rates_for(&self, context_tokens: Option<u64>) -> (&Rates, Option<u64>) {
+        context_tokens
+            .and_then(|used| self.tiers.iter().rev().find(|tier| used > tier.above))
+            .map_or((&self.base, None), |tier| (&tier.rates, Some(tier.above)))
+    }
+
+    fn basis(&self, tier: Option<u64>, context_tokens: Option<u64>) -> String {
+        let mut basis = match &self.mode {
+            Some(mode) => format!("models.dev {mode} mode rates"),
+            None => "models.dev standard rates".to_owned(),
+        };
+        match (tier, context_tokens) {
+            (Some(above), _) => basis.push_str(&format!("; context tier above {above} tokens")),
+            (None, None) if !self.tiers.is_empty() => basis.push_str("; context unknown, context tiers not applied"),
+            _ => {}
+        }
+        basis.push_str("; batch rates not applied");
+        basis
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -73,26 +135,89 @@ fn parse_price(raw: &RawValue) -> Option<Price> {
     })
 }
 
+fn parse_rates(
+    input: &RawValue,
+    output: &RawValue,
+    cache_read: Option<&RawValue>,
+    cache_write: Option<&RawValue>,
+) -> Option<Rates> {
+    Some(Rates {
+        input: parse_price(input)?,
+        output: parse_price(output)?,
+        cache_read: optional_price(cache_read)?,
+        cache_write: optional_price(cache_write)?,
+    })
+}
+
+fn parse_cost(cost: &RawCost, mode: Option<&str>) -> Option<ModelCost> {
+    let base = parse_rates(
+        &cost.input,
+        &cost.output,
+        cost.cache_read.as_deref(),
+        cost.cache_write.as_deref(),
+    )?;
+    let mut tiers: Vec<ContextTier> = cost
+        .tiers
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<RawTier>>(raw.get()).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter(|tier| tier.tier.kind == "context")
+        .filter_map(|tier| {
+            Some(ContextTier {
+                above: tier.tier.size,
+                rates: parse_rates(
+                    &tier.input,
+                    &tier.output,
+                    tier.cache_read.as_deref(),
+                    tier.cache_write.as_deref(),
+                )?,
+            })
+        })
+        .collect();
+    tiers.sort_by_key(|tier| tier.above);
+    Some(ModelCost {
+        base,
+        tiers,
+        mode: mode.map(str::to_owned),
+    })
+}
+
+/// Index exact models first, then each priced mode as `<model>-<mode>` unless an exact entry owns that name.
 fn parse_catalog(body: &str) -> Result<Catalog, serde_json::Error> {
     let providers: HashMap<String, ProviderData> = serde_json::from_str(body)?;
     let mut catalog = HashMap::new();
+    let mut modes = Vec::new();
     for (provider, data) in providers {
         for (model, data) in data.models {
-            let Some(cost) = data.cost else { continue };
-            let parsed = (|| {
-                Some(ModelCost {
-                    input: parse_price(&cost.input)?,
-                    output: parse_price(&cost.output)?,
-                    cache_read: optional_price(cost.cache_read.as_deref())?,
-                    cache_write: optional_price(cost.cache_write.as_deref())?,
-                })
-            })();
-            if let Some(cost) = parsed {
-                catalog.insert((provider.clone(), model), cost);
-            } else {
-                tracing::debug!(%provider, %model, "Invalid model price");
+            if let Some(cost) = &data.cost {
+                match parse_cost(cost, None) {
+                    Some(cost) => {
+                        catalog.insert((provider.clone(), model.clone()), cost);
+                    }
+                    None => tracing::debug!(%provider, %model, "Invalid model price"),
+                }
+            }
+            let Some(experimental) = data
+                .experimental
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<RawExperimental>(raw.get()).ok())
+            else {
+                continue;
+            };
+            for (mode, raw) in experimental.modes.unwrap_or_default() {
+                if let Some(cost) = raw
+                    .cost
+                    .as_ref()
+                    .and_then(|cost| parse_cost(cost, Some(&mode)))
+                {
+                    modes.push(((provider.clone(), format!("{model}-{mode}")), cost));
+                }
             }
         }
+    }
+    for (key, cost) in modes {
+        catalog.entry(key).or_insert(cost);
     }
     Ok(catalog)
 }
@@ -125,12 +250,13 @@ impl PriceIndex {
 }
 
 impl PriceSnapshot {
-    /// Price one model using only an exact provider/model catalog match.
+    /// Price one model from its exact provider/model entry, or a `<model>-<mode>` mode entry, at the turn's context tier.
     pub(super) fn price(
         &self,
         entry: &mut DiscussModelUsageEntry,
         semantics: BillingCategorySemantics,
         provider: Option<&str>,
+        context_tokens: Option<u64>,
     ) {
         let missing = missing_categories(entry, semantics);
         entry.incomplete_categories = i64::from(missing);
@@ -155,17 +281,19 @@ impl PriceSnapshot {
         else {
             return;
         };
-        let (amount, missing) = calculate_cost(entry, semantics, cost);
+        let (rates, tier) = cost.rates_for(context_tokens);
+        let (amount, missing) = calculate_cost(entry, semantics, rates);
         entry.incomplete_categories |= i64::from(missing);
         if let Some(amount) = amount {
             entry.calculated_cost_usd = Some(amount.to_string());
-            entry.pricing_basis = Some(BASIS.to_owned());
+            entry.pricing_basis = Some(cost.basis(tier, context_tokens));
             entry.price_snapshot_json = Some(
                 serde_json::json!({
                     "provider": provider, "model": model, "fetched_at_ms": catalog.fetched_at_ms,
-                    "input": cost.input.text, "output": cost.output.text,
-                    "cache_read": cost.cache_read.as_ref().map(|price| &price.text),
-                    "cache_write": cost.cache_write.as_ref().map(|price| &price.text),
+                    "mode": cost.mode, "context_tokens": context_tokens, "context_tier_above": tier,
+                    "input": rates.input.text, "output": rates.output.text,
+                    "cache_read": rates.cache_read.as_ref().map(|price| &price.text),
+                    "cache_write": rates.cache_write.as_ref().map(|price| &price.text),
                 })
                 .to_string(),
             );
@@ -196,7 +324,7 @@ fn missing_categories(entry: &DiscussModelUsageEntry, semantics: BillingCategory
 fn calculate_cost(
     entry: &DiscussModelUsageEntry,
     semantics: BillingCategorySemantics,
-    cost: &ModelCost,
+    cost: &Rates,
 ) -> (Option<Decimal>, u8) {
     let mut missing = missing_categories(entry, semantics);
     if entry.input_tokens.is_none() {

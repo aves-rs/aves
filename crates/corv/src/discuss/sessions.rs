@@ -300,12 +300,12 @@ impl Actor {
         let provider_title = if transient_connectivity {
             None
         } else {
-            stored_launch
-                .as_ref()
-                .and_then(|row| row.display_title.as_deref())
-                .filter(|title| !title.trim().is_empty())
-                .map(str::to_owned)
-                .or(caller_title)
+            initial_provider_title(
+                stored_launch
+                    .as_ref()
+                    .and_then(|row| row.display_title.as_deref()),
+                caller_title,
+            )
         };
         let stored_cwd = stored_launch
             .as_ref()
@@ -1357,6 +1357,15 @@ impl Actor {
     }
 }
 
+/// Title pushed to the provider when a worker starts: a user rename wins over the caller's name, and
+/// a session started without a name keeps whatever title the provider gives it.
+fn initial_provider_title(stored_display_title: Option<&str>, caller_name: Option<String>) -> Option<String> {
+    stored_display_title
+        .filter(|title| !title.trim().is_empty())
+        .map(str::to_owned)
+        .or(caller_name)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Keep the moved session-worker reporting helper's inputs unchanged during the module refactor."
@@ -1650,5 +1659,34 @@ mod team_at_root_setup_tests {
         let kind = Actor::setup_kind_for(Some(&setup));
         let restored = Actor::restored_team_setup(&row(Some("chief-of-staff"), kind));
         assert_eq!(restored, Some(setup));
+    }
+}
+
+#[cfg(test)]
+mod provider_title_tests {
+    use super::initial_provider_title;
+
+    #[test]
+    fn user_rename_wins_over_the_callers_name() {
+        let title = initial_provider_title(Some("My own name"), Some("yach | Tidy | perform".to_owned()));
+
+        assert_eq!(title.as_deref(), Some("My own name"));
+    }
+
+    #[test]
+    fn callers_name_is_pushed_when_the_session_was_never_renamed() {
+        assert_eq!(
+            initial_provider_title(None, Some("Sonya | yach".to_owned())).as_deref(),
+            Some("Sonya | yach")
+        );
+        assert_eq!(
+            initial_provider_title(Some("   "), Some("Sonya | yach".to_owned())).as_deref(),
+            Some("Sonya | yach")
+        );
+    }
+
+    #[test]
+    fn unnamed_session_pushes_no_title() {
+        assert_eq!(initial_provider_title(None, None), None);
     }
 }

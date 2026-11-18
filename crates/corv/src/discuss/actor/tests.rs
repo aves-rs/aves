@@ -6957,3 +6957,91 @@ fn agent_node_limit_breach_keeps_typed_terminal_error() {
         }
     ));
 }
+
+/// Seed a renameable anchor and return its live-worker command receiver when `live` is set.
+async fn renameable_session(
+    actor: &mut Actor,
+    live: bool,
+) -> (DiscussSessionId, Option<mpsc::Receiver<WorkerCommand>>) {
+    let session_id = DiscussSessionId::new();
+    persist_session_anchor_inner(
+        &actor.persistence,
+        &session_id.to_string(),
+        SessionAnchorMetadata::default(),
+    )
+    .await
+    .expect("anchor");
+    if !live {
+        return (session_id, None);
+    }
+    let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>(1);
+    actor.worker_registry.insert(
+        session_id,
+        WorkerEntry {
+            active_turn: false,
+            agent_name: "agent".to_string(),
+            worker_jti: None,
+            command_tx,
+            join_handle: tokio::spawn(async {}),
+            acp_session_id: None,
+            desktop_association_requested: false,
+        },
+    );
+    (session_id, Some(command_rx))
+}
+
+async fn stored_display_title(actor: &Actor, session_id: DiscussSessionId) -> Option<String> {
+    let conn = actor
+        .persistence
+        .acquire_connection()
+        .await
+        .expect("connection");
+    load_discuss_session(&conn, &session_id.to_string())
+        .await
+        .expect("load")
+        .expect("row")
+        .display_title
+}
+
+/// A rename reaches the live worker so it can update the provider's title too.
+#[tokio::test]
+async fn rename_sends_the_trimmed_title_to_the_live_worker() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let (session_id, command_rx) = renameable_session(&mut actor, true).await;
+
+    let result = actor
+        .handle_rename_session(session_id, "  yach | Tidy the README | perform  ")
+        .await;
+
+    assert!(matches!(result, Ok(DiscussResponse::Success)), "got {result:?}");
+    assert_eq!(
+        stored_display_title(&actor, session_id).await.as_deref(),
+        Some("yach | Tidy the README | perform")
+    );
+    match command_rx.expect("live worker").try_recv() {
+        Ok(WorkerCommand::SetTitle { title }) => assert_eq!(title, "yach | Tidy the README | perform"),
+        Ok(_) => panic!("expected SetTitle, got a different worker command"),
+        Err(error) => panic!("the live worker received no title: {error}"),
+    }
+}
+
+/// Without a live worker the rename is still saved; the title reaches the provider when the session next starts.
+#[tokio::test]
+async fn rename_without_a_live_worker_is_still_saved() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let (session_id, _) = renameable_session(&mut actor, false).await;
+
+    let result = actor
+        .handle_rename_session(session_id, "Sonya | yach")
+        .await;
+
+    assert!(matches!(result, Ok(DiscussResponse::Success)), "got {result:?}");
+    assert_eq!(
+        stored_display_title(&actor, session_id).await.as_deref(),
+        Some("Sonya | yach")
+    );
+}

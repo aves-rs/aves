@@ -162,11 +162,8 @@ pub(super) async fn run_connected_session(
         opened,
     } = setup;
     let mut session = opened.session;
-    if title_supported
-        && let Some(title) = provider_title
-        && let Err(error) = send_session_title(&session, title).await
-    {
-        tracing::debug!(target: "application_acp", %error, "could not set provider session title");
+    if let Some(title) = provider_title {
+        push_provider_title(session.connection(), session.session_id(), title_supported, title).await;
     }
     let mut latest_config_options = opened.latest_config_options;
     let mut session_settings = opened.session_settings;
@@ -489,11 +486,7 @@ async fn pump_connected_session(
                         let _ = reply.send(result);
                     }
                     Some(WorkerCommand::SetTitle { title }) => {
-                        if *title_supported
-                            && let Err(error) = send_session_title(session, title).await
-                        {
-                            tracing::debug!(target: "application_acp", %error, "could not update provider session title");
-                        }
+                        push_provider_title(session.connection(), session.session_id(), *title_supported, title).await;
                     }
                     Some(WorkerCommand::ListProviderSessions { reply }) => {
                         let _ = reply.send(list_provider_sessions(session).await);
@@ -590,13 +583,18 @@ async fn list_provider_sessions(session: &WorkerSession) -> Result<Vec<ProviderS
         .map_err(DiscussError::from)
 }
 
-async fn send_session_title(session: &WorkerSession, title: String) -> Result<(), agent_client_protocol::Error> {
-    session
-        .connection()
-        .send_request(SetSessionTitleRequest::new(session.session_id().clone(), title))
+/// Best-effort `session/set_title`: sent only to agents that advertise it, and a failure never ends the session.
+async fn push_provider_title(connection: &ConnectionTo<Agent>, session_id: &SessionId, supported: bool, title: String) {
+    if !supported {
+        return;
+    }
+    if let Err(error) = connection
+        .send_request(SetSessionTitleRequest::new(session_id.clone(), title))
         .block_task()
-        .await?;
-    Ok(())
+        .await
+    {
+        tracing::debug!(target: "application_acp", %error, "could not set provider session title");
+    }
 }
 
 async fn load_provider_session(
@@ -1702,4 +1700,84 @@ async fn persist_set_config_option(
             message: error.to_string(),
         })??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use agent_client_protocol::v1::schema::{SessionId, SetSessionTitleRequest, SetSessionTitleResponse};
+    use agent_client_protocol::{Agent, Channel, Client, on_receive_request};
+
+    use super::push_provider_title;
+
+    /// Push one title through a real client connection to an in-process agent and report what the agent received.
+    async fn titles_received_by_agent(supported: bool, agent_accepts: bool) -> Vec<(String, String)> {
+        let (client_side, agent_side) = Channel::duplex();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let recorder = received.clone();
+        let agent = tokio::spawn(
+            Agent
+                .v1()
+                .on_receive_request(
+                    async move |request: SetSessionTitleRequest, responder, _connection| {
+                        recorder
+                            .lock()
+                            .unwrap()
+                            .push((request.session_id.to_string(), request.title.clone()));
+                        if agent_accepts {
+                            responder.respond(SetSessionTitleResponse::new(request.title))
+                        } else {
+                            responder.respond_with_internal_error("title rejected")
+                        }
+                    },
+                    on_receive_request!(),
+                )
+                .connect_to(agent_side),
+        );
+        Client
+            .v1()
+            .connect_with(client_side, async move |connection| {
+                push_provider_title(
+                    &connection,
+                    &SessionId::from("provider-session".to_owned()),
+                    supported,
+                    "yach | Tidy the README | perform".to_owned(),
+                )
+                .await;
+                Ok(())
+            })
+            .await
+            .expect("a failed provider title never fails the client connection");
+        agent.abort();
+        let received = received.lock().unwrap().clone();
+        received
+    }
+
+    #[tokio::test]
+    async fn supported_provider_receives_the_session_title() {
+        let received = titles_received_by_agent(true, true).await;
+
+        assert_eq!(
+            received,
+            [(
+                "provider-session".to_owned(),
+                "yach | Tidy the README | perform".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_provider_receives_no_title_request() {
+        let received = titles_received_by_agent(false, true).await;
+
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_rejecting_the_title_does_not_fail_the_session() {
+        let received = titles_received_by_agent(true, false).await;
+
+        assert_eq!(received.len(), 1);
+    }
 }

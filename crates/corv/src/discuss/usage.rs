@@ -293,7 +293,7 @@ fn assemble(active: &ActiveTurn) -> (DiscussTurnRecord, Vec<DiscussModelUsageEnt
                 price_snapshot_json: None,
             };
             if let Some((snapshot, semantics, provider)) = &active.pricing {
-                snapshot.price(&mut entry, *semantics, *provider);
+                snapshot.price(&mut entry, *semantics, *provider, turn.context_used_tokens);
             }
             entry
         })

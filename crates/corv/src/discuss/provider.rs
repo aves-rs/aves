@@ -35,7 +35,7 @@ use super::types::{
 };
 
 /// Connection plus native-ACP MCP, HTTP MCP and session system-prompt support.
-type SharedConnectionResult = Result<(ConnectionTo<Agent>, bool, bool, bool), agent_client_protocol::Error>;
+type SharedConnectionResult = Result<(ConnectionTo<Agent>, bool, bool, bool, bool), agent_client_protocol::Error>;
 
 impl Actor {
     /// Add a provider to the ACP server.
@@ -584,6 +584,11 @@ impl Actor {
                             .session_capabilities
                             .system_prompt
                             .is_some(),
+                        init_response
+                            .agent_capabilities
+                            .session_capabilities
+                            .title
+                            .is_some(),
                     )));
                     connection.incoming_closed().await;
                     Ok(())
@@ -596,7 +601,7 @@ impl Actor {
             stderr_task.abort();
             let _ = exit_tx.send(());
         });
-        let (connection, mcp_acp, mcp_http, system_prompt) =
+        let (connection, mcp_acp, mcp_http, system_prompt, title_supported) =
             Self::shared_connection_result(provider_name, ready_rx, &owner).await?;
         Ok(SharedConnectionReady {
             connection,
@@ -605,6 +610,7 @@ impl Actor {
             mcp_acp,
             mcp_http,
             system_prompt,
+            title_supported,
             callback_routes,
         })
     }
@@ -665,9 +671,9 @@ impl Actor {
         provider_name: &str,
         ready_rx: oneshot::Receiver<SharedConnectionResult>,
         owner: &JoinHandle<()>,
-    ) -> Result<(ConnectionTo<Agent>, bool, bool, bool), DiscussError> {
+    ) -> Result<(ConnectionTo<Agent>, bool, bool, bool, bool), DiscussError> {
         let ready_result = ready_rx.await;
-        let (connection, mcp_acp, mcp_http, system_prompt) = match ready_result {
+        let (connection, mcp_acp, mcp_http, system_prompt, title_supported) = match ready_result {
             Ok(Ok(ready)) => ready,
             Ok(Err(error)) => {
                 owner.abort();
@@ -681,7 +687,7 @@ impl Actor {
                 });
             }
         };
-        Ok((connection, mcp_acp, mcp_http, system_prompt))
+        Ok((connection, mcp_acp, mcp_http, system_prompt, title_supported))
     }
 
     async fn ensure_shared_provider_connection(&mut self, provider_name: &str) -> Result<(), DiscussError> {
@@ -712,6 +718,7 @@ impl Actor {
             mcp_acp,
             mcp_http,
             system_prompt,
+            title_supported,
             callback_routes,
             ..
         } = &mut supervisor.resources
@@ -720,6 +727,7 @@ impl Actor {
             *mcp_acp = ready.mcp_acp;
             *mcp_http = ready.mcp_http;
             *system_prompt = ready.system_prompt;
+            *title_supported = ready.title_supported;
             *callback_routes = Some(ready.callback_routes.clone());
             *connection_owner = Some(ready.owner);
         } else {
@@ -891,6 +899,7 @@ impl Actor {
                     mcp_acp,
                     mcp_http,
                     system_prompt,
+                    title_supported,
                     ..
                 } => {
                     supervisor.chat_sessions.clear();
@@ -899,6 +908,7 @@ impl Actor {
                     *mcp_acp = false;
                     *mcp_http = false;
                     *system_prompt = false;
+                    *title_supported = false;
                     (
                         connection_owner.take(),
                         connection_watcher.take(),

@@ -346,6 +346,7 @@ pub(super) struct TaskSessionStart {
     pub(super) launch_config: Option<SessionLaunchConfig>,
     pub(super) provider_name: String,
     pub(super) agent_name: String,
+    pub(super) session_name: Option<String>,
     pub(super) config_overrides: DiscussConfigValues,
     pub(super) application_mcp_enabled: bool,
     pub(super) prompt: String,
@@ -912,6 +913,8 @@ pub(crate) enum WorkerCommand {
         value: String,
         reply: oneshot::Sender<Result<(), DiscussError>>,
     },
+    /// Set the provider-side title for the active session.
+    SetTitle { title: String },
     /// List provider-side sessions for the active session's agent.
     ListProviderSessions {
         reply: oneshot::Sender<Result<Vec<ProviderSessionInfo>, DiscussError>>,
@@ -1548,6 +1551,8 @@ pub struct BuiltinSkillEntry {
     pub name: String,
     pub description: String,
     pub version: String,
+    /// Canonical `SKILL.md` contents from the application-supplied definition.
+    pub body: String,
 }
 
 /// Source of an installed asset claim.
@@ -1642,6 +1647,8 @@ pub struct TeamCatalogMember {
     pub name: String,
     /// Human-readable Agent job title.
     pub job_title: String,
+    /// Agent body (system prompt) from its built-in or custom definition.
+    pub body: String,
 }
 
 /// Origin of the currently available Team definition.

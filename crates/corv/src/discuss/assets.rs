@@ -578,6 +578,10 @@ impl Actor {
                 name: skill.name.to_owned(),
                 description: skill.description.to_owned(),
                 version: skill.version.to_string(),
+                body: skill
+                    .bundle
+                    .first()
+                    .map_or_else(String::new, |file| file.contents.to_owned()),
             })
             .collect();
         Ok(DiscussResponse::ListBuiltinSkills { entries })

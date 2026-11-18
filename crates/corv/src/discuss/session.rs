@@ -105,6 +105,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) discuss_session_id: DiscussSessionId,
     pub(super) auth_launch_server: McpServer,
     pub(super) session_name: String,
+    pub(super) provider_title: Option<String>,
     pub(super) agent_name: String,
     pub(super) primary_agent: Option<ResolvedAgent>,
     pub(super) reconnect_acp_session_id: Option<SessionId>,
@@ -140,6 +141,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) shared_mcp_capabilities: Option<(bool, bool)>,
     /// Whether the Provider advertises `sessionCapabilities.systemPrompt`.
     pub(super) system_prompt_supported: bool,
+    pub(super) title_supported: bool,
     pub(super) shared_mcp_registrations: Option<SharedMcpRegistrations>,
 }
 
@@ -963,43 +965,53 @@ pub(super) async fn open_configured_session(
     });
     let mut open = PrimaryAgentOpen::for_selection(primary_agent.as_ref(), options.system_prompt_supported)?;
     open.meta = plugins::merge_metadata(open.meta, options.launch_meta)?;
-    let session_response = if let Some(session_id) = options.reconnect_session_id {
-        let response = connection
-            .send_request(
-                load_session_request(session_id.clone(), options.cwd.clone(), &options.mcp_servers)
-                    .system_prompt(open.system_prompt)
-                    .meta(open.meta),
-            )
-            .block_task()
-            .await?;
-        NewSessionResponse::new(session_id).config_options(response.config_options)
-    } else {
-        connection
-            .send_request_to(Agent, {
-                let request = NewSessionRequest::new(options.cwd)
-                    .system_prompt(open.system_prompt)
-                    .meta(open.meta);
-                if options.mcp_servers.is_empty() {
-                    request
-                } else {
-                    request.mcp_servers(options.mcp_servers)
-                }
-            })
-            .block_task()
-            .await?
-    };
-
-    tracing::debug!(provider = provider_name, acp_session_id = %session_response.session_id, "ACP session open response received");
-    let initial_config_options = session_response.config_options.clone();
-    let initial_config_metadata = session_response.meta.clone();
-    let session = WorkerSession::attach(
-        connection,
-        session_response,
-        callback_target,
-        callback_router,
-        callback_routes,
-        callback_tx,
-    )?;
+    let (session, initial_config_options, initial_config_metadata) =
+        if let Some(session_id) = options.reconnect_session_id {
+            // Attach before loading: the provider replays history as `session/update` before it answers.
+            let session = WorkerSession::attach(
+                connection.clone(),
+                NewSessionResponse::new(session_id.clone()),
+                callback_target,
+                callback_router,
+                callback_routes,
+                callback_tx,
+            )?;
+            let response = connection
+                .send_request(
+                    load_session_request(session_id, options.cwd.clone(), &options.mcp_servers)
+                        .system_prompt(open.system_prompt)
+                        .meta(open.meta),
+                )
+                .block_task()
+                .await?;
+            (session, response.config_options, None)
+        } else {
+            let session_response = connection
+                .send_request_to(Agent, {
+                    let request = NewSessionRequest::new(options.cwd)
+                        .system_prompt(open.system_prompt)
+                        .meta(open.meta);
+                    if options.mcp_servers.is_empty() {
+                        request
+                    } else {
+                        request.mcp_servers(options.mcp_servers)
+                    }
+                })
+                .block_task()
+                .await?;
+            let initial_config_options = session_response.config_options.clone();
+            let initial_config_metadata = session_response.meta.clone();
+            let session = WorkerSession::attach(
+                connection,
+                session_response,
+                callback_target,
+                callback_router,
+                callback_routes,
+                callback_tx,
+            )?;
+            (session, initial_config_options, initial_config_metadata)
+        };
+    tracing::debug!(provider = provider_name, acp_session_id = %session.session_id(), "ACP session open response received");
 
     let normalized_options =
         agent_plugin.initial_config_options(initial_config_options.clone(), initial_config_metadata.as_ref());

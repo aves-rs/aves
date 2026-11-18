@@ -47,6 +47,8 @@ pub enum DiscussRequestPayload {
         launch_config: Option<SessionLaunchConfig>,
         provider_name: String,
         agent_name: String,
+        #[serde(default)]
+        session_name: Option<String>,
         config_overrides: DiscussConfigValues,
         application_mcp_enabled: bool,
         prompt: String,

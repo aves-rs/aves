@@ -1,6 +1,6 @@
 [package]
 name = "aves-corv"
-version = "0.15.0"
+version = "0.16.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Specialized discussion domain for the Aves async application runtime"
 authors = { workspace = true }
@@ -27,7 +27,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # internal
-aves = { path = "../aves", version = "=0.15.0", features = ["test-support"] }
+aves = { path = "../aves", version = "=0.16.0", features = ["test-support"] }
 
 # external
 tempfile = { workspace = true }
@@ -36,10 +36,10 @@ tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves = { path = "../aves", version = "=0.15.0" }
+aves = { path = "../aves", version = "=0.16.0" }
 
 # external
-agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp", "unstable_end_turn_token_usage"] }
+agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp", "unstable_end_turn_token_usage", "unstable_session_set_title"] }
 async-trait = { workspace = true }
 axum08 = { workspace = true }
 base64 = { workspace = true }

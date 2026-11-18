@@ -850,6 +850,7 @@ impl Actor {
                             agent_id: agent_id.to_string(),
                             name: agent.name.to_string(),
                             job_title: agent.job_title.to_string(),
+                            body: agent.body.to_string(),
                         })
                 })
                 .collect::<Option<Vec<_>>>();
@@ -900,14 +901,19 @@ impl Actor {
             let mut members = Vec::new();
             for id in std::iter::once(&team.leader).chain(&team.followers) {
                 let agent = self.resolve_agent(id).await?;
-                let (name, job_title) = match agent {
-                    ResolvedAgent::Builtin(agent) => (agent.name.to_string(), agent.job_title.to_string()),
-                    ResolvedAgent::Custom(agent) => (agent.name.clone(), agent.job_title.clone()),
+                let (name, job_title, body) = match agent {
+                    ResolvedAgent::Builtin(agent) => (
+                        agent.name.to_string(),
+                        agent.job_title.to_string(),
+                        agent.body.to_string(),
+                    ),
+                    ResolvedAgent::Custom(agent) => (agent.name.clone(), agent.job_title.clone(), agent.body.clone()),
                 };
                 members.push(TeamCatalogMember {
                     agent_id: id.to_string(),
                     name,
                     job_title,
+                    body,
                 });
             }
             let mut skill_names = Vec::new();

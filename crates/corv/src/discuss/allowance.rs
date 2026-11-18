@@ -1,60 +1,33 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use quota_core::model::{ProviderUsage, windows};
-use quota_core::{Registry, config::QuotaConfig};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 use super::database::persist_allowance_observation;
 use super::storage::{DiscussAllowanceObservation, DiscussPersistence};
+use super::types::{DiscussAllowanceProjection, DiscussAllowanceWindow, DiscussAllowanceWindows};
 
 const CAPACITY: usize = 8;
 const WINDOW_MS: i64 = 15 * 60 * 1000;
 type Key = (String, Option<String>);
 
-/// Actor-owned receiver and writer sender for one registry lifetime.
+/// Actor-owned writer sender for one server lifetime.
 pub(super) struct AllowanceService {
-    pub(super) observations: mpsc::Receiver<Vec<ProviderUsage>>,
-    pub(super) writer: mpsc::Sender<Vec<ProviderUsage>>,
-    registry_task: JoinHandle<()>,
+    pub(super) writer: mpsc::Sender<Vec<DiscussAllowanceProjection>>,
     writer_task: JoinHandle<()>,
 }
 
-/// Start a single read-only registry and its bounded observation writer.
-pub(super) fn spawn(persistence: DiscussPersistence, cancel: CancellationToken) -> AllowanceService {
-    let (observation_tx, observations) = mpsc::channel(CAPACITY);
+/// Start the bounded observation writer for host-supplied snapshots.
+pub(super) fn spawn(persistence: DiscussPersistence) -> AllowanceService {
     let (writer, writer_rx) = mpsc::channel(CAPACITY);
-    let registry_task = tokio::spawn(async move {
-        let registry = Registry::with_defaults(QuotaConfig::default(), None);
-        registry
-            .refresh_loop_observed(cancel, move |entries| {
-                let _ = observation_tx.try_send(entries);
-                std::future::ready(())
-            })
-            .await;
-    });
     let writer_task = tokio::spawn(write_observations(persistence, writer_rx));
-    AllowanceService {
-        observations,
-        writer,
-        registry_task,
-        writer_task,
-    }
+    AllowanceService { writer, writer_task }
 }
 
 impl AllowanceService {
-    /// Cancel externally, then drain registry output and finish pending writes.
-    pub(super) async fn stop(mut self) {
-        if let Err(error) = self.registry_task.await {
-            tracing::warn!(?error, "Allowance registry task failed");
-        }
-        while let Some(snapshot) = self.observations.recv().await {
-            if self.writer.send(snapshot).await.is_err() {
-                break;
-            }
-        }
+    /// Close the writer and finish pending writes.
+    pub(super) async fn stop(self) {
         drop(self.writer);
         if let Err(error) = self.writer_task.await {
             tracing::warn!(?error, "Allowance writer task failed");
@@ -62,26 +35,17 @@ impl AllowanceService {
     }
 }
 
-/// Display-only association; registry identity is unchanged.
-pub(super) fn display_provider(provider: &str) -> &str {
-    match provider {
-        "claude" => "claude-acp",
-        "codex" => "codex-acp",
-        "grok" => "grok-build",
-        "antigravity" => "antigravity-acp",
-        "opencode" => "opencode",
-        other => other,
-    }
-}
-
 struct Sample {
-    entry: ProviderUsage,
+    entry: DiscussAllowanceProjection,
     observed_at_ms: i64,
     window: i64,
     pending: bool,
 }
 
-async fn write_observations(persistence: DiscussPersistence, mut receiver: mpsc::Receiver<Vec<ProviderUsage>>) {
+async fn write_observations(
+    persistence: DiscussPersistence,
+    mut receiver: mpsc::Receiver<Vec<DiscussAllowanceProjection>>,
+) {
     let mut samples: HashMap<Key, Sample> = HashMap::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(30));
     loop {
@@ -98,7 +62,11 @@ async fn write_observations(persistence: DiscussPersistence, mut receiver: mpsc:
     }
 }
 
-async fn observe(persistence: &DiscussPersistence, samples: &mut HashMap<Key, Sample>, snapshot: Vec<ProviderUsage>) {
+async fn observe(
+    persistence: &DiscussPersistence,
+    samples: &mut HashMap<Key, Sample>,
+    snapshot: Vec<DiscussAllowanceProjection>,
+) {
     let now = chrono::Utc::now().timestamp_millis();
     let mut seen = HashSet::new();
     for entry in snapshot {
@@ -142,7 +110,7 @@ async fn observe(persistence: &DiscussPersistence, samples: &mut HashMap<Key, Sa
     }
 }
 
-async fn persist_disappearance(persistence: &DiscussPersistence, entry: &ProviderUsage, now: i64) {
+async fn persist_disappearance(persistence: &DiscussPersistence, entry: &DiscussAllowanceProjection, now: i64) {
     let entry_json = match serde_json::to_string(entry) {
         Ok(json) => json,
         Err(error) => {
@@ -168,14 +136,28 @@ async fn persist_disappearance(persistence: &DiscussPersistence, entry: &Provide
     }
 }
 
-fn reset_crossed(entry: &ProviderUsage, previous: i64, now: i64) -> bool {
+fn reset_crossed(entry: &DiscussAllowanceProjection, previous: i64, now: i64) -> bool {
     entry
-        .usage
+        .windows
         .iter()
         .flat_map(windows)
         .filter_map(|window| window.resets_at.as_deref())
         .filter_map(timestamp)
         .any(|reset| previous < reset && reset <= now)
+}
+
+/// Every populated rate window, including named extra windows.
+fn windows(windows: &DiscussAllowanceWindows) -> impl Iterator<Item = &DiscussAllowanceWindow> {
+    [&windows.primary, &windows.secondary, &windows.tertiary]
+        .into_iter()
+        .flatten()
+        .chain(
+            windows
+                .extra_rate_windows
+                .iter()
+                .flatten()
+                .filter_map(|extra| extra.window.as_ref()),
+        )
 }
 
 fn timestamp(value: &str) -> Option<i64> {

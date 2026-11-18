@@ -78,12 +78,12 @@ scale 6 with round-half-even.
 
 ## Allowance
 
-`getAllowanceReport` groups retained samples and projects each observation's typed
-provider usage: windows, pools, saved resets, stale marker, and error class. Provider
-names are the registry names; `display_provider` maps them to Discuss provider names for
-display only.
+`getAllowanceReport` groups retained samples and returns each stored
+`DiscussAllowanceProjection`: windows, pools, saved resets, stale marker, and error class.
+Provider names are the usage source's names; the embedding application supplies
+`display_provider` with the Discuss provider name for display and the provider filter.
 
-`getCurrentAllowance` reads the actor's in-memory snapshot, so it reflects the freshest completed observation. While the server is not running, or before the first observation arrives, it returns `AccountingUnavailable` — never empty data presented as "no allowance".
+`getCurrentAllowance` reads the actor's in-memory snapshot, so it reflects the latest snapshot recorded through `recordAllowance`. While the server is not running, or before the first observation arrives, it returns `AccountingUnavailable` — never empty data presented as "no allowance".
 
 ## Related
 

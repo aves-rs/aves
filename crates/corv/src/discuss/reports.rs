@@ -3,20 +3,16 @@
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{Datelike, Utc};
-use quota_core::model::{Amount, Pool, PoolBasis, PoolFunding, ProviderUsage, RateWindow, Usage};
 use rust_decimal::Decimal;
 
 use super::actor::Actor;
-use super::allowance::display_provider;
 use super::messages::DiscussResponse;
 use super::storage::{select_allowance_range, select_usage_range};
 use super::types::{
-    DiscussAllowanceAccountInfo, DiscussAllowanceAmount, DiscussAllowanceExtraWindow, DiscussAllowanceGroupBy,
-    DiscussAllowancePool, DiscussAllowanceProjection, DiscussAllowanceReport, DiscussAllowanceReportRow,
-    DiscussAllowanceResetKind, DiscussAllowanceSample, DiscussAllowanceSavedResets, DiscussAllowanceStale,
-    DiscussAllowanceWindow, DiscussAllowanceWindows, DiscussCompletionKind, DiscussError, DiscussHarnessCost,
-    DiscussHarnessCostKind, DiscussModelUsageEntry, DiscussReportKey, DiscussTurnRecord, DiscussUsageGroupBy,
-    DiscussUsageReport, DiscussUsageReportRow,
+    DiscussAllowanceGroupBy, DiscussAllowanceProjection, DiscussAllowanceReport, DiscussAllowanceReportRow,
+    DiscussAllowanceSample, DiscussCompletionKind, DiscussError, DiscussHarnessCost, DiscussHarnessCostKind,
+    DiscussModelUsageEntry, DiscussReportKey, DiscussTurnRecord, DiscussUsageGroupBy, DiscussUsageReport,
+    DiscussUsageReportRow,
 };
 
 const LIMIT: usize = 5_000;
@@ -123,122 +119,6 @@ fn add_decimal(target: &mut Option<Decimal>, value: Decimal) -> Result<(), Discu
             .ok_or(DiscussError::ReportAggregationOverflow)?,
     );
     Ok(())
-}
-
-fn allowance_window(window: &RateWindow) -> DiscussAllowanceWindow {
-    DiscussAllowanceWindow {
-        used_percent: window.used_percent,
-        raw_used_percent: window.raw_used_percent,
-        resets_at: window.resets_at.clone(),
-        window_minutes: window.window_minutes,
-        window_kind: window.window_kind.clone(),
-        used_count: window.used_count,
-        total_count: window.total_count,
-    }
-}
-
-fn allowance_windows(usage: &Usage) -> DiscussAllowanceWindows {
-    DiscussAllowanceWindows {
-        primary: usage.primary.as_ref().map(allowance_window),
-        secondary: usage.secondary.as_ref().map(allowance_window),
-        tertiary: usage.tertiary.as_ref().map(allowance_window),
-        extra_rate_windows: usage.extra_rate_windows.as_ref().map(|windows| {
-            windows
-                .iter()
-                .map(|extra| DiscussAllowanceExtraWindow {
-                    title: extra.title.clone(),
-                    id: extra.id.clone(),
-                    window: extra.window.as_ref().map(allowance_window),
-                })
-                .collect()
-        }),
-    }
-}
-
-fn allowance_amount(amount: &Amount) -> DiscussAllowanceAmount {
-    DiscussAllowanceAmount {
-        minor: amount.minor,
-        exponent: amount.exponent,
-        unit: amount.unit.clone(),
-    }
-}
-
-fn allowance_pool(pool: &Pool) -> DiscussAllowancePool {
-    let funding = match pool.funding {
-        PoolFunding::Granted => "granted",
-        PoolFunding::Purchased => "purchased",
-        PoolFunding::Subscription => "subscription",
-        PoolFunding::Unknown => "unknown",
-    };
-    let basis = match pool.basis {
-        PoolBasis::Reported => "reported",
-        PoolBasis::Derived => "derived",
-        PoolBasis::Unstated => "unstated",
-    };
-    DiscussAllowancePool {
-        id: pool.id.clone(),
-        label: pool.label.clone(),
-        funding: funding.to_owned(),
-        basis: basis.to_owned(),
-        remaining: pool.remaining.as_ref().map(allowance_amount),
-        total: pool.total.as_ref().map(allowance_amount),
-        spendable: pool.spendable,
-        resets_at: pool.resets_at.clone(),
-        expires_at: pool.expires_at.clone(),
-        unlimited: pool.unlimited,
-    }
-}
-
-fn allowance_projection(entry: &ProviderUsage) -> DiscussAllowanceProjection {
-    DiscussAllowanceProjection {
-        provider: entry.provider.clone(),
-        display_provider: display_provider(&entry.provider).to_owned(),
-        api_provider: entry.api_provider.clone(),
-        account: entry.account.clone(),
-        account_info: entry
-            .account_info
-            .as_ref()
-            .map(|info| DiscussAllowanceAccountInfo {
-                email: info.email.clone(),
-                org_name: info.org_name.clone(),
-                plan_type: info.plan_type.clone(),
-                subscription_renews_at: info.subscription_renews_at.clone(),
-                subscription_ends_at: info.subscription_ends_at.clone(),
-            }),
-        fetched_at: entry.fetched_at.clone(),
-        stale: entry.stale.as_ref().map(|stale| DiscussAllowanceStale {
-            since: stale.since.clone(),
-            class: stale.class.clone(),
-        }),
-        error: entry.error.clone(),
-        error_class: entry.error_class.clone(),
-        windows: entry.usage.as_ref().map(allowance_windows),
-        pools: entry
-            .spend
-            .as_ref()
-            .map(|pools| pools.iter().map(allowance_pool).collect()),
-        saved_resets: entry
-            .saved_resets
-            .as_ref()
-            .map(|resets| DiscussAllowanceSavedResets {
-                available_count: resets.available_count,
-                soonest_expires_at: resets.soonest_expires_at.clone(),
-                credit_expiries: resets
-                    .credits
-                    .iter()
-                    .map(|credit| credit.expires_at.clone())
-                    .collect(),
-                kinds: resets
-                    .kinds
-                    .iter()
-                    .map(|kind| DiscussAllowanceResetKind {
-                        kind: kind.kind.clone(),
-                        available_count: kind.available_count,
-                        soonest_expires_at: kind.soonest_expires_at.clone(),
-                    })
-                    .collect(),
-            }),
-    }
 }
 
 #[derive(Default)]
@@ -475,9 +355,14 @@ impl Actor {
         let observations = select_allowance_range(&conn, from, to).await?;
         let mut groups: BTreeMap<GroupKey, Vec<DiscussAllowanceSample>> = BTreeMap::new();
         for observation in observations {
+            let projection: DiscussAllowanceProjection =
+                serde_json::from_str(&observation.entry_json).map_err(|error| DiscussError::Persistence {
+                    code: "allowance_decode".to_owned(),
+                    message: error.to_string(),
+                })?;
             if provider
                 .as_ref()
-                .is_some_and(|p| p != &observation.provider && p != display_provider(&observation.provider))
+                .is_some_and(|p| p != &observation.provider && p != &projection.display_provider)
             {
                 continue;
             }
@@ -491,14 +376,8 @@ impl Actor {
                 DiscussAllowanceGroupBy::UtcWeek => GroupKey::Time(bucket(observation.observed_at_ms, 2)?),
                 DiscussAllowanceGroupBy::UtcMonth => GroupKey::Time(bucket(observation.observed_at_ms, 3)?),
             };
-            let entry: ProviderUsage =
-                serde_json::from_str(&observation.entry_json).map_err(|error| DiscussError::Persistence {
-                    code: "allowance_decode".to_owned(),
-                    message: error.to_string(),
-                })?;
-            let projection = allowance_projection(&entry);
             groups.entry(key).or_default().push(DiscussAllowanceSample {
-                display_provider: display_provider(&observation.provider).to_owned(),
+                display_provider: projection.display_provider.clone(),
                 provider: observation.provider,
                 account: observation.account_key,
                 observed_at_ms: observation.observed_at_ms,
@@ -524,11 +403,7 @@ impl Actor {
     }
 
     pub(super) fn current_allowance_response(&self) -> Result<DiscussResponse, DiscussError> {
-        let entries = self
-            .current_allowance()?
-            .iter()
-            .map(allowance_projection)
-            .collect();
+        let entries = self.current_allowance()?.to_vec();
         Ok(DiscussResponse::CurrentAllowance { entries })
     }
 }

@@ -223,6 +223,10 @@ pub enum DiscussRequestPayload {
     #[operation(name = "getCurrentAllowance", kind = "query", response = CurrentAllowanceOutput, response_variant = "CurrentAllowance")]
     GetCurrentAllowance,
 
+    /// Replace the current allowance snapshot supplied by the embedding application.
+    #[operation(name = "recordAllowance", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    RecordAllowance { entries: Vec<DiscussAllowanceProjection> },
+
     /// Get the database-backed provider menu and defaults for an installed provider.
 
     #[operation(name = "getProviderConfig", kind = "query", response = ProviderConfigOutput, response_variant = "ProviderConfig")]

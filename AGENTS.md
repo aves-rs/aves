@@ -9,6 +9,9 @@ This repository contains the reusable Aves runtime and three optional domain cra
 | `crates/corv/` | Discuss (ACP sessions, Teams, MCP) and Decide (bounded model questions) | [Corv](crates/corv/AGENTS.md) |
 | `crates/kea/` | Knowledge notes, Data, Canvas | [Kea](crates/kea/AGENTS.md) |
 | `crates/tyto/` | Messaging subscriptions, Send, Flow nodes | [Tyto](crates/tyto/AGENTS.md) |
+| `crates/utils/` | Unpublished, git-only `aves-utils`: Subscription (provider allowance observation recorded into Discuss) | — |
+
+`aves-utils` is `publish = false`, excluded from `cargo release` and the publish workflow, and consumed by applications through git. It depends on Aves and Corv by registry version so a git consumer unifies them with its own registry crates; the root `[patch.crates-io]` keeps this workspace on local sources.
 
 ## Boundaries
 

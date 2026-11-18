@@ -1,6 +1,6 @@
 [package]
 name = "aves-corv"
-version = "0.16.0"
+version = "0.17.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Specialized discussion domain for the Aves async application runtime"
 authors = { workspace = true }
@@ -8,10 +8,7 @@ edition = { workspace = true }
 keywords = ["async", "runtime", "actors", "rpc", "workflow"]
 categories = ["asynchronous"]
 readme = "README.md"
-# TODO: restore `publish = ["crates-io"]` once `quota-core` is available on crates.io
-# (insula's crate is `publish = false` and the crates.io `quota-core` is an unrelated project)
-# or allowance moves behind an application-supplied usage source.
-publish = false
+publish = ["crates-io"]
 include = ["Cargo.toml", "README.md", "src/**", "migrations/**"]
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -27,7 +24,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # internal
-aves = { path = "../aves", version = "=0.16.0", features = ["test-support"] }
+aves = { path = "../aves", version = "=0.17.0", features = ["test-support"] }
 
 # external
 tempfile = { workspace = true }
@@ -36,7 +33,7 @@ tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves = { path = "../aves", version = "=0.16.0" }
+aves = { path = "../aves", version = "=0.17.0" }
 
 # external
 agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp", "unstable_end_turn_token_usage", "unstable_session_set_title"] }
@@ -44,7 +41,6 @@ async-trait = { workspace = true }
 axum08 = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
-quota-core = { workspace = true }
 rmcp = { workspace = true }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
 rspc = { workspace = true }

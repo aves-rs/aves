@@ -839,7 +839,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aves"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "arc-malachitebft-app-channel",
  "arc-malachitebft-codec",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "aves-corv"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -907,7 +907,6 @@ dependencies = [
  "axum 0.8.9",
  "base64 0.23.1",
  "chrono",
- "quota-core",
  "reqwest 0.13.5",
  "rmcp",
  "rspc",
@@ -932,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "aves-kea"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "aves",
  "chrono",
@@ -955,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "aves-tyto"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "async-imap",
  "async-trait",
@@ -986,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "aves_macros"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1840,31 +1839,6 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
-
-[[package]]
-name = "cortexkit-lease"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a0fc0f64f4fa68109464728f7c4d2afd5b676ff8d11d1e99cd2d022f6bc02a1"
-dependencies = [
- "fs2",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "cortexkit-paths"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57e7ea934b88f1cd195c79fdeb56bda1a4595252a444eba543689fda561ea7a4"
-
-[[package]]
-name = "cortexkit-provider-usage"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6da78d395a731c1562504c5cdb737b3c22ef713876f60ff122bcc8f2622818dc"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "cow-utils"
@@ -3019,12 +2993,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
 
 [[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
 name = "fastbloom"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3159,16 +3127,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
 ]
 
 [[package]]
@@ -5478,17 +5436,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libsqlite3-sys"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
-dependencies = [
- "cc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "libyaml-rs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7752,33 +7699,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quota-core"
-version = "0.3.0"
-source = "git+https://github.com/cortexkit/insula?tag=v0.3.0#f75f800517fe85b29c2f2f10c16314079d947906"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "cortexkit-lease",
- "cortexkit-paths",
- "cortexkit-provider-usage",
- "futures-util",
- "hmac 0.12.1",
- "libc",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_ignored",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tokio-util",
- "url",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8422,20 +8342,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusqlite"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
-dependencies = [
- "bitflags 2.13.1",
- "fallible-iterator",
- "fallible-streaming-iterator",
- "hashlink 0.9.1",
- "libsqlite3-sys",
- "smallvec",
-]
-
-[[package]]
 name = "rust-stemmers"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8909,16 +8815,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
-]
-
-[[package]]
-name = "serde_ignored"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
-dependencies = [
- "serde",
- "serde_core",
 ]
 
 [[package]]

@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use agent_client_protocol::Agent;
 use agent_client_protocol::v1::{ConnectionTo, schema::SessionId};
-use quota_core::model::ProviderUsage;
 use semver::Version;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -41,10 +40,10 @@ use super::storage::{
 };
 use super::supervisor::{CallbackRouteRegistry, ProviderSupervisor};
 use super::types::{
-    AcpProvider, ActorInboundPorts, AgentNodeTerminalResult, DiscussConfigOption, DiscussElicitationAnswer,
-    DiscussError, DiscussImageAttachment, DiscussMemberOverrides, DiscussPermissionOption, DiscussSessionId,
-    DiscussSessionSetup, DiscussStreamEvent, ElicitationRequestId, InspectorBinding, PendingElicitation,
-    PendingPermission, PendingPermissionRegistry, SessionLaunchConfig, WorkerEntry, WorkerRegistry,
+    AcpProvider, ActorInboundPorts, AgentNodeTerminalResult, DiscussAllowanceProjection, DiscussConfigOption,
+    DiscussElicitationAnswer, DiscussError, DiscussImageAttachment, DiscussMemberOverrides, DiscussPermissionOption,
+    DiscussSessionId, DiscussSessionSetup, DiscussStreamEvent, ElicitationRequestId, InspectorBinding,
+    PendingElicitation, PendingPermission, PendingPermissionRegistry, SessionLaunchConfig, WorkerEntry, WorkerRegistry,
     WorkspaceCopySourceRequest, WorkspaceCopySources,
 };
 
@@ -234,7 +233,7 @@ pub(super) struct Actor {
     /// Authoritative lifecycle state for ACP sessions.
     pub(super) server_running: bool,
     pub(super) price_index: PriceIndex,
-    pub(super) allowance_snapshot: Option<Vec<ProviderUsage>>,
+    pub(super) allowance_snapshot: Option<Vec<DiscussAllowanceProjection>>,
     accounting_cancel: Option<CancellationToken>,
     allowance: Option<AllowanceService>,
     pricing_task: Option<JoinHandle<()>>,
@@ -243,13 +242,23 @@ pub(super) struct Actor {
 
 impl Actor {
     /// Return the most recent observed allowance snapshot while the server is running.
-    pub(super) fn current_allowance(&self) -> Result<&[ProviderUsage], DiscussError> {
+    pub(super) fn current_allowance(&self) -> Result<&[DiscussAllowanceProjection], DiscussError> {
         if !self.server_running {
             return Err(DiscussError::AccountingUnavailable);
         }
         self.allowance_snapshot
             .as_deref()
             .ok_or(DiscussError::AccountingUnavailable)
+    }
+
+    /// Replace the current allowance snapshot and queue it for sampled persistence.
+    fn record_allowance(&mut self, entries: Vec<DiscussAllowanceProjection>) -> Result<DiscussResponse, DiscussError> {
+        let Some(service) = &self.allowance else {
+            return Err(DiscussError::AccountingUnavailable);
+        };
+        let _ = service.writer.try_send(entries.clone());
+        self.allowance_snapshot = Some(entries);
+        Ok(DiscussResponse::Success)
     }
 
     pub async fn new(
@@ -508,6 +517,7 @@ impl Actor {
                     .await
             }
             DiscussRequestPayload::GetCurrentAllowance => self.current_allowance_response(),
+            DiscussRequestPayload::RecordAllowance { entries } => self.record_allowance(entries),
             DiscussRequestPayload::StartAgent {
                 correlation,
                 launch_config,
@@ -945,7 +955,7 @@ impl Actor {
                 cancel.clone(),
                 self.price_index.clone(),
             ));
-            self.allowance = Some(super::allowance::spawn(self.persistence.clone(), cancel.clone()));
+            self.allowance = Some(super::allowance::spawn(self.persistence.clone()));
             self.accounting_cancel = Some(cancel);
             self.allowance_snapshot = None;
             self.server_running = true;
@@ -1249,6 +1259,7 @@ fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
         DiscussRequestPayload::GetSpendReport { .. } => "getSpendReport",
         DiscussRequestPayload::GetAllowanceReport { .. } => "getAllowanceReport",
         DiscussRequestPayload::GetCurrentAllowance => "getCurrentAllowance",
+        DiscussRequestPayload::RecordAllowance { .. } => "recordAllowance",
         DiscussRequestPayload::StartAgent { .. } => "startAgent",
         DiscussRequestPayload::TickAgent { .. } => "tickAgent",
         DiscussRequestPayload::CancelAgentExecution { .. } => "cancelAgentExecution",
@@ -1377,15 +1388,6 @@ pub(super) async fn run_actor(mut actor: Actor) {
                         tracing::warn!(?error, "Accounting retention prune failed");
                     }
                 }
-            }
-            Some(snapshot) = async {
-                match actor.allowance.as_mut() {
-                    Some(service) => service.observations.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(service) = &actor.allowance { let _ = service.writer.try_send(snapshot.clone()); }
-                actor.allowance_snapshot = Some(snapshot);
             }
             Some(request) = actor.workspace_copy_source_rx.recv() => {
                 let result = actor.resolve_workspace_copy_sources(request.provider_names);

@@ -1,7 +1,7 @@
 ---
 title: Discuss Accounting Ledgers
 type: concept
-updated: 2026-11-17
+updated: 2026-11-18
 references:
   - crates/corv/migrations/0005_accounting_ledgers.sql
   - crates/corv/src/discuss/usage.rs
@@ -60,7 +60,7 @@ A model is priced only on an exact `(provider, model)` catalog match. `pricing_b
 
 ## Allowance
 
-`allowance.rs` runs one `quota_core::Registry::with_defaults` (pinned to the `insula` tag `v0.3.0`) in-process. No `subc` binary, no daemon, no spawned helper process. `codex.auto_use_resets` stays disabled and the registry's reset-redemption API is never called.
+Corv does not fetch allowance data. The embedding application polls its provider-usage source, converts each snapshot to `DiscussAllowanceProjection`, and sends it with the public `discuss.recordAllowance` operation. Corv rejects it with `AccountingUnavailable` while the Discuss server is stopped. Each accepted snapshot replaces the actor's current copy and goes to `allowance.rs`, which stores the projection JSON in `entry_json`; reports read it back unchanged.
 
 Observations are written at most once per 15-minute window per `(provider, account)`, plus an immediate row on a structural transition (error class change, account appears or disappears, reset time crossed). The live snapshot is the actor's in-memory copy and is exact; the history is a sample series.
 

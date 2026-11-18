@@ -5,6 +5,7 @@ members = [
   "crates/corv",
   "crates/kea",
   "crates/tyto",
+  "crates/utils",
 ]
 resolver = "2"
 
@@ -12,6 +13,15 @@ resolver = "2"
 authors = ["Aves Authors <engineering@sluice.trade>"]
 edition = "2024"
 version = "0.1.0"
+
+# aves-utils is git-only and resolves Aves crates by registry version so a git
+# consumer unifies them with its own registry Aves; this patch keeps the
+# workspace on the local sources.
+[patch.crates-io]
+aves = { path = "crates/aves" }
+aves_macros = { path = "crates/aves/macros" }
+aves-corv = { path = "crates/corv" }
+aves-kea = { path = "crates/kea" }
 
 [workspace.dependencies]
 agent-client-protocol = { version = "=5.3.0" }
@@ -38,7 +48,7 @@ axum08 = { package = "axum", version = "=0.8.9", default-features = false, featu
 ] }
 base64 = { version = "=0.23.1" }
 bonsai-bt = { version = "=0.14.0" }
-bytes = { version = "=1.12.1", default-features = false }
+bytes = { version = "=1.12.2", default-features = false }
 chacha20poly1305 = { version = "=0.11.0" }
 chrono = { version = "=0.4.45", features = ["serde"] }
 croner = { version = "=4.0.3" }
@@ -54,7 +64,7 @@ iroh-gossip = { version = "=0.101.0" } # required by iroh-docs
 jsonwebtoken = { version = "=12.0.0", default-features = false, features = ["rust_crypto"] }
 keyring = { version = "=4.2.0", features = ["v1"] }
 keyring-core = { version = "=1.0.1" }
-lettre = { version = "=0.11.23", default-features = false, features = [
+lettre = { version = "=0.11.24", default-features = false, features = [
   "tokio1",
   "tokio1-native-tls",
   "smtp-transport",
@@ -66,13 +76,14 @@ oxc = { version = "=0.158.0", features = [
   "codegen",
   "semantic",
   "transformer",
-] }
+] } # > than this version needs rust 1.98
 pkcs8 = { version = "=0.11.0", features = ["alloc"] }
 proc-macro2 = { version = "=1.0.107" }
+quota-core = { git = "https://github.com/cortexkit/insula", tag = "v0.3.0" }
 quote = { version = "=1.0.47" }
-ractor = { version = "=0.15.10", features = ["async-trait"] } # required by malachite
+ractor = { version = "=0.15.10", features = ["async-trait"] } # exact version required by malachite
 rand = { version = "=0.10.4" }
-rmcp = { version = "=3.10.0", features = [
+rmcp = { version = "=3.11.0", features = [
   "macros",
   "server",
   "transport-io",
@@ -89,7 +100,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde-big-array = { version = "=0.5.1" }
 serde_json = { version = "=1.0.154" }
 sha2 = { version = "=0.11.1" }
-slack-morphism = { version = "=2.33.0", default-features = false, features = [
+slack-morphism = { version = "=2.34.0", default-features = false, features = [
   "hyper",
 ] }
 specta = { version = "=2.0.0-rc.22", features = [ # rspc allows no higher
@@ -109,15 +120,15 @@ tokio-util = { version = "=0.7.20" }
 toml = { version = "=1.2.1" }
 tower = { version = "=0.5.3" }
 tracing = { version = "=0.1.44" }
-turbovault-core = { version = "=4.0.1" }
-turbovault-parser = { version = "=4.0.1" }
-turbovault-tools = { version = "=4.0.1" }
-turbovault-vault = { version = "=4.0.1" }
+turbovault-core = { version = "=4.1.0" }
+turbovault-parser = { version = "=4.1.0" }
+turbovault-tools = { version = "=4.1.0" }
+turbovault-vault = { version = "=4.1.0" }
 turso = { version = "=0.8.3", default-features = false }
 url = { version = "=2.5.8" }
-uuid = { version = "=1.29.2", features = ["serde", "v4"] }
-wasmtime = { version = "=50.0.1" }
-wasmtime-wasi = { version = "=50.0.1", features = ["p1"] }
+uuid = { version = "=1.29.3", features = ["serde", "v4"] }
+wasmtime = { version = "=50.0.2" }
+wasmtime-wasi = { version = "=50.0.2", features = ["p1"] }
 yaml_serde = { version = "=0.10.7" }
 zbus-secret-service-keyring-store = { version = "=1.0.1" }
-zeroize = { version = "=1.9.1", features = ["derive"] }
+zeroize = { version = "=1.9.2", features = ["derive"] }

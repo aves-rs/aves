@@ -249,9 +249,14 @@ pub fn iso_to_ms(iso: &str) -> Result<i64, TimeParseError> {
     parse_rfc3339_utc(iso).map(|dt| dt.timestamp_millis())
 }
 
+/// Returns the current UTC time in milliseconds since Unix epoch.
+pub fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
 /// Returns the current UTC timestamp in the same millisecond format as [`ms_to_iso`].
 pub fn now_iso() -> String {
-    ms_to_iso(Utc::now().timestamp_millis())
+    ms_to_iso(now_ms())
 }
 
 #[cfg(test)]

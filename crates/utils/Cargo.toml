@@ -1,0 +1,38 @@
+[package]
+name = "aves-utils"
+version = "0.20.0"
+repository = "https://github.com/aves-rs/aves"
+description = "Unpublished utility domains for Aves applications, consumed through git"
+authors = { workspace = true }
+edition = { workspace = true }
+publish = false
+rust-version = "1.97"
+license = "Apache-2.0"
+
+[package.metadata.release]
+release = false
+
+[lib]
+name = "aves_utils"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[dependencies]
+# internal: registry versions so git consumers unify with their own Aves crates
+aves = { version = "=0.20.0" }
+aves-corv = { version = "=0.20.0" }
+
+# external
+async-trait = { workspace = true }
+quota-core = { workspace = true }
+rspc = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+specta = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

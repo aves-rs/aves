@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
@@ -196,13 +197,29 @@ impl CallbackRouter {
     }
 }
 
-/// Session whose live MCP endpoints a shared Provider uses for each workspace.
+/// Idle time after which a shared Provider may have discarded a workspace's MCP registration.
+///
+/// OpenCode evicts an idle workspace after about an hour and reboots it with
+/// its config-file servers only, so the registration is renewed well before.
+const MCP_REGISTRATION_IDLE_REFRESH: Duration = Duration::from_secs(30 * 60);
+
+/// MCP registration state of one shared Provider workspace.
+struct WorkspaceMcpRegistration {
+    /// Session whose live endpoints serve the workspace, if any.
+    owner: Option<DiscussSessionId>,
+    /// Turns currently running in the workspace across all of its sessions.
+    active_turns: usize,
+    /// Last registration, turn start or turn end in the workspace.
+    last_activity: Instant,
+}
+
+/// Live MCP registration per shared Provider workspace.
 ///
 /// Shared Providers may register MCP servers per workspace rather than per
 /// session, so the newest session's endpoints serve every session in that
-/// workspace until its worker ends.
+/// workspace until its worker ends or the Provider drops the idle workspace.
 #[derive(Clone, Default)]
-pub(super) struct SharedMcpRegistrations(Arc<SyncMutex<HashMap<PathBuf, DiscussSessionId>>>);
+pub(super) struct SharedMcpRegistrations(Arc<SyncMutex<HashMap<PathBuf, WorkspaceMcpRegistration>>>);
 
 impl SharedMcpRegistrations {
     /// Record that this session's endpoints now serve `workspace`.
@@ -212,12 +229,13 @@ impl SharedMcpRegistrations {
             workspace: workspace.to_path_buf(),
             discuss_session_id,
             generation: 0,
+            turn_active: false,
         };
         claim.reclaim();
         claim
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, DiscussSessionId>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, WorkspaceMcpRegistration>> {
         self.0.lock().expect("shared MCP registration lock")
     }
 }
@@ -231,12 +249,22 @@ pub(super) struct McpRegistrationClaim {
     workspace: PathBuf,
     discuss_session_id: DiscussSessionId,
     generation: u64,
+    turn_active: bool,
 }
 
 impl McpRegistrationClaim {
-    /// Whether no live session's endpoints serve this workspace.
-    pub(super) fn is_stale(&self) -> bool {
-        !self.registrations.lock().contains_key(&self.workspace)
+    /// Whether the workspace's endpoints must be registered again before a turn.
+    ///
+    /// True when no live session's endpoints serve the workspace, or when the
+    /// workspace has no running turn and has idled long enough for the Provider
+    /// to have discarded the registration.
+    pub(super) fn needs_refresh(&self) -> bool {
+        match self.registrations.lock().get(&self.workspace) {
+            Some(registration) if registration.owner.is_some() => {
+                registration.active_turns == 0 && registration.last_activity.elapsed() >= MCP_REGISTRATION_IDLE_REFRESH
+            }
+            _ => true,
+        }
     }
 
     /// Advance the registration generation used to make a re-registration distinct.
@@ -247,16 +275,56 @@ impl McpRegistrationClaim {
 
     /// Record that this session's endpoints serve the workspace again.
     pub(super) fn reclaim(&self) {
-        self.registrations
-            .lock()
-            .insert(self.workspace.clone(), self.discuss_session_id);
+        let mut registrations = self.registrations.lock();
+        let registration = registrations
+            .entry(self.workspace.clone())
+            .or_insert_with(WorkspaceMcpRegistration::idle);
+        registration.owner = Some(self.discuss_session_id);
+        registration.last_activity = Instant::now();
+    }
+
+    /// Record this session's turn starting or ending as workspace activity.
+    pub(super) fn set_turn_active(&mut self, active: bool) {
+        if self.turn_active == active {
+            return;
+        }
+        self.turn_active = active;
+        let mut registrations = self.registrations.lock();
+        let registration = registrations
+            .entry(self.workspace.clone())
+            .or_insert_with(WorkspaceMcpRegistration::idle);
+        registration.active_turns = if active {
+            registration.active_turns + 1
+        } else {
+            registration.active_turns.saturating_sub(1)
+        };
+        registration.last_activity = Instant::now();
+    }
+}
+
+impl WorkspaceMcpRegistration {
+    fn idle() -> Self {
+        Self {
+            owner: None,
+            active_turns: 0,
+            last_activity: Instant::now(),
+        }
     }
 }
 
 impl Drop for McpRegistrationClaim {
     fn drop(&mut self) {
         let mut registrations = self.registrations.lock();
-        if registrations.get(&self.workspace) == Some(&self.discuss_session_id) {
+        let Some(registration) = registrations.get_mut(&self.workspace) else {
+            return;
+        };
+        if registration.owner == Some(self.discuss_session_id) {
+            registration.owner = None;
+        }
+        if self.turn_active {
+            registration.active_turns = registration.active_turns.saturating_sub(1);
+        }
+        if registration.owner.is_none() && registration.active_turns == 0 {
             registrations.remove(&self.workspace);
         }
     }

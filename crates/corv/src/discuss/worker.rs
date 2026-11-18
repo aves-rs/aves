@@ -524,6 +524,9 @@ async fn pump_connected_session(
                 }
             }
         }
+        if let Some(claim) = &mut **mcp_claim {
+            claim.set_turn_active(!**awaiting_turn);
+        }
     }
     Ok(())
 }
@@ -545,14 +548,15 @@ async fn teardown_connected_worker(
 }
 
 /// Re-registers this session's MCP endpoints when the shared Provider's
-/// workspace registration still points at an ended session's endpoints.
+/// workspace registration points at an ended session's endpoints, or the
+/// workspace idled long enough for the Provider to have discarded it.
 async fn refresh_stale_mcp_registration(
     session: &WorkerSession,
     agents_workspace: &Path,
     mcp_descriptors: &[McpServer],
     claim: &mut McpRegistrationClaim,
 ) {
-    if !claim.is_stale() {
+    if !claim.needs_refresh() {
         return;
     }
     let request = ResumeSessionRequest::new(session.session_id().clone(), agents_workspace.to_path_buf())
@@ -565,10 +569,10 @@ async fn refresh_stale_mcp_registration(
     {
         Ok(_) => {
             claim.reclaim();
-            tracing::info!(target: "application_acp", acp_session_id = %session.session_id(), "re-registered stale shared MCP endpoints");
+            tracing::info!(target: "application_acp", acp_session_id = %session.session_id(), "re-registered stale or idle shared MCP endpoints");
         }
         Err(error) => {
-            tracing::warn!(target: "application_acp", ?error, acp_session_id = %session.session_id(), "could not re-register stale shared MCP endpoints");
+            tracing::warn!(target: "application_acp", ?error, acp_session_id = %session.session_id(), "could not re-register stale or idle shared MCP endpoints");
         }
     }
 }

@@ -312,12 +312,16 @@ impl SessionCallbackRouter {
             .cloned()
     }
 
-    async fn forward(&self, target: CallbackRouteTarget, event: CallbackEvent) -> Result<(), CallbackEvent> {
+    /// Returns the undelivered event, boxed, when the target has no live queue.
+    async fn forward(&self, target: CallbackRouteTarget, event: CallbackEvent) -> Result<(), Box<CallbackEvent>> {
         let queue = self.routes.lock().await.queue_for(&target);
         let Some(queue) = queue else {
-            return Err(event);
+            return Err(Box::new(event));
         };
-        queue.send(event).await.map_err(|send_error| send_error.0)
+        queue
+            .send(event)
+            .await
+            .map_err(|send_error| Box::new(send_error.0))
     }
 
     async fn fail_closed(event: CallbackEvent) -> Result<(), agent_client_protocol::Error> {
@@ -345,7 +349,7 @@ impl SessionCallbackRouter {
             target: target.clone(),
         };
         if let Err(event) = self.forward(target, event).await {
-            Self::fail_closed(event).await?;
+            Self::fail_closed(*event).await?;
         }
         Ok(())
     }
@@ -390,7 +394,7 @@ impl SessionCallbackRouter {
                     .await
                     .take_elicitation(correlation_id);
             }
-            Self::fail_closed(event).await?;
+            Self::fail_closed(*event).await?;
         }
         Ok(Handled::Yes)
     }
@@ -622,7 +626,8 @@ impl SessionCapabilitiesCache {
 }
 
 pub(super) struct SessionWorkerFailure {
-    pub(super) error: DiscussError,
+    /// Boxed so the worker's `Err` variant stays small.
+    pub(super) error: Box<DiscussError>,
     pub(super) terminal_auth_methods: Vec<super::types::DiscussTerminalAuthMethod>,
 }
 
@@ -631,7 +636,7 @@ pub async fn run(agent: AcpAgent, params: WorkerSessionParams) -> Result<(), Ses
         Some(connection) => run_connected_session(params, connection)
             .await
             .map_err(|error| SessionWorkerFailure {
-                error: DiscussError::from(error),
+                error: Box::new(DiscussError::from(error)),
                 terminal_auth_methods: Vec::new(),
             }),
         None => run_isolated(agent, params).await,

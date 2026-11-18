@@ -111,7 +111,7 @@ pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -
 
     let terminal_auth_methods = captured_terminal_auth_methods.lock().await.clone();
     result.map_err(|error| SessionWorkerFailure {
-        error: DiscussError::from(error),
+        error: Box::new(DiscussError::from(error)),
         terminal_auth_methods,
     })
 }

@@ -85,7 +85,7 @@ pub(super) fn append_installed_instructions(
         path: path.to_string_lossy().into_owned(),
         message: error.to_string(),
     };
-    let rendered = std::fs::read_to_string(&path).map_err(&capture_error)?;
+    let rendered = std::fs::read_to_string(&path).map_err(capture_error)?;
     let contents = if agent {
         plugin.append_agent_instructions(&rendered, instructions)?
     } else {

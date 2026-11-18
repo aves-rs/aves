@@ -107,11 +107,9 @@ fn display_provider(provider: &str) -> &str {
     match provider {
         "claude" => "claude-acp",
         "codex" => "codex-acp",
-        "grok" => "grok-build",
         "antigravity" => "antigravity-acp",
-        "opencode" => "opencode",
-        "opencodego" => "opencode",
-        "opencode-go" => "opencode",
+        "grok" | "cursor" | "xai" => "grok-build",
+        "opencode" | "opencodego" | "opencode-go" => "opencode",
         other => other,
     }
 }

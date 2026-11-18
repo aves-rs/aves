@@ -1,6 +1,6 @@
 [package]
 name = "aves-utils"
-version = "0.20.0"
+version = "0.21.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Unpublished utility domains for Aves applications, consumed through git"
 authors = { workspace = true }
@@ -21,11 +21,14 @@ tempfile = { workspace = true }
 
 [dependencies]
 # internal: registry versions so git consumers unify with their own Aves crates
-aves = { version = "=0.20.0" }
-aves-corv = { version = "=0.20.0" }
+aves = { version = "=0.21.0" }
+aves-corv = { version = "=0.21.0" }
 
 # external
+aes = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
+cbc = { workspace = true }
 quota-core = { workspace = true }
 rspc = { workspace = true }
 schemars = { workspace = true }

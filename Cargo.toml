@@ -39,6 +39,7 @@ async-imap = { version = "=0.12.0", default-features = false, features = [
   "runtime-tokio",
   "tokio",
 ] }
+aes = { version = "=0.9.4" }
 async-trait = { version = "=0.1.92" }
 axum = { version = "=0.7.9" } # limited by rspc-axum's version
 axum08 = { package = "axum", version = "=0.8.9", default-features = false, features = [
@@ -49,6 +50,7 @@ axum08 = { package = "axum", version = "=0.8.9", default-features = false, featu
 base64 = { version = "=0.23.1" }
 bonsai-bt = { version = "=0.14.0" }
 bytes = { version = "=1.12.2", default-features = false }
+cbc = { version = "=0.2.1" }
 chacha20poly1305 = { version = "=0.11.0" }
 chrono = { version = "=0.4.45", features = ["serde"] }
 croner = { version = "=4.0.3" }
@@ -70,13 +72,13 @@ lettre = { version = "=0.11.24", default-features = false, features = [
   "smtp-transport",
   "builder",
 ] }
-mail-parser = { version = "=0.11.9" } # > than this version needs rust 1.98
+mail-parser = { version = "=1.0.1" }
 native-tls = { version = "=0.2.18" }
-oxc = { version = "=0.158.0", features = [
+oxc = { version = "=0.159.0", features = [
   "codegen",
   "semantic",
   "transformer",
-] } # > than this version needs rust 1.98
+] }
 pkcs8 = { version = "=0.11.0", features = ["alloc"] }
 proc-macro2 = { version = "=1.0.107" }
 quota-core = { git = "https://github.com/cortexkit/insula", tag = "v0.3.0" }

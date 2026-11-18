@@ -1,10 +1,11 @@
 //! Credential plugin boundary for allowance observation.
 //!
-//! Each plugin reads one CLI's own login file and serves it to insula under that
+//! Each plugin reads one login file and serves it to insula under that
 //! provider's vault credential id. Tokens are never refreshed or written back; an
 //! expired login stays unusable until its CLI refreshes it.
 
 mod claude;
+mod cursor;
 mod grok;
 
 #[cfg(test)]
@@ -19,9 +20,10 @@ use quota_core::credential_source::{CredentialSource, ScopedRowState, ScopedSnap
 use aves::utils::time::now_ms;
 
 use claude::PLUGIN as CLAUDE_PLUGIN;
+use cursor::PLUGIN as CURSOR_PLUGIN;
 use grok::PLUGIN as GROK_PLUGIN;
 
-const PLUGINS: [&dyn CredentialPlugin; 2] = [&CLAUDE_PLUGIN, &GROK_PLUGIN];
+const PLUGINS: [&dyn CredentialPlugin; 3] = [&CLAUDE_PLUGIN, &GROK_PLUGIN, &CURSOR_PLUGIN];
 
 /// One provider's CLI login, served to insula as a scoped vault credential.
 trait CredentialPlugin: Sync {
@@ -86,18 +88,18 @@ impl CredentialSource for CliCredentials {
         })
     }
 
+    /// Every present login lists as `ready`, expired or not: insula skips `needs_reauth` rows entirely,
+    /// whereas a ready row is fetched, refused locally by `get_scoped`, and published as `credential_unusable`.
     async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
-        let now = now_ms();
         let rows = PLUGINS
             .iter()
             .filter_map(|plugin| {
                 let login = plugin.login(&self.home)?;
-                let state = if login.usable(now, 0) { "ready" } else { "needs_reauth" };
                 Some(ScopedRowState {
                     credential_id: plugin.credential_id().to_owned(),
                     credential_type: "oauth".to_owned(),
                     record_version: login.record_version,
-                    state: state.to_owned(),
+                    state: "ready".to_owned(),
                     account_id: login.account_id,
                 })
             })

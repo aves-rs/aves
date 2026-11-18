@@ -41,9 +41,7 @@ use super::super::library::AgentId;
 use super::super::migration::MIGRATIONS as DISCUSS_MIGRATIONS;
 use super::super::sessions::dedupe_session_list;
 use super::super::test_library;
-use super::super::{
-    agents::*, config::*, database::*, elicitation::*, messages::*, session::*, storage::*, supervisor::*, types::*,
-};
+use super::super::{agents::*, config::*, database::*, elicitation::*, messages::*, session::*, storage::*, types::*};
 use super::*;
 
 async fn open_local_db(config_dir: &Path) -> Result<turso::Database, DatabaseError> {

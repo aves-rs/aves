@@ -1397,6 +1397,7 @@ async fn run_session_worker_with_reporting(
             error,
             terminal_auth_methods,
         } = error;
+        let error = *error;
         tracing::warn!(?error, "Discuss session worker stopped");
         if let Some(transient_worker_tx) = transient_worker_tx {
             let _ = transient_worker_tx

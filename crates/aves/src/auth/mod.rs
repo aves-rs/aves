@@ -21,5 +21,6 @@ pub use jwt::Jwt;
 pub use pairing::{AuthFirstContactHandler, PairingInvitation, PairingOwner};
 pub use peer::{PeerEndpoint, PeerRecord, PeerTrustState};
 pub use types::{
-    ApprovedIssuer, AuthAdmissionRegistry, AuthCapability, AuthProjection, AvesAuthError, MachineIssuerId,
+    ApprovedIssuer, AuthAdmissionRegistry, AuthCapability, AuthProjection, AvesAuthError, ConnectionRegistration,
+    MachineIssuerId, NativeProtocol, OperationGrants, PeerGrants, QualifiedOperation, RelationshipKey,
 };

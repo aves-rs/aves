@@ -8,6 +8,7 @@ target
 target/
 **/*.rs.bk
 *.pdb
+.cargo/local.toml
 
 # Logs
 logs

@@ -1,6 +1,6 @@
 [package]
 name = "aves"
-version = "0.21.0"
+version = "0.22.0"
 repository = "https://github.com/aves-rs/aves"
 description = "Typed async application runtime with domain messaging, RPC, and durable workflow automation"
 authors = { workspace = true }
@@ -36,7 +36,7 @@ tower = { workspace = true, features = ["util"] }
 
 [dependencies]
 # internal
-aves_macros = { path = "macros", version = "=0.21.0" }
+aves_macros = { path = "macros", version = "=0.22.0" }
 
 # external
 arc-malachitebft-app-channel.workspace = true
@@ -66,6 +66,7 @@ iroh-docs = { workspace = true }
 iroh-gossip = { workspace = true }
 jsonwebtoken = { workspace = true }
 keyring = { workspace = true }
+num-integer = { workspace = true }
 oxc = { workspace = true }
 pkcs8 = { workspace = true }
 ractor = { workspace = true }

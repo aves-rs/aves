@@ -5,12 +5,17 @@
 
 mod abci;
 mod actor;
+mod authority;
 mod chain;
 mod domain;
 mod handle;
+mod membership;
 mod network;
+mod notices;
 mod persistence;
+mod roster;
 mod serialization;
+mod sharing;
 mod signing;
 mod transaction;
 mod types;
@@ -18,11 +23,21 @@ mod types;
 pub mod messages;
 
 pub use domain::CoordinationDomain;
+pub use domain::CoordinationSigningService;
 pub use messages::{CoordinationBroadcast, CoordinationRequestPayload, CoordinationResponse};
+pub use signing::MachineRecord as SignableMachineRecord;
 pub use types::{
-    BlobHash, ChainRecord, CommittedSnapshot, CoordinationError, CoordinationEventId, CoordinationExecutionId,
-    CoordinationFlowId, DomainId, EncKey, ExecutionCancelled, ExecutionCreated, ExecutionLanded, ExecutionRecord,
-    Height, MachineBound, MachineId, MachineRecord, MachineRegistered, MachineUnbound, PublicKey, RecordHash,
-    Regenesis, SchemaActivated, SignedBody, SnapshotDecided, UserEncRotated, UserId, UserRecord, UserRegistered,
-    UserRevoked, UserRootRotated, UserSuccessorLinked, ValidatorSet,
+    AUTHORITY_RULES_VERSION, Acceptance, BlobHash, ChainHalted, ChainKind, ChainPolicyChanged, ChainPolicyRecord,
+    ChainRecord, CommittedSnapshot, CoordinationError, CoordinationEventId, CoordinationExecutionId,
+    CoordinationFlowId, DomainId, EffectiveValidator, EncKey, EnvelopeAddition, EnvelopeRef, ExecutionCancelled,
+    ExecutionCreated, ExecutionLanded, ExecutionRecord, GenesisDescriptor, GenesisFingerprint, Height, Invitation,
+    InvitationId, InvitationRecord, MachineBound, MachineId, MachineRecord, MachineRegistered, MachineUnbound,
+    MemberAuthority, MemberAuthorityUpdated, MemberIdentityProof, MemberMachineCertUpdate,
+    MemberMachineSelfRegistration, MemberPowerChanged, MemberPowerRecord, MemberRecord, MemberRemoved, MemberStatus,
+    MemberValidatorSplitChanged, MemberValidatorSplitRecord, MembershipDecision, OwnerRegistration, PublicKey,
+    PublicationEnvelopeRef, PublicationRecord, PublishedRecordRef, RecordAttestation, RecordHash, Regenesis,
+    RegisteredTransaction, SchemaActivated, ScopedPublicationKey, ShareGrantChanged, ShareScope, SharingBootstrap,
+    SharingDecision, SharingNotice, SharingNoticeKey, SharingNoticeRecord, SharingNoticeState, SharingResponse,
+    SignedBody, SnapshotDecided, SourceProof, StoryPublished, UserEncRotated, UserId, UserRecord, UserRegistered,
+    UserRevoked, UserRootRotated, UserSuccessorLinked, ValidatorSet, ValidatorSplitPart, VerificationReport,
 };

@@ -10,13 +10,14 @@ use super::handle::{self, ConstructionResult};
 use super::messages::{
     AuthPrivilegedCreateInvitation, AuthPrivilegedFirstContact, AuthPrivilegedIssueJwt, AuthPrivilegedIssuePeerJwt,
     AuthPrivilegedIssueRootJwt, AuthPrivilegedListPairingCandidates, AuthPrivilegedListPeers, AuthPrivilegedPairPeer,
-    AuthPrivilegedRevokeJti, AuthPrivilegedRevokePeer, AuthPrivilegedVerifyJwt, AuthRequest, AuthRequestPayload,
-    AuthSudoServicePrivilegeMapping, CreateInvitationInput, DelegatedJwtIssuedOutput, FirstContactInput,
-    FirstContactedOutput, InvitationOutput, IssueJwtInput, IssuePeerJwtInput, IssueRootJwtInput, JwtIssuedOutput,
-    ListPairingCandidatesInput, ListPeersInput, PairPeerInput, PairingCandidatesOutput, PeerJwtIssuedOutput,
-    PeersOutput, RevokeJtiInput, RevokePeerInput, SuccessOutput, VerifiedOutput, VerifyJwtInput,
+    AuthPrivilegedReadPeerGrants, AuthPrivilegedRevokeJti, AuthPrivilegedRevokePeer, AuthPrivilegedSetPeerRelationship,
+    AuthPrivilegedVerifyJwt, AuthRequest, AuthRequestPayload, AuthSudoServicePrivilegeMapping, CreateInvitationInput,
+    DelegatedJwtIssuedOutput, FirstContactInput, FirstContactedOutput, InvitationOutput, IssueJwtInput,
+    IssuePeerJwtInput, IssueRootJwtInput, JwtIssuedOutput, ListPairingCandidatesInput, ListPeersInput, PairPeerInput,
+    PairingCandidatesOutput, PeerGrantsOutput, PeerJwtIssuedOutput, PeersOutput, ReadPeerGrantsInput, RevokeJtiInput,
+    RevokePeerInput, SetPeerRelationshipInput, SuccessOutput, VerifiedOutput, VerifyJwtInput,
 };
-use super::types::AvesAuthError;
+use super::types::{AvesAuthError, PeerGrants};
 
 /// Empty lifecycle marker for the built-in Auth domain.
 pub struct AuthDomain;
@@ -26,6 +27,7 @@ pub struct AuthBootOptions {
     pub namespace: String,
     pub audience: Uuid,
     pub peer_config_path: PathBuf,
+    pub confirmation_grants: PeerGrants,
 }
 
 aves::domain! {
@@ -48,6 +50,8 @@ aves::domain! {
         ListPairingCandidates => PairingCandidates (operation = "listPairingCandidates"),
         CreateInvitation => Invitation (operation = "createInvitation"),
         FirstContact => FirstContacted (operation = "firstContact"),
+        SetPeerRelationship => Success (operation = "setPeerRelationship"),
+        ReadPeerGrants => PeerGrants (operation = "readPeerGrants"),
     }
 }
 
@@ -78,6 +82,10 @@ where
                     namespace: options.namespace.clone(),
                     audience: options.audience,
                     peer_config_path: options.peer_config_path.clone(),
+                    confirmation_grants: facade
+                        .input::<PeerGrants>()
+                        .cloned()
+                        .unwrap_or_else(|| options.confirmation_grants.clone()),
                 }
             };
 
@@ -112,8 +120,12 @@ fn construct_auth_domain(
     options: &AuthBootOptions,
     publisher: ServicePublisher<dyn AuthSudoService>,
 ) -> Result<(ConstructionResult, Receiver<AuthRequest>), AvesAuthError> {
-    let (construction, sudo_requests) =
-        handle::construct(&options.namespace, options.audience, &options.peer_config_path)?;
+    let (construction, sudo_requests) = handle::construct(
+        &options.namespace,
+        options.audience,
+        &options.peer_config_path,
+        options.confirmation_grants.clone(),
+    )?;
 
     publisher
         .publish(construction.service.clone())

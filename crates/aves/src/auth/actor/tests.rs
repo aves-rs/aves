@@ -32,6 +32,12 @@ fn approved_issuer_contains_the_local_machine_issuer() {
     let local_issuer = MachineIssuerId::from(keyring.secret_key().public());
     let accepted_issuers = [ApprovedIssuer {
         issuer: local_issuer.clone(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
     }];
 
     assert_eq!(accepted_issuers.len(), 1);
@@ -129,6 +135,7 @@ async fn normal_issue_rejects_reserved_subjects_and_root_issue_fixes_root_subjec
                 Ok(ActorResponse::PairingCandidates(_)) => panic!("unexpected pairing candidates response"),
                 Ok(ActorResponse::Invitation(_)) => panic!("unexpected invitation response"),
                 Ok(ActorResponse::FirstContacted { .. }) => panic!("unexpected first-contact response"),
+                Ok(ActorResponse::PeerGrants { .. }) => panic!("unexpected peer grants response"),
                 Err(error) => Err(error),
             };
             request
@@ -163,6 +170,7 @@ async fn normal_issue_rejects_reserved_subjects_and_root_issue_fixes_root_subjec
             jwt: token.clone(),
             accepted_issuers: vec![ApprovedIssuer {
                 issuer: keyring.secret_key().public().into(),
+                relationships: Default::default(),
             }],
             audience,
         })
@@ -208,6 +216,7 @@ async fn delegated_issue_returns_jti_and_sudo_revocation_is_idempotent() {
                 Ok(ActorResponse::PairingCandidates(_)) => panic!("unexpected pairing candidates response"),
                 Ok(ActorResponse::Invitation(_)) => panic!("unexpected invitation response"),
                 Ok(ActorResponse::FirstContacted { .. }) => panic!("unexpected first-contact response"),
+                Ok(ActorResponse::PeerGrants { .. }) => panic!("unexpected peer grants response"),
                 Err(error) => Err(error),
             };
             let _ = request.reply_to.send(response);
@@ -227,6 +236,7 @@ async fn delegated_issue_returns_jti_and_sudo_revocation_is_idempotent() {
             jwt: issued.token.clone(),
             accepted_issuers: vec![ApprovedIssuer {
                 issuer: local_issuer.clone(),
+                relationships: Default::default(),
             }],
             audience,
         })
@@ -245,7 +255,10 @@ async fn delegated_issue_returns_jti_and_sudo_revocation_is_idempotent() {
     let error = match service
         .verify_jwt(VerifyJwtInput {
             jwt: issued.token,
-            accepted_issuers: vec![ApprovedIssuer { issuer: local_issuer }],
+            accepted_issuers: vec![ApprovedIssuer {
+                issuer: local_issuer,
+                relationships: Default::default(),
+            }],
             audience,
         })
         .await
@@ -332,7 +345,15 @@ fn test_actor() -> (Actor, MachineIssuerId, uuid::Uuid) {
 }
 
 fn issuer(issuer: &MachineIssuerId) -> ApprovedIssuer {
-    ApprovedIssuer { issuer: issuer.clone() }
+    ApprovedIssuer {
+        issuer: issuer.clone(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
+    }
 }
 
 #[test]
@@ -527,9 +548,21 @@ fn peer_tokens_are_short_lived_and_do_not_create_local_jtis() {
 fn remote_issuers_can_be_added_and_removed_while_local_remains_immutable() {
     let local = ApprovedIssuer {
         issuer: machine_issuer(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
     };
     let remote = ApprovedIssuer {
         issuer: machine_issuer(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
     };
     let registry = AuthAdmissionRegistry::new(local.clone());
 
@@ -552,12 +585,30 @@ fn remote_issuers_can_be_added_and_removed_while_local_remains_immutable() {
 fn reconciliation_replaces_only_remote_issuers() {
     let local = ApprovedIssuer {
         issuer: machine_issuer(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
     };
     let first_remote = ApprovedIssuer {
         issuer: machine_issuer(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
     };
     let second_remote = ApprovedIssuer {
         issuer: machine_issuer(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
     };
     let registry = AuthAdmissionRegistry::new(local.clone());
 

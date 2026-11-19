@@ -103,6 +103,7 @@ where
             namespace: keyring_service_namespace,
             audience: Uuid::new_v4(),
             peer_config_path: data_root.join("auth").join("peers.json"),
+            confirmation_grants: Default::default(),
         };
         let auth_domain = DomainDescriptor::for_domain::<AuthDomain>("auth");
         {
@@ -174,9 +175,10 @@ where
 
         // The remote dispatcher is installed only after all generated-operation receivers are registered.
         let iroh = substrate.start(
-            remote_operation_installer.map(|installer| installer.install(bus.input_sender())),
+            remote_operation_installer.map(|installer| installer.install(bus.input_sender(), registry.clone())),
             auth_construction.first_contact_handler.clone(),
             auth_construction.pairing_owner.clone(),
+            registry.clone(),
         );
 
         // Finally, the bus handle is created.

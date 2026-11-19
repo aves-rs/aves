@@ -4,6 +4,7 @@ use arc_malachitebft_core_types::{
 use arc_malachitebft_signing::Signer;
 
 use super::super::signing::{ChainSigner, CoordinationSigner};
+use super::super::transaction::test_genesis;
 use super::super::types::{
     ConsensusVote, ConsensusVoteKind, EncKey, RegisteredTransaction, SignedBody, UserRegistered,
 };
@@ -11,8 +12,12 @@ use super::*;
 
 async fn application(path: &std::path::Path) -> CoordinationApplication {
     let store = CoordinationStore::open(path).await.unwrap();
-    let recovery = store.load().await.unwrap();
-    CoordinationApplication::with_store(store, recovery).unwrap()
+    let domains = store.list_domains().await.unwrap();
+    let recovery = match domains.first() {
+        Some(domain) => store.load(*domain).await.unwrap(),
+        None => None,
+    };
+    CoordinationApplication::with_store(std::sync::Arc::new(store), recovery).unwrap()
 }
 
 #[tokio::test]
@@ -22,7 +27,10 @@ async fn genesis_snapshot_adopts_restarts_and_is_idempotent() {
     let mut source = application(source_dir.path()).await;
     let key = iroh::SecretKey::from_bytes(&[42; 32]);
     let roster = vec![(PublicKey(*key.public().as_bytes()), 7)];
-    let chain = source.create_genesis(roster.clone()).await.unwrap();
+    let chain = source
+        .create_genesis(test_genesis(DomainId::from_bytes([1; 32]), roster.clone()))
+        .await
+        .unwrap();
     let snapshot = source.export_snapshot(None).unwrap();
     assert_eq!(snapshot.domain, chain.domain);
     assert_eq!(snapshot.height, Height(0));
@@ -55,7 +63,10 @@ async fn corrupt_or_wrong_anchor_does_not_initialize_host() {
     let mut source = application(source_dir.path()).await;
     let key = iroh::SecretKey::from_bytes(&[43; 32]);
     source
-        .create_genesis(vec![(PublicKey(*key.public().as_bytes()), 1)])
+        .create_genesis(test_genesis(
+            DomainId::from_bytes([1; 32]),
+            vec![(PublicKey(*key.public().as_bytes()), 1)],
+        ))
         .await
         .unwrap();
     let snapshot = source.export_snapshot(None).unwrap();
@@ -77,7 +88,10 @@ async fn corrupt_or_wrong_anchor_does_not_initialize_host() {
     let other_dir = tempfile::tempdir().unwrap();
     let mut other = application(other_dir.path()).await;
     other
-        .create_genesis(vec![(PublicKey(*key.public().as_bytes()), 1)])
+        .create_genesis(test_genesis(
+            DomainId::from_bytes([2; 32]),
+            vec![(PublicKey(*key.public().as_bytes()), 1)],
+        ))
         .await
         .unwrap();
     let different = other.export_snapshot(None).unwrap();
@@ -97,7 +111,10 @@ async fn decided_snapshot_preserves_history_across_restart() {
     let mut source = application(source_dir.path()).await;
     let key = iroh::SecretKey::from_bytes(&[44; 32]);
     let address = PublicKey(*key.public().as_bytes());
-    let chain = source.create_genesis(vec![(address, 3)]).await.unwrap();
+    let chain = source
+        .create_genesis(test_genesis(DomainId::from_bytes([1; 32]), vec![(address, 3)]))
+        .await
+        .unwrap();
     let value = ConsensusValue("[]".to_owned());
     let vote = ConsensusVote {
         height: Height(1),
@@ -152,7 +169,11 @@ async fn snapshot_identity_ignores_valid_certificate_variation() {
         .iter()
         .map(|key| (PublicKey(*key.public().as_bytes()), 1))
         .collect();
-    let domain = source.create_genesis(roster).await.unwrap().domain;
+    let domain = source
+        .create_genesis(test_genesis(DomainId::from_bytes([1; 32]), roster))
+        .await
+        .unwrap()
+        .domain;
     let value = ConsensusValue("[]".to_owned());
     let mut votes = Vec::new();
     for key in &keys {
@@ -248,7 +269,11 @@ async fn retired_export_preserves_active_and_retained_transient_rows() {
     let key = iroh::SecretKey::from_bytes(&[45; 32]);
     let signer = ChainSigner::new(key);
     let address = PublicKey::from(signer.public_key());
-    let predecessor = app.create_genesis(vec![(address, 1)]).await.unwrap().domain;
+    let predecessor = app
+        .create_genesis(test_genesis(DomainId::from_bytes([1; 32]), vec![(address, 1)]))
+        .await
+        .unwrap()
+        .domain;
     let body = UserRegistered {
         user: UserId([2; 32]),
         root_key: address,
@@ -285,7 +310,7 @@ async fn retired_export_preserves_active_and_retained_transient_rows() {
     next.genesis_validators = Some(vec![(address, 1)]);
     let next_recovery = CoordinationApplication::recovery_state(&next).unwrap();
     app.store
-        .save_successor(predecessor, &previous, &next_recovery)
+        .save_successor(predecessor, &previous, successor, &next_recovery)
         .await
         .unwrap();
     app.state = next;

@@ -11,4 +11,9 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "coordination_retired",
         sql: include_str!("./coordination_migrations/0002_coordination_retired.sql"),
     },
+    Migration {
+        version: 3,
+        name: "coordination_domains",
+        sql: include_str!("./coordination_migrations/0003_coordination_domains.sql"),
+    },
 ];

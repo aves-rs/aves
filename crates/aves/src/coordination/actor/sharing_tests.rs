@@ -4,12 +4,13 @@ use serde::Serialize;
 use crate::auth::{ApprovedIssuer, AuthAdmissionRegistry};
 use crate::machine::{MachinePeerServices, PeerConnectivity};
 
+use super::super::messages::{CoordinationRequestPayload, CoordinationResponse};
 use super::super::network::encode_transaction;
 use super::super::signing::ChainSigner;
-use super::super::transaction::PendingTransaction;
+use super::super::transaction::{PendingTransaction, test_genesis};
 use super::super::types::{
-    DomainId, EncKey, Height, MachineId, PublicKey, RegisteredTransaction, SchemaActivated, SignedBody, UserId,
-    UserRegistered,
+    DomainId, EncKey, Height, MachineBound, MachineId, MachineRecord, PublicKey, RegisteredTransaction,
+    SchemaActivated, SignedBody, UserId, UserRegistered,
 };
 use super::Actor;
 
@@ -31,28 +32,109 @@ async fn actor(path: &std::path::Path) -> Actor {
     Actor::new(requests, path.to_path_buf(), None, None, broadcasts).await
 }
 
+async fn genesis(actor: &mut Actor, domain: DomainId, validators: Vec<(PublicKey, u64)>) {
+    let result = actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain,
+            genesis: test_genesis(domain, validators),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, CoordinationResponse::Chain { .. }));
+}
+
+#[tokio::test]
+async fn effective_roster_is_domain_and_height_scoped_and_reports_halt() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = actor(directory.path()).await;
+    let domain = DomainId::from_bytes([1; 32]);
+    let key = PublicKey::from(ChainSigner::new(iroh::SecretKey::from_bytes(&[42; 32])).public_key());
+    genesis(&mut actor, domain, vec![(key, 3)]).await;
+    let state = &mut actor.hosts.get_mut(&domain).unwrap().abci.state.committed;
+    state.height = Height(1);
+    state.roster_history.insert(2, Vec::new());
+    state.roster_owners.insert(2, Vec::new());
+    let response = actor
+        .handle_message(CoordinationRequestPayload::GetEffectiveRoster {
+            domain,
+            height: Some(1),
+        })
+        .await
+        .unwrap();
+    match response {
+        CoordinationResponse::EffectiveRoster {
+            height,
+            validators,
+            halted,
+        } => {
+            assert_eq!(height, 1);
+            assert_eq!(validators.len(), 1);
+            assert_eq!(validators[0].machine_key, key);
+            assert_eq!(validators[0].voting_power, 3);
+            assert_eq!(validators[0].member, UserId([1; 32]));
+            assert_eq!(halted, Some(super::super::types::ChainHalted::NoEligibleValidators));
+        }
+        _ => panic!("unexpected response"),
+    }
+    let current = actor
+        .handle_message(CoordinationRequestPayload::GetEffectiveRoster { domain, height: None })
+        .await
+        .unwrap();
+    assert!(
+        matches!(current, CoordinationResponse::EffectiveRoster { height: 2, validators, halted: Some(_) } if validators.is_empty())
+    );
+    let unknown = DomainId::from_bytes([2; 32]);
+    assert!(
+        matches!(actor.handle_message(CoordinationRequestPayload::GetEffectiveRoster { domain: unknown, height: None }).await,
+        Err(super::super::types::CoordinationError::ChainNotHosted { domain }) if domain == unknown)
+    );
+}
+
+async fn submit(
+    actor: &mut Actor,
+    domain: DomainId,
+    transaction: PendingTransaction,
+) -> Result<CoordinationResponse, super::super::types::CoordinationError> {
+    let mut host = actor.hosts.remove(&domain).unwrap();
+    let result = actor.submit(&mut host, transaction).await;
+    actor.hosts.insert(domain, host);
+    result
+}
+
+async fn lifecycle(actor: &mut Actor, domain: DomainId, start: bool) {
+    let payload = if start {
+        CoordinationRequestPayload::StartServer { domain }
+    } else {
+        CoordinationRequestPayload::StopServer { domain }
+    };
+    actor.handle_message(payload).await.unwrap();
+}
+
 #[tokio::test]
 async fn offline_admission_is_durable_deduplicated_and_checks_domain() {
     let directory = tempfile::tempdir().unwrap();
     let signer = ChainSigner::new(iroh::SecretKey::from_bytes(&[42; 32]));
     let key = PublicKey::from(signer.public_key());
     let mut host = actor(directory.path()).await;
-    let chain = host.abci.create_genesis(vec![(key, 3)]).await.unwrap();
+    let domain = DomainId::from_bytes([1; 32]);
+    genesis(&mut host, domain, vec![(key, 3)]).await;
     let body = UserRegistered {
         user: UserId([43; 32]),
         root_key: key,
         enc_key: EncKey([44; 32]),
         enc_epoch: 1,
     };
-    let transaction = PendingTransaction::UserRegistered(signed(body.clone(), &signer, chain.domain));
-    host.submit(transaction.clone()).await.unwrap();
-    host.submit(transaction).await.unwrap();
-    assert_eq!(host.abci.state.pending.len(), 1);
+    let transaction = PendingTransaction::UserRegistered(signed(body.clone(), &signer, domain));
+    submit(&mut host, domain, transaction.clone())
+        .await
+        .unwrap();
+    submit(&mut host, domain, transaction).await.unwrap();
+    assert_eq!(host.hosts[&domain].abci.state.pending.len(), 1);
     let wrong = PendingTransaction::UserRegistered(signed(body, &signer, DomainId::from_bytes([99; 32])));
-    assert!(host.submit(wrong).await.is_err());
+    assert!(submit(&mut host, domain, wrong).await.is_err());
     drop(host);
     let restored = actor(directory.path()).await;
-    assert_eq!(restored.abci.state.pending.len(), 1);
+    assert_eq!(restored.hosts[&domain].abci.state.pending.len(), 1);
 }
 
 struct NativeFixture {
@@ -105,13 +187,51 @@ impl NativeFixture {
 fn admission(local: u8, remote: u8) -> AuthAdmissionRegistry {
     let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
         issuer: iroh::SecretKey::from_bytes(&[local; 32]).public().into(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
     });
     registry
         .upsert_remote(ApprovedIssuer {
             issuer: iroh::SecretKey::from_bytes(&[remote; 32]).public().into(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
         })
         .unwrap();
     registry
+}
+
+fn certify_owner_machine(actor: &mut Actor, domain: DomainId, seed: u8) {
+    let key = PublicKey(*iroh::SecretKey::from_bytes(&[seed; 32]).public().as_bytes());
+    let machine = MachineId([seed; 32]);
+    let host = actor.hosts.get_mut(&domain).unwrap();
+    host.abci.state.committed.owner = Some(super::super::abci::ChainOwner {
+        user: UserId([1; 32]),
+        root: PublicKey(*iroh::SecretKey::from_bytes(&[42; 32]).public().as_bytes()),
+    });
+    host.abci.state.committed.machines.insert(
+        machine,
+        MachineRecord {
+            machine,
+            registrations: Vec::new(),
+            bindings: vec![MachineBound {
+                user: UserId([1; 32]),
+                machine,
+                machine_key: key,
+                sonya_key: key,
+                enc_key: EncKey([seed; 32]),
+                enc_epoch: 1,
+            }],
+            unbindings: Vec::new(),
+        },
+    );
 }
 
 async fn native_actor(path: &std::path::Path, fixture: &NativeFixture, registry: AuthAdmissionRegistry) -> Actor {
@@ -142,18 +262,16 @@ fn registration(seed: u8, signer: &ChainSigner, domain: DomainId) -> PendingTran
 }
 
 async fn pump(left: &mut Actor, right: &mut Actor) {
-    let left_events = &mut left.running.as_mut().unwrap().transport.events;
-    let right_events = &mut right.running.as_mut().unwrap().transport.events;
+    use futures_util::StreamExt;
+
     let (is_left, event) = tokio::select! {
-        event = left_events.recv() => (true, event),
-        event = right_events.recv() => (false, event),
+        event = left.mux.next() => (true, event),
+        event = right.mux.next() => (false, event),
     };
-    if let Some(event) = event {
-        if is_left {
-            left.handle_application_event(Some(event)).await
-        } else {
-            right.handle_application_event(Some(event)).await
-        }
+    if is_left {
+        left.handle_host_event(event).await;
+    } else {
+        right.handle_host_event(event).await;
     }
 }
 
@@ -174,46 +292,56 @@ async fn admitted_neighbors_share_replay_and_reject_invalid_and_revoked() {
     let key_b = PublicKey::from(signer_b.public_key());
     let third = PublicKey(*iroh::SecretKey::from_bytes(&[53; 32]).public().as_bytes());
     let roster = vec![(key_a, 1), (key_b, 1), (third, 5)];
-    let domain = a.abci.create_genesis(roster.clone()).await.unwrap().domain;
-    // The snapshot lane supplies this adoption in production; this fixture shares the same genesis.
-    b.abci.state.domain = Some(domain);
-    b.abci.state.genesis_validators = Some(roster);
-    b.abci.save_state(&b.abci.state).await.unwrap();
+    let domain = DomainId::from_bytes([1; 32]);
+    genesis(&mut a, domain, roster.clone()).await;
+    // Both fixtures share the same genesis and committed owner-machine authority.
+    genesis(&mut b, domain, roster).await;
+    certify_owner_machine(&mut a, domain, 51);
+    certify_owner_machine(&mut a, domain, 52);
+    certify_owner_machine(&mut b, domain, 51);
+    certify_owner_machine(&mut b, domain, 52);
+    let b_abci = &b.hosts[&domain].abci;
+    b_abci.save_state(&b_abci.state).await.unwrap();
     let offline = registration(61, &signer_b, domain);
-    b.submit(offline.clone()).await.unwrap();
+    submit(&mut b, domain, offline.clone()).await.unwrap();
     drop(b);
     let mut b = native_actor(dir_b.path(), &native_b, b_admission.clone()).await;
-    a.start_server().await.unwrap();
-    b.start_server().await.unwrap();
+    lifecycle(&mut a, domain, true).await;
+    lifecycle(&mut b, domain, true).await;
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while a.abci.state.pending.len() != 1 {
+        while a.hosts[&domain].abci.state.pending.len() != 1 {
             pump(&mut a, &mut b).await;
         }
     })
     .await
     .expect("restarted offline admission must reach the other validator");
-    assert_eq!(b.abci.state.pending.len(), 1);
+    assert_eq!(b.hosts[&domain].abci.state.pending.len(), 1);
     let next = registration(62, &signer_b, domain);
-    b.submit(next.clone()).await.unwrap();
+    submit(&mut b, domain, next.clone()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while a.abci.state.pending.len() != 2 {
+        while a.hosts[&domain].abci.state.pending.len() != 2 {
             pump(&mut a, &mut b).await;
         }
     })
     .await
     .expect("connected validator admission must propagate");
-    a.handle_application_event(Some(super::ApplicationEvent::Transaction(
-        iroh::SecretKey::from_bytes(&[52; 32]).public(),
-        Box::new(next),
-    )))
+    let mut chain_host = a.hosts.remove(&domain).unwrap();
+    a.handle_application_event(
+        &mut chain_host,
+        Some(super::ApplicationEvent::Transaction(
+            iroh::SecretKey::from_bytes(&[52; 32]).public(),
+            Box::new(next),
+        )),
+    )
     .await;
-    assert_eq!(a.abci.state.pending.len(), 2);
-    b.stop_server().await.unwrap();
+    a.hosts.insert(domain, chain_host);
+    assert_eq!(a.hosts[&domain].abci.state.pending.len(), 2);
+    lifecycle(&mut b, domain, false).await;
     let disconnected = registration(66, &signer_a, domain);
-    a.submit(disconnected).await.unwrap();
-    b.start_server().await.unwrap();
+    submit(&mut a, domain, disconnected).await.unwrap();
+    lifecycle(&mut b, domain, true).await;
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while b.abci.state.pending.len() != 3 {
+        while b.hosts[&domain].abci.state.pending.len() != 3 {
             pump(&mut a, &mut b).await;
         }
     })
@@ -224,7 +352,13 @@ async fn admitted_neighbors_share_replay_and_reject_invalid_and_revoked() {
     if let PendingTransaction::UserRegistered(record) = &mut tampered {
         record.body.enc_epoch += 1;
     }
-    let tx = b.running.as_ref().unwrap().transport.transactions.clone();
+    let tx = b.hosts[&domain]
+        .running
+        .as_ref()
+        .unwrap()
+        .transport
+        .transactions
+        .clone();
     for value in [wrong, tampered] {
         tx.send(encode_transaction(&value, 64 * 1024 * 1024).unwrap())
             .await
@@ -236,12 +370,13 @@ async fn admitted_neighbors_share_replay_and_reject_invalid_and_revoked() {
         }
     })
     .await;
-    assert_eq!(a.abci.state.pending.len(), 3);
+    assert_eq!(a.hosts[&domain].abci.state.pending.len(), 3);
     b_admission
         .remove_remote(&iroh::SecretKey::from_bytes(&[51; 32]).public().into())
         .unwrap();
     let revoked = registration(65, &signer_a, domain);
-    a.running
+    a.hosts[&domain]
+        .running
         .as_ref()
         .unwrap()
         .transport
@@ -255,9 +390,9 @@ async fn admitted_neighbors_share_replay_and_reject_invalid_and_revoked() {
         }
     })
     .await;
-    assert_eq!(b.abci.state.pending.len(), 3);
-    a.stop_server().await.unwrap();
-    b.stop_server().await.unwrap();
+    assert_eq!(b.hosts[&domain].abci.state.pending.len(), 3);
+    lifecycle(&mut a, domain, false).await;
+    lifecycle(&mut b, domain, false).await;
     native_a.router.shutdown().await.unwrap();
     native_b.router.shutdown().await.unwrap();
 }
@@ -269,12 +404,8 @@ async fn oversized_transaction_is_rejected_before_persistence() {
     let dir = tempfile::tempdir().unwrap();
     let mut host = native_actor(dir.path(), &native, admission(71, 72)).await;
     let signer = ChainSigner::new(iroh::SecretKey::from_bytes(&[71; 32]));
-    let domain = host
-        .abci
-        .create_genesis(vec![(PublicKey::from(signer.public_key()), 1)])
-        .await
-        .unwrap()
-        .domain;
+    let domain = DomainId::from_bytes([1; 32]);
+    genesis(&mut host, domain, vec![(PublicKey::from(signer.public_key()), 1)]).await;
     let tx = PendingTransaction::SchemaActivated(signed(
         SchemaActivated {
             machine: MachineId([73; 32]),
@@ -287,10 +418,10 @@ async fn oversized_transaction_is_rejected_before_persistence() {
         domain,
     ));
     assert!(encode_transaction(&tx, 512).is_err());
-    assert!(host.submit(tx).await.is_err());
-    assert!(host.abci.state.pending.is_empty());
+    assert!(submit(&mut host, domain, tx).await.is_err());
+    assert!(host.hosts[&domain].abci.state.pending.is_empty());
     drop(host);
     let restored = native_actor(dir.path(), &native, admission(71, 72)).await;
-    assert!(restored.abci.state.pending.is_empty());
+    assert!(restored.hosts[&domain].abci.state.pending.is_empty());
     native.router.shutdown().await.unwrap();
 }

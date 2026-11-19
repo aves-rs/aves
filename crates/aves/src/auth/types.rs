@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use specta::datatype::reference::Reference;
 use specta::{DataType, Generics, Type, TypeCollection};
 use thiserror::Error;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::bus::DispatchContextError;
@@ -110,6 +111,105 @@ pub enum AuthCapability {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ApprovedIssuer {
     pub issuer: MachineIssuerId,
+    pub relationships: BTreeMap<RelationshipKey, PeerGrants>,
+}
+
+/// Native protocols independently authorized for a peer.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum NativeProtocol {
+    AuthFirstContact,
+    Bus,
+    Gossip,
+    Blobs,
+}
+
+/// A generated qualified bus operation name.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Type, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct QualifiedOperation(pub String);
+
+/// Bus operations granted by one relationship.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum OperationGrants {
+    All,
+    Only(BTreeSet<QualifiedOperation>),
+}
+
+/// Independent protocol and bus operation permissions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct PeerGrants {
+    pub protocols: BTreeSet<NativeProtocol>,
+    pub operations: OperationGrants,
+}
+
+impl PeerGrants {
+    /// Grants every native protocol and operation.
+    pub fn full() -> Self {
+        Self {
+            protocols: [
+                NativeProtocol::AuthFirstContact,
+                NativeProtocol::Bus,
+                NativeProtocol::Gossip,
+                NativeProtocol::Blobs,
+            ]
+            .into_iter()
+            .collect(),
+            operations: OperationGrants::All,
+        }
+    }
+
+    /// Combines the authority of two relationships.
+    pub fn union(&self, other: &Self) -> Self {
+        let operations = match (&self.operations, &other.operations) {
+            (OperationGrants::All, _) | (_, OperationGrants::All) => OperationGrants::All,
+            (OperationGrants::Only(a), OperationGrants::Only(b)) => {
+                OperationGrants::Only(a.union(b).cloned().collect())
+            }
+        };
+        Self {
+            protocols: self.protocols.union(&other.protocols).copied().collect(),
+            operations,
+        }
+    }
+}
+
+impl Default for PeerGrants {
+    fn default() -> Self {
+        Self {
+            protocols: [NativeProtocol::AuthFirstContact, NativeProtocol::Bus]
+                .into_iter()
+                .collect(),
+            operations: OperationGrants::Only(BTreeSet::new()),
+        }
+    }
+}
+
+/// Application-owned stable relationship identity.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Type, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct RelationshipKey(pub String);
+
+#[derive(Debug)]
+struct RegisteredConnection {
+    peer: MachineIssuerId,
+    protocol: NativeProtocol,
+    connection: iroh::endpoint::Connection,
+}
+
+/// Removes a native connection from admission tracking on drop.
+#[derive(Debug)]
+pub struct ConnectionRegistration {
+    connections: Arc<RwLock<HashMap<Uuid, RegisteredConnection>>>,
+    id: Uuid,
+}
+
+impl Drop for ConnectionRegistration {
+    fn drop(&mut self) {
+        self.connections
+            .write()
+            .expect("auth connection registry lock poisoned")
+            .remove(&self.id);
+    }
 }
 
 /// Shared admission state with one immutable local issuer and dynamic remote issuers.
@@ -117,6 +217,8 @@ pub struct ApprovedIssuer {
 pub struct AuthAdmissionRegistry {
     local_issuer: ApprovedIssuer,
     remote_issuers: Arc<RwLock<HashMap<MachineIssuerId, ApprovedIssuer>>>,
+    generation: Arc<watch::Sender<u64>>,
+    connections: Arc<RwLock<HashMap<Uuid, RegisteredConnection>>>,
 }
 
 impl AuthAdmissionRegistry {
@@ -124,17 +226,125 @@ impl AuthAdmissionRegistry {
         Self {
             local_issuer,
             remote_issuers: Arc::new(RwLock::new(HashMap::new())),
+            generation: Arc::new(watch::channel(0).0),
+            connections: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Subscribe to admission changes before reading the current projection.
+    pub fn subscribe_generation(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
+    /// Returns the union of all grants for an admitted issuer.
+    pub fn effective_grants(&self, issuer: &MachineIssuerId) -> Option<PeerGrants> {
+        if issuer == &self.local_issuer.issuer {
+            return Some(PeerGrants::full());
+        }
+        let remotes = self
+            .remote_issuers
+            .read()
+            .expect("auth admission registry lock poisoned");
+        remotes.get(issuer).map(Self::issuer_grants)
+    }
+
+    fn issuer_grants(issuer: &ApprovedIssuer) -> PeerGrants {
+        issuer.relationships.values().fold(
+            PeerGrants {
+                protocols: BTreeSet::new(),
+                operations: OperationGrants::Only(BTreeSet::new()),
+            },
+            |grants, next| grants.union(next),
+        )
+    }
+
+    /// Tests a native protocol grant.
+    pub fn allows_protocol(&self, issuer: &MachineIssuerId, protocol: NativeProtocol) -> bool {
+        self.effective_grants(issuer)
+            .is_some_and(|grants| grants.protocols.contains(&protocol))
+    }
+
+    /// Tests a generated qualified operation grant.
+    pub fn allows_operation(&self, issuer: &MachineIssuerId, qualified: &str) -> bool {
+        self.effective_grants(issuer)
+            .is_some_and(|grants| match grants.operations {
+                OperationGrants::All => true,
+                OperationGrants::Only(operations) => operations.contains(&QualifiedOperation(qualified.to_owned())),
+            })
+    }
+
+    /// Registers a connection, closing it immediately if its protocol is no longer allowed.
+    pub fn register_connection(
+        &self,
+        peer: MachineIssuerId,
+        protocol: NativeProtocol,
+        connection: iroh::endpoint::Connection,
+    ) -> ConnectionRegistration {
+        let remotes = self
+            .remote_issuers
+            .read()
+            .expect("auth admission registry lock poisoned");
+        let allowed = peer == self.local_issuer.issuer
+            || remotes
+                .get(&peer)
+                .is_some_and(|issuer| Self::issuer_grants(issuer).protocols.contains(&protocol));
+        let mut connections = self
+            .connections
+            .write()
+            .expect("auth connection registry lock poisoned");
+        let id = Uuid::new_v4();
+        if allowed {
+            connections.insert(
+                id,
+                RegisteredConnection {
+                    peer,
+                    protocol,
+                    connection,
+                },
+            );
+        } else {
+            connection.close(1u32.into(), b"peer protocol grant revoked");
+        }
+        ConnectionRegistration {
+            connections: self.connections.clone(),
+            id,
+        }
+    }
+
+    fn close_disallowed(&self, remotes: &HashMap<MachineIssuerId, ApprovedIssuer>) {
+        let mut connections = self
+            .connections
+            .write()
+            .expect("auth connection registry lock poisoned");
+        connections.retain(|_, entry| {
+            let allowed = entry.peer == self.local_issuer.issuer
+                || remotes.get(&entry.peer).is_some_and(|issuer| {
+                    Self::issuer_grants(issuer)
+                        .protocols
+                        .contains(&entry.protocol)
+                });
+            if !allowed {
+                entry
+                    .connection
+                    .close(1u32.into(), b"peer protocol grant revoked");
+            }
+            allowed
+        });
     }
 
     pub fn upsert_remote(&self, issuer: ApprovedIssuer) -> Result<(), AvesAuthError> {
         if issuer.issuer == self.local_issuer.issuer {
             return Err(AvesAuthError::LocalIssuerImmutable);
         }
-        self.remote_issuers
+        let mut remotes = self
+            .remote_issuers
             .write()
-            .expect("auth admission registry lock poisoned")
-            .insert(issuer.issuer.clone(), issuer);
+            .expect("auth admission registry lock poisoned");
+        remotes.insert(issuer.issuer.clone(), issuer);
+        self.close_disallowed(&remotes);
+        drop(remotes);
+        self.generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(())
     }
 
@@ -142,10 +352,15 @@ impl AuthAdmissionRegistry {
         if issuer == &self.local_issuer.issuer {
             return Err(AvesAuthError::LocalIssuerImmutable);
         }
-        self.remote_issuers
+        let mut remotes = self
+            .remote_issuers
             .write()
-            .expect("auth admission registry lock poisoned")
-            .remove(issuer);
+            .expect("auth admission registry lock poisoned");
+        remotes.remove(issuer);
+        self.close_disallowed(&remotes);
+        drop(remotes);
+        self.generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(())
     }
 
@@ -158,10 +373,15 @@ impl AuthAdmissionRegistry {
             }
             remotes.insert(issuer.issuer.clone(), issuer);
         }
-        *self
+        let mut current = self
             .remote_issuers
             .write()
-            .expect("auth admission registry lock poisoned") = remotes;
+            .expect("auth admission registry lock poisoned");
+        *current = remotes;
+        self.close_disallowed(&current);
+        drop(current);
+        self.generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(())
     }
 
@@ -238,6 +458,8 @@ pub enum AvesAuthError {
     LocalPeerTarget,
     #[error("the peer is not currently trusted")]
     PeerNotTrusted,
+    #[error("peer permission coordinator is pending")]
+    PeerGrantsPending,
     #[error("the peer fingerprint was not confirmed by local policy")]
     FingerprintNotConfirmed,
     #[error("peer pairing rejected: {cause}")]
@@ -313,5 +535,86 @@ impl From<GeneratedCallError<AvesAuthError>> for AvesAuthError {
                 Self::Internal(format!("Auth response expected {expected}, got {actual}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApprovedIssuer, AuthAdmissionRegistry, MachineIssuerId};
+
+    #[test]
+    fn admission_updates_publish_a_new_generation() {
+        let local: MachineIssuerId = iroh::SecretKey::generate().public().into();
+        let remote: MachineIssuerId = iroh::SecretKey::generate().public().into();
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local,
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let mut changes = registry.subscribe_generation();
+        assert_eq!(*changes.borrow_and_update(), 0);
+        registry
+            .upsert_remote(ApprovedIssuer {
+                issuer: remote.clone(),
+                relationships: [(
+                    crate::auth::RelationshipKey("test".to_owned()),
+                    crate::auth::PeerGrants::full(),
+                )]
+                .into_iter()
+                .collect(),
+            })
+            .unwrap();
+        assert_eq!(*changes.borrow_and_update(), 1);
+        registry.remove_remote(&remote).unwrap();
+        assert_eq!(*changes.borrow_and_update(), 2);
+    }
+
+    #[test]
+    fn relationship_union_preserves_overlapping_protocols() {
+        use super::{NativeProtocol, OperationGrants, PeerGrants, QualifiedOperation, RelationshipKey};
+        let local: MachineIssuerId = iroh::SecretKey::generate().public().into();
+        let remote: MachineIssuerId = iroh::SecretKey::generate().public().into();
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local,
+            relationships: Default::default(),
+        });
+        let a = PeerGrants {
+            protocols: [NativeProtocol::Bus, NativeProtocol::Gossip]
+                .into_iter()
+                .collect(),
+            operations: OperationGrants::Only([QualifiedOperation("a".into())].into_iter().collect()),
+        };
+        let b = PeerGrants {
+            protocols: [NativeProtocol::Bus, NativeProtocol::Blobs]
+                .into_iter()
+                .collect(),
+            operations: OperationGrants::Only([QualifiedOperation("b".into())].into_iter().collect()),
+        };
+        let mut relationships = [(RelationshipKey("a".into()), a), (RelationshipKey("b".into()), b)]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        registry
+            .upsert_remote(ApprovedIssuer {
+                issuer: remote.clone(),
+                relationships: relationships.clone(),
+            })
+            .unwrap();
+        assert!(registry.allows_protocol(&remote, NativeProtocol::Gossip));
+        assert!(registry.allows_operation(&remote, "a"));
+        assert!(registry.allows_operation(&remote, "b"));
+        relationships.remove(&RelationshipKey("a".into()));
+        registry
+            .upsert_remote(ApprovedIssuer {
+                issuer: remote.clone(),
+                relationships,
+            })
+            .unwrap();
+        assert!(registry.allows_protocol(&remote, NativeProtocol::Bus));
+        assert!(!registry.allows_protocol(&remote, NativeProtocol::Gossip));
+        assert!(!registry.allows_operation(&remote, "a"));
     }
 }

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use arc_malachitebft_app_channel::NetworkMsg as ApplicationNetworkMsg;
 use arc_malachitebft_core_consensus::SignedConsensusMsg;
+use arc_malachitebft_core_types::ValidatorSet as _;
 use arc_malachitebft_engine::{
     network::{Msg as MalachiteNetworkMsg, NetworkEvent, PersistentPeerError, Subscriber},
     util::streaming::{StreamContent, StreamId, StreamMessage},
@@ -29,7 +30,7 @@ use super::serialization::{
     malachite_peer_id,
 };
 use super::transaction::PendingTransaction;
-use super::types::{ConsensusProposalPart, CoordinationContext as ConsensusContext, DomainId};
+use super::types::{ConsensusProposalPart, CoordinationContext as ConsensusContext, DomainId, PublicKey};
 
 pub(super) enum ApplicationEvent {
     NeighborUp(iroh::EndpointId),
@@ -41,8 +42,8 @@ pub(super) fn encode_transaction(
     transaction: &PendingTransaction,
     max_message_size: usize,
 ) -> Result<Vec<u8>, ChainNetworkError> {
-    let payload =
-        serde_json::to_vec(&ChainWireMessage::Transaction(transaction.clone())).map_err(ChainPayloadError::from)?;
+    let payload = serde_json::to_vec(&ChainWireMessage::Transaction(Box::new(transaction.clone())))
+        .map_err(ChainPayloadError::from)?;
     // The 0.101 stream header carries the topic; the frame holds tags, hash, length and scope.
     let mut length = payload.len();
     let mut varint_bytes = 1usize;
@@ -96,14 +97,16 @@ pub(crate) struct CoordinationNetwork {
     max_message_size: usize,
     outbound: HashMap<OutboundRequestId, PeerId>,
     inbound: HashMap<InboundRequestId, (PeerId, String)>,
+    validator_peers: HashMap<PeerId, NodeKey>,
 }
 
 impl CoordinationNetwork {
-    /// Joins the caller-supplied chain topic using only currently admitted peer identities.
+    /// Joins with admitted participants. This limits fan-out, not secrecy.
     pub(crate) async fn join(
         services: &dyn MachinePeerService,
         admission: AuthAdmissionRegistry,
         topic_id: TopicId,
+        participants: &[PublicKey],
     ) -> Result<Self, ChainNetworkError> {
         let (endpoint, gossip) = services.transport().await;
         let gossip = gossip.ok_or(ChainNetworkError::GossipUnavailable)?;
@@ -112,6 +115,7 @@ impl CoordinationNetwork {
             .into_iter()
             .map(|issuer| issuer.issuer.public_key())
             .filter(|peer| *peer != endpoint.id())
+            .filter(|peer| participants.contains(&PublicKey(*peer.as_bytes())))
             .collect();
 
         let local = *endpoint.id().as_bytes();
@@ -126,6 +130,7 @@ impl CoordinationNetwork {
             max_message_size,
             outbound: HashMap::new(),
             inbound: HashMap::new(),
+            validator_peers: HashMap::new(),
         })
     }
 
@@ -246,7 +251,18 @@ impl CoordinationNetwork {
                 )));
                 Ok(())
             }
-            MalachiteNetworkMsg::UpdateValidatorSet(_) | MalachiteNetworkMsg::ValidatorProofVerified { .. } => Ok(()),
+            MalachiteNetworkMsg::UpdateValidatorSet(validators) => {
+                let mut peers = HashMap::new();
+                for index in 0..validators.count() {
+                    if let Some(validator) = validators.get_by_index(index) {
+                        let key = validator.address.0;
+                        peers.insert(malachite_peer_id(key)?, key);
+                    }
+                }
+                self.validator_peers = peers;
+                Ok(())
+            }
+            MalachiteNetworkMsg::ValidatorProofVerified { .. } => Ok(()),
             MalachiteNetworkMsg::NewEvent(_) => Err(ChainPayloadError::UnsupportedMessage(
                 "NewEvent belongs to Malachite's bundled libp2p transport",
             )
@@ -273,7 +289,12 @@ impl CoordinationNetwork {
         let recipient = self
             .topic
             .neighbors()
-            .find(|key| malachite_peer_id(*key.as_bytes()).ok() == Some(peer))
+            .find(|key| {
+                self.validator_peers
+                    .get(&peer)
+                    .is_some_and(|known| known == key.as_bytes())
+                    || malachite_peer_id(*key.as_bytes()).ok() == Some(peer)
+            })
             .ok_or(ChainNetworkError::PeerNotAdmitted)?;
         self.require_admitted_peer(recipient)?;
         let payload = serde_json::to_vec(&DirectedMessage {
@@ -329,7 +350,7 @@ impl CoordinationNetwork {
                             application
                                 .try_send(ApplicationEvent::Transaction(
                                     message.delivered_from,
-                                    Box::new(transaction),
+                                    Box::new(*transaction),
                                 ))
                                 .map_err(|_| ChainNetworkError::ApplicationQueueUnavailable)?;
                         }
@@ -410,9 +431,15 @@ impl NetworkAttachment {
         services: &dyn MachinePeerService,
         admission: AuthAdmissionRegistry,
         domain: DomainId,
+        participants: &[PublicKey],
     ) -> Result<Self, ChainNetworkError> {
-        let mut network =
-            CoordinationNetwork::join(services, admission, TopicId::from_bytes(*domain.as_bytes())).await?;
+        let mut network = CoordinationNetwork::join(
+            services,
+            admission,
+            TopicId::from_bytes(*domain.as_bytes()),
+            participants,
+        )
+        .await?;
         let (commands, mut incoming) = mpsc::channel(128);
         let (sender, mut publications) = mpsc::channel::<ApplicationNetworkMsg<ConsensusContext>>(128);
         let (transactions, mut pending) = mpsc::channel::<Vec<u8>>(128);

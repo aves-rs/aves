@@ -13,10 +13,10 @@ use super::jwt::{Jwt, issue_jwt, issue_root_jwt, issuer_from_jwt, verify_jwt};
 use super::keystore::MachineIdentityKeyring;
 use super::messages::AuthRequestPayload;
 use super::pairing::{PairingCoordinator, PairingInvitation, PairingOwner};
-use super::peer::{PeerRecord, PeerTrustState};
+use super::peer::PeerRecord;
 use super::types::{
     ApprovedIssuer, AuthAdmissionRegistry, AuthIssueRequest, AuthProjection, AvesAuthError, MachineIssuerId,
-    PeerJwtIssueRequest,
+    PeerGrants, PeerJwtIssueRequest, RelationshipKey,
 };
 
 const PEER_JWT_LIFETIME: chrono::Duration = chrono::Duration::minutes(5);
@@ -40,6 +40,10 @@ pub(crate) enum ActorResponse {
     Success,
     Peers(Vec<PeerRecord>),
     PairingCandidates(Vec<MachineIssuerId>),
+    PeerGrants {
+        effective: PeerGrants,
+        relationships: std::collections::BTreeMap<RelationshipKey, PeerGrants>,
+    },
     Invitation(PairingInvitation),
     #[cfg_attr(test, allow(dead_code))]
     FirstContacted {
@@ -64,18 +68,15 @@ impl Actor {
         audience: Uuid,
         admission_registry: AuthAdmissionRegistry,
         peer_config_path: &Path,
+        confirmation_grants: PeerGrants,
     ) -> Result<Self, AvesAuthError> {
         let local_issuer = keyring.secret_key().public().into();
-        let pairing = PairingCoordinator::load(peer_config_path, admission_registry.clone(), local_issuer, audience)?;
-        admission_registry.replace_remotes(
-            pairing
-                .peers()
-                .into_iter()
-                .filter(|record| record.state == PeerTrustState::Confirmed)
-                .map(|record| ApprovedIssuer {
-                    issuer: record.peer.into(),
-                })
-                .collect(),
+        let pairing = PairingCoordinator::load_with_grants(
+            peer_config_path,
+            admission_registry.clone(),
+            local_issuer,
+            audience,
+            confirmation_grants,
         )?;
         Ok(Self {
             receiver,
@@ -90,7 +91,10 @@ impl Actor {
     #[cfg(test)]
     pub(crate) fn new(receiver: mpsc::Receiver<ActorRequest>, keyring: MachineIdentityKeyring, audience: Uuid) -> Self {
         let issuer: MachineIssuerId = keyring.secret_key().public().into();
-        let admission_registry = AuthAdmissionRegistry::new(ApprovedIssuer { issuer: issuer.clone() });
+        let admission_registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: issuer.clone(),
+            relationships: Default::default(),
+        });
         Self {
             receiver,
             keyring,
@@ -181,6 +185,28 @@ impl Actor {
                     .expect("Auth pairing coordinator lock poisoned")
                     .revoke(peer)?;
                 Ok(ActorResponse::Success)
+            }
+            AuthRequestPayload::SetPeerRelationship {
+                peer,
+                relationship,
+                grants,
+            } => {
+                self.pairing
+                    .lock()
+                    .map_err(|_| AvesAuthError::PeerGrantsPending)?
+                    .set_relationship(peer, relationship, grants)?;
+                Ok(ActorResponse::Success)
+            }
+            AuthRequestPayload::ReadPeerGrants { peer } => {
+                let (effective, relationships) = self
+                    .pairing
+                    .lock()
+                    .map_err(|_| AvesAuthError::PeerGrantsPending)?
+                    .read_grants(&peer)?;
+                Ok(ActorResponse::PeerGrants {
+                    effective,
+                    relationships,
+                })
             }
             AuthRequestPayload::ListPeers {} => Ok(ActorResponse::Peers(
                 self.pairing

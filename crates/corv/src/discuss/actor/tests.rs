@@ -968,6 +968,20 @@ struct TestAuthSudoService;
 
 #[async_trait::async_trait]
 impl AuthSudoService for TestAuthSudoService {
+    async fn set_peer_relationship(
+        &self,
+        _input: aves::auth::messages::SetPeerRelationshipInput,
+    ) -> Result<SuccessOutput, AvesAuthError> {
+        Err(AvesAuthError::PeerGrantsPending)
+    }
+
+    async fn read_peer_grants(
+        &self,
+        _input: aves::auth::messages::ReadPeerGrantsInput,
+    ) -> Result<aves::auth::messages::PeerGrantsOutput, AvesAuthError> {
+        Err(AvesAuthError::PeerGrantsPending)
+    }
+
     async fn issue_jwt(&self, _input: IssueJwtInput) -> Result<DelegatedJwtIssuedOutput, AvesAuthError> {
         Ok(DelegatedJwtIssuedOutput {
             token: Jwt::from_opaque("test-worker-token".to_string()),

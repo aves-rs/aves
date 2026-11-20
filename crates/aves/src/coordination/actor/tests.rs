@@ -25,10 +25,11 @@ use super::super::messages::{CoordinationRequestPayload, CoordinationResponse};
 use super::super::network::NetworkAttachment;
 use super::super::serialization::{ChainPayloadError, CoordinationJsonCodec};
 use super::super::signing::{ChainSignature, ChainSigner, CoordinationSigner};
+use super::super::transaction::test_genesis;
 use super::super::types::{
     ConsensusProposal, ConsensusProposalPart, ConsensusValue, ConsensusVote, ConsensusVoteKind, CoordinationContext,
-    CoordinationError, DomainId, EncKey, Genesis, Height, PublicKey, Regenesis, RegisteredTransaction, SignedBody,
-    UserId, UserRegistered, ValidatorSet,
+    CoordinationError, DomainId, EncKey, Height, PublicKey, Regenesis, RegisteredTransaction, SignedBody, UserId,
+    UserRegistered, ValidatorSet,
 };
 use super::Actor;
 
@@ -91,6 +92,192 @@ async fn new_actor(config_dir: &std::path::Path) -> Actor {
     Actor::new(receiver, config_dir.to_path_buf(), None, None, broadcasts).await
 }
 
+#[tokio::test]
+async fn join_rejects_unsupported_rules_without_disturbing_other_hosts() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let address = PublicKey::from(signer(70).public_key());
+    let genesis = test_genesis(DOMAIN, vec![(address, 1)]);
+    actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis,
+        })
+        .await
+        .unwrap();
+    let other = DomainId::from_bytes([8; 32]);
+    let mut descriptor = test_genesis(other, vec![(address, 1)]);
+    descriptor.body.rules_version += 1;
+    assert!(matches!(
+        actor
+            .handle_message(CoordinationRequestPayload::JoinChain {
+                descriptor,
+                expected_snapshot_hash: None,
+                participants: vec![]
+            })
+            .await,
+        Err(CoordinationError::UnsupportedRulesVersion { .. })
+    ));
+    assert!(actor.hosts.contains_key(&DOMAIN));
+    assert!(!actor.hosts.contains_key(&other));
+}
+
+#[tokio::test]
+async fn join_rejects_a_conflicting_descriptor() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let address = PublicKey::from(signer(70).public_key());
+    let genesis = test_genesis(DOMAIN, vec![(address, 1)]);
+    actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis: genesis.clone(),
+        })
+        .await
+        .unwrap();
+    let mut body = genesis.body;
+    body.initial_roster[0].1 = 2;
+    let descriptor = signed(body, &signer(42), DOMAIN);
+    assert!(
+        matches!(actor.handle_message(CoordinationRequestPayload::JoinChain { descriptor, expected_snapshot_hash: None, participants: vec![] }).await,
+        Err(CoordinationError::GenesisConflict { domain }) if domain == DOMAIN)
+    );
+    assert!(actor.hosts.contains_key(&DOMAIN));
+}
+
+#[tokio::test]
+async fn join_persists_joined_descriptor_without_minting() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let address = PublicKey::from(signer(70).public_key());
+    let descriptor = test_genesis(DOMAIN, vec![(address, 1)]);
+    actor
+        .handle_message(CoordinationRequestPayload::JoinChain {
+            descriptor,
+            expected_snapshot_hash: None,
+            participants: vec![address],
+        })
+        .await
+        .unwrap();
+    let host = actor.hosts.get(&DOMAIN).unwrap();
+    assert!(host.abci.state.genesis.as_ref().unwrap().joined);
+    assert!(host.abci.state.committed_values.is_empty());
+    assert_eq!(host.abci.state.committed.height, Height(0));
+    drop(actor);
+    let restored = new_actor(directory.path()).await;
+    assert!(
+        restored
+            .hosts
+            .get(&DOMAIN)
+            .unwrap()
+            .abci
+            .state
+            .genesis
+            .as_ref()
+            .unwrap()
+            .joined
+    );
+}
+
+fn activate_host(actor: &mut Actor, domain: DomainId) {
+    let mut abci = super::CoordinationApplication::with_store(actor.store.clone(), None).unwrap();
+    abci.activate_chain(domain).unwrap();
+    actor.hosts.insert(domain, super::ChainHost::new(abci));
+}
+
+#[tokio::test]
+async fn unknown_domain_is_not_hosted() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let result = actor
+        .handle_message(CoordinationRequestPayload::GetChain { domain: DOMAIN })
+        .await;
+    assert!(matches!(result, Err(CoordinationError::ChainNotHosted { domain }) if domain == DOMAIN));
+}
+
+#[tokio::test]
+async fn retired_domain_cannot_be_recreated() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let address = PublicKey::from(signer(70).public_key());
+    let genesis = test_genesis(DOMAIN, vec![(address, 1)]);
+    actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis: genesis.clone(),
+        })
+        .await
+        .unwrap();
+    let host = actor.hosts.remove(&DOMAIN).unwrap();
+    let previous = super::CoordinationApplication::recovery_state(&host.abci.state).unwrap();
+    let successor = DomainId::from_bytes([9; 32]);
+    let mut successor_state = host.abci.state.clone();
+    successor_state.domain = Some(successor);
+    let successor_recovery = super::CoordinationApplication::recovery_state(&successor_state).unwrap();
+    actor
+        .store
+        .save_successor(DOMAIN, &previous, successor, &successor_recovery)
+        .await
+        .unwrap();
+
+    let result = actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis,
+        })
+        .await;
+    assert!(matches!(result, Err(CoordinationError::DomainRetired { domain }) if domain == DOMAIN));
+    assert!(!actor.hosts.contains_key(&DOMAIN));
+    assert!(actor.store.load(DOMAIN).await.unwrap().is_none());
+    assert_eq!(actor.store.load_retired(DOMAIN).await.unwrap(), Some(previous));
+}
+
+#[tokio::test]
+async fn closing_one_host_leaves_another_unchanged() {
+    use super::{HostEvent, HostEventKind};
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let other = DomainId::from_bytes([8; 32]);
+    let address = PublicKey::from(signer(70).public_key());
+    for domain in [DOMAIN, other] {
+        let genesis = test_genesis(domain, vec![(address, 1)]);
+        actor
+            .handle_message(CoordinationRequestPayload::Genesis { domain, genesis })
+            .await
+            .unwrap();
+    }
+    actor.hosts.get_mut(&other).unwrap().server_requested = true;
+    actor.hosts.get_mut(&other).unwrap().pending_start = true;
+    let transaction = super::super::transaction::PendingTransaction::UserRegistered(signed(
+        registration(70, address),
+        &signer(70),
+        other,
+    ));
+    let pending_id = actor
+        .hosts
+        .get_mut(&other)
+        .unwrap()
+        .abci
+        .submit(transaction)
+        .await
+        .unwrap();
+    let other_generation = actor.hosts[&other].generation;
+    let generation = actor.hosts[&DOMAIN].generation;
+    actor
+        .handle_host_event(Some(HostEvent {
+            domain: DOMAIN,
+            generation,
+            kind: HostEventKind::Closed,
+        }))
+        .await;
+    assert_eq!(actor.hosts[&other].generation, other_generation);
+    assert!(actor.hosts[&other].server_requested);
+    assert!(actor.hosts[&other].pending_start);
+    assert_eq!(actor.hosts[&other].abci.state.pending.len(), 1);
+    assert_eq!(actor.hosts[&other].abci.state.pending[0].0, pending_id);
+}
+
 fn peer_id(signer: &ChainSigner) -> PeerId {
     let mut bytes = vec![0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
     bytes.extend_from_slice(&signer.public_key().0);
@@ -104,17 +291,74 @@ struct NativeFixture {
 }
 
 #[tokio::test]
+async fn start_without_peer_services_keeps_retry_requested() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let address = PublicKey::from(signer(70).public_key());
+    actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis: test_genesis(DOMAIN, vec![(address, 1)]),
+        })
+        .await
+        .unwrap();
+
+    let result = actor
+        .handle_message(CoordinationRequestPayload::StartServer { domain: DOMAIN })
+        .await;
+    assert!(matches!(result, Err(CoordinationError::PeerServicesPending)));
+    assert!(actor.hosts[&DOMAIN].server_requested);
+    assert!(actor.hosts[&DOMAIN].running.is_none());
+}
+
+#[tokio::test]
+async fn stale_host_event_is_ignored() {
+    use super::{HostEvent, HostEventKind};
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let address = PublicKey::from(signer(70).public_key());
+    actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis: test_genesis(DOMAIN, vec![(address, 1)]),
+        })
+        .await
+        .unwrap();
+    actor.hosts.get_mut(&DOMAIN).unwrap().server_requested = true;
+    actor.hosts.get_mut(&DOMAIN).unwrap().generation = 1;
+    actor
+        .handle_host_event(Some(HostEvent {
+            domain: DOMAIN,
+            generation: 0,
+            kind: HostEventKind::Closed,
+        }))
+        .await;
+    assert_eq!(actor.hosts[&DOMAIN].generation, 1);
+    assert!(!actor.hosts[&DOMAIN].pending_start);
+    assert!(actor.mux.is_empty());
+}
+
+#[tokio::test]
 async fn idle_proposal_does_not_block_history_callbacks() {
     use arc_malachitebft_engine::host::HostMsg;
     let directory = tempfile::tempdir().unwrap();
     let mut actor = new_actor(directory.path()).await;
     let owner = signer(70);
     let address = PublicKey::from(owner.public_key());
-    let chain = actor.abci.create_genesis(vec![(address, 1)]).await.unwrap();
+    actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis: test_genesis(DOMAIN, vec![(address, 1)]),
+        })
+        .await
+        .unwrap();
+    let mut host = actor.hosts.remove(&DOMAIN).unwrap();
     let (network, _receiver) = tokio::sync::mpsc::channel(4);
     let (reply, mut proposed) = tokio::sync::oneshot::channel();
     actor
         .dispatch_consensus_message(
+            &mut host,
             HostMsg::GetValue {
                 height: Height(1),
                 round: Round::new(0),
@@ -131,13 +375,18 @@ async fn idle_proposal_does_not_block_history_callbacks() {
     ));
     let (reply, history) = tokio::sync::oneshot::channel();
     actor
-        .dispatch_consensus_message(HostMsg::GetHistoryMinHeight { reply_to: reply.into() }, &network)
+        .dispatch_consensus_message(
+            &mut host,
+            HostMsg::GetHistoryMinHeight { reply_to: reply.into() },
+            &network,
+        )
         .await
         .unwrap();
     assert_eq!(history.await.unwrap(), Height(1));
     let (reply, values) = tokio::sync::oneshot::channel();
     actor
         .dispatch_consensus_message(
+            &mut host,
             HostMsg::GetDecidedValues {
                 range: Height(1)..=Height(1),
                 reply_to: reply.into(),
@@ -147,9 +396,11 @@ async fn idle_proposal_does_not_block_history_callbacks() {
         .await
         .unwrap();
     assert!(values.await.unwrap().is_empty());
+    actor.hosts.insert(DOMAIN, host);
     actor
         .handle_message(CoordinationRequestPayload::RegisterUser {
-            record: signed(registration(70, address), &owner, chain.domain),
+            domain: DOMAIN,
+            record: signed(registration(70, address), &owner, DOMAIN),
         })
         .await
         .unwrap();
@@ -204,11 +455,23 @@ impl NativeFixture {
     fn admission(seed: u8, peers: &[u8]) -> AuthAdmissionRegistry {
         let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
             issuer: iroh::SecretKey::from_bytes(&[seed; 32]).public().into(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
         });
         for peer in peers {
             registry
                 .upsert_remote(ApprovedIssuer {
                     issuer: iroh::SecretKey::from_bytes(&[*peer; 32]).public().into(),
+                    relationships: [(
+                        crate::auth::RelationshipKey("test".to_owned()),
+                        crate::auth::PeerGrants::full(),
+                    )]
+                    .into_iter()
+                    .collect(),
                 })
                 .unwrap();
         }
@@ -220,31 +483,49 @@ impl NativeFixture {
 async fn transport_loss_preserves_reconnect_intent() {
     let directory = tempfile::tempdir().unwrap();
     let mut actor = new_actor(directory.path()).await;
-    actor.server_requested = true;
+    let address = PublicKey::from(signer(70).public_key());
+    actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis: test_genesis(DOMAIN, vec![(address, 1)]),
+        })
+        .await
+        .unwrap();
+    let mut host = actor.hosts.remove(&DOMAIN).unwrap();
+    host.server_requested = true;
 
-    actor.handle_application_event(None).await;
+    actor.handle_application_event(&mut host, None).await;
 
-    assert!(actor.server_requested);
-    assert!(actor.running.is_none());
+    assert!(host.server_requested);
+    assert!(host.running.is_none());
 }
 
 #[tokio::test]
 async fn explicit_stop_cancels_pending_reconnect_and_recovery() {
     let directory = tempfile::tempdir().unwrap();
     let mut actor = new_actor(directory.path()).await;
-    actor.server_requested = true;
-    actor.restart_after_recovery = true;
+    let address = PublicKey::from(signer(70).public_key());
+    actor
+        .handle_message(CoordinationRequestPayload::Genesis {
+            domain: DOMAIN,
+            genesis: test_genesis(DOMAIN, vec![(address, 1)]),
+        })
+        .await
+        .unwrap();
+    actor.hosts.get_mut(&DOMAIN).unwrap().server_requested = true;
+    actor.hosts.get_mut(&DOMAIN).unwrap().restart_after_recovery = true;
 
     let response = actor
-        .handle_message(CoordinationRequestPayload::StopServer)
+        .handle_message(CoordinationRequestPayload::StopServer { domain: DOMAIN })
         .await
         .unwrap();
 
     assert!(matches!(response, CoordinationResponse::ServerStopped));
-    assert!(!actor.server_requested);
-    assert!(!actor.restart_after_recovery);
-    actor.reconnect().await;
-    assert!(actor.running.is_none());
+    let mut host = actor.hosts.remove(&DOMAIN).unwrap();
+    assert!(!host.server_requested);
+    assert!(!host.restart_after_recovery);
+    actor.reconnect(&mut host).await;
+    assert!(host.running.is_none());
 }
 
 struct NetworkCollector;
@@ -299,7 +580,7 @@ async fn native_network_replays_bound_listening_address_to_each_subscriber_after
         .collect::<std::collections::BTreeSet<_>>();
 
     for _ in 0..2 {
-        let network = NetworkAttachment::start(&native.services, NativeFixture::admission(92, &[]), DOMAIN)
+        let network = NetworkAttachment::start(&native.services, NativeFixture::admission(92, &[]), DOMAIN, &[])
             .await
             .unwrap();
         for _ in 0..2 {
@@ -341,12 +622,22 @@ async fn native_network_carries_targeted_sync_requests_and_responses() {
     let lookup = MemoryLookup::new();
     let left = NativeFixture::new(73, &lookup).await;
     let right = NativeFixture::new(74, &lookup).await;
-    let left_network = NetworkAttachment::start(&left.services, NativeFixture::admission(73, &[74]), DOMAIN)
-        .await
-        .unwrap();
-    let right_network = NetworkAttachment::start(&right.services, NativeFixture::admission(74, &[73]), DOMAIN)
-        .await
-        .unwrap();
+    let left_network = NetworkAttachment::start(
+        &left.services,
+        NativeFixture::admission(73, &[74]),
+        DOMAIN,
+        &[PublicKey(*iroh::SecretKey::from_bytes(&[74; 32]).public().as_bytes())],
+    )
+    .await
+    .unwrap();
+    let right_network = NetworkAttachment::start(
+        &right.services,
+        NativeFixture::admission(74, &[73]),
+        DOMAIN,
+        &[PublicKey(*iroh::SecretKey::from_bytes(&[73; 32]).public().as_bytes())],
+    )
+    .await
+    .unwrap();
     let (left_events, mut left_receiver) = tokio::sync::mpsc::channel(32);
     let (right_events, mut right_receiver) = tokio::sync::mpsc::channel(32);
     let (left_observer, left_task) = NetworkCollector::spawn(None, NetworkCollector, left_events)
@@ -433,6 +724,7 @@ fn proposal_parts(proposal: &ConsensusProposal, stream_id: StreamId) -> [StreamM
 
 async fn receive_proposal_parts(
     actor: &mut Actor,
+    domain: DomainId,
     proposal: &ConsensusProposal,
     stream_id: StreamId,
     peer: PeerId,
@@ -443,6 +735,9 @@ async fn receive_proposal_parts(
     for (index, part) in parts.into_iter().enumerate() {
         let (reply, response) = tokio::sync::oneshot::channel();
         actor
+            .hosts
+            .get_mut(&domain)
+            .unwrap()
             .abci
             .handle_app_msg(
                 AppMsg::ReceivedProposalPart {
@@ -661,7 +956,8 @@ async fn genesis_rejects_invalid_and_duplicate_requests() {
         assert!(matches!(
             actor
                 .handle_message(CoordinationRequestPayload::Genesis {
-                    genesis: Genesis { validators }
+                    domain: DOMAIN,
+                    genesis: test_genesis(DOMAIN, validators)
                 })
                 .await,
             Err(CoordinationError::InvalidValidatorSet)
@@ -670,24 +966,22 @@ async fn genesis_rejects_invalid_and_duplicate_requests() {
     assert!(matches!(
         actor
             .handle_message(CoordinationRequestPayload::Genesis {
-                genesis: Genesis {
-                    validators: vec![(first, 0)]
-                },
+                domain: DOMAIN,
+                genesis: test_genesis(DOMAIN, vec![(first, 0)]),
             })
             .await,
         Err(CoordinationError::ZeroVotingPower)
     ));
     assert!(matches!(
         actor
-            .handle_message(CoordinationRequestPayload::GetChain)
+            .handle_message(CoordinationRequestPayload::GetChain { domain: DOMAIN })
             .await,
-        Err(CoordinationError::NotImplemented)
+        Err(CoordinationError::ChainNotHosted { domain }) if domain == DOMAIN
     ));
     let chain = match actor
         .handle_message(CoordinationRequestPayload::Genesis {
-            genesis: Genesis {
-                validators: vec![(first, 2), (second, 5)],
-            },
+            domain: DOMAIN,
+            genesis: test_genesis(DOMAIN, vec![(first, 2), (second, 5)]),
         })
         .await
         .expect("create genesis")
@@ -699,6 +993,9 @@ async fn genesis_rejects_invalid_and_duplicate_requests() {
     let (network, _receiver) = tokio::sync::mpsc::channel(4);
     let (reply, ready) = tokio::sync::oneshot::channel();
     actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
         .abci
         .handle_app_msg(AppMsg::ConsensusReady { reply }, &network)
         .await
@@ -724,17 +1021,39 @@ async fn genesis_rejects_invalid_and_duplicate_requests() {
     assert!(matches!(
         actor
             .handle_message(CoordinationRequestPayload::Genesis {
-                genesis: Genesis {
-                    validators: vec![(second, 1)]
-                },
+                domain: DOMAIN,
+                genesis: test_genesis(DOMAIN, vec![(second, 1)]),
             })
             .await,
-        Err(CoordinationError::NotImplemented)
+        Err(CoordinationError::GenesisConflict { .. })
     ));
     assert!(
-        matches!(actor.handle_message(CoordinationRequestPayload::GetChain).await,
+        matches!(actor.handle_message(CoordinationRequestPayload::GetChain { domain: DOMAIN }).await,
         Ok(CoordinationResponse::Chain { record }) if record == chain)
     );
+}
+
+#[tokio::test]
+async fn unsupported_genesis_is_not_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(dir.path()).await;
+    let key = PublicKey::from(signer(20).public_key());
+    let mut genesis = test_genesis(DOMAIN, vec![(key, 1)]);
+    genesis.body.rules_version += 1;
+    assert!(matches!(
+        actor
+            .handle_message(CoordinationRequestPayload::Genesis {
+                domain: DOMAIN,
+                genesis
+            })
+            .await,
+        Err(CoordinationError::UnsupportedRulesVersion { found: 2 })
+    ));
+    drop(actor);
+    let store = super::super::persistence::CoordinationStore::open(dir.path())
+        .await
+        .unwrap();
+    assert!(store.list_domains().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -747,9 +1066,8 @@ async fn genesis_admission_and_decision_survive_reconstruction() {
     let key = PublicKey::from(owner.public_key());
     let chain = match actor
         .handle_message(CoordinationRequestPayload::Genesis {
-            genesis: Genesis {
-                validators: vec![(key, 3)],
-            },
+            domain: DOMAIN,
+            genesis: test_genesis(DOMAIN, vec![(key, 3)]),
         })
         .await
         .expect("create genesis")
@@ -763,20 +1081,24 @@ async fn genesis_admission_and_decision_survive_reconstruction() {
     assert!(matches!(
         actor
             .handle_message(CoordinationRequestPayload::RegisterUser {
+                domain: DOMAIN,
                 record: invalid_signature
             })
             .await,
         Err(CoordinationError::SignatureInvalid)
     ));
     PendingTransaction::UserRegistered(signed(registration(22, key), &owner, chain.domain))
-        .apply(&mut actor.abci.state.committed, Height(0))
+        .apply(
+            &mut actor.hosts.get_mut(&DOMAIN).unwrap().abci.state.committed,
+            Height(0),
+        )
         .expect("commit successor authority");
-    actor
-        .abci
-        .save_state(&actor.abci.state)
+    let host = &actor.hosts[&DOMAIN];
+    host.abci
+        .save_state(&host.abci.state)
         .await
         .expect("persist authority");
-    let snapshot = actor
+    let snapshot = actor.hosts[&DOMAIN]
         .abci
         .export_snapshot(None)
         .expect("export predecessor snapshot");
@@ -793,13 +1115,19 @@ async fn genesis_admission_and_decision_survive_reconstruction() {
     );
     assert!(matches!(
         actor
-            .handle_message(CoordinationRequestPayload::Regenesis { record: invalid_roster })
+            .handle_message(CoordinationRequestPayload::Regenesis {
+                domain: DOMAIN,
+                record: invalid_roster
+            })
             .await,
         Err(CoordinationError::ZeroVotingPower)
     ));
-    assert!(actor.abci.pending_transactions().is_empty());
+    assert!(actor.hosts[&DOMAIN].abci.pending_transactions().is_empty());
     let pending_id = match actor
-        .handle_message(CoordinationRequestPayload::RegisterUser { record: record.clone() })
+        .handle_message(CoordinationRequestPayload::RegisterUser {
+            domain: DOMAIN,
+            record: record.clone(),
+        })
         .await
         .expect("admit user")
     {
@@ -809,23 +1137,26 @@ async fn genesis_admission_and_decision_survive_reconstruction() {
     drop(actor);
     let mut actor = new_actor(dir.path()).await;
     assert!(
-        matches!(actor.handle_message(CoordinationRequestPayload::GetChain).await,
+        matches!(actor.handle_message(CoordinationRequestPayload::GetChain { domain: DOMAIN }).await,
         Ok(CoordinationResponse::Chain { record }) if record == chain)
     );
-    let pending = actor.abci.pending_transactions();
+    let pending = actor.hosts[&DOMAIN].abci.pending_transactions();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].0, pending_id);
     assert!(matches!(&pending[0].1, PendingTransaction::UserRegistered(recovered) if recovered == &record));
     let user = record.body.user;
     assert!(matches!(
         actor
-            .handle_message(CoordinationRequestPayload::GetUser { user })
+            .handle_message(CoordinationRequestPayload::GetUser { domain: DOMAIN, user })
             .await,
         Ok(CoordinationResponse::User { record: None })
     ));
     let (network, _receiver) = tokio::sync::mpsc::channel(4);
     let (reply, ready) = tokio::sync::oneshot::channel();
     actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
         .abci
         .handle_app_msg(AppMsg::ConsensusReady { reply }, &network)
         .await
@@ -842,6 +1173,9 @@ async fn genesis_admission_and_decision_survive_reconstruction() {
     );
     let (reply, proposed) = tokio::sync::oneshot::channel();
     actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
         .abci
         .handle_app_msg(
             AppMsg::GetValue {
@@ -858,6 +1192,9 @@ async fn genesis_admission_and_decision_survive_reconstruction() {
     let certificate = certificate(22, chain.domain, &value).await;
     let (reply, decided) = tokio::sync::oneshot::channel();
     actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
         .abci
         .handle_app_msg(
             AppMsg::Decided {
@@ -870,19 +1207,37 @@ async fn genesis_admission_and_decision_survive_reconstruction() {
         .await
         .expect("decide recovered admission");
     decided.await.expect("decided acknowledgement");
+    let before = actor.hosts[&DOMAIN].abci.export_snapshot(None).unwrap();
+    let replay = actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
+        .abci
+        .create_genesis(test_genesis(DOMAIN, vec![(key, 3)]))
+        .await
+        .unwrap();
+    assert_eq!(replay.height, Height(1));
+    assert_eq!(actor.hosts[&DOMAIN].abci.export_snapshot(None).unwrap(), before);
+    assert!(
+        matches!(actor.hosts.get_mut(&DOMAIN).unwrap().abci.create_genesis(test_genesis(DOMAIN, vec![(key, 4)])).await,
+        Err(CoordinationError::GenesisConflict { domain }) if domain == DOMAIN)
+    );
     drop(actor);
     let mut actor = new_actor(dir.path()).await;
     assert!(
-        matches!(actor.handle_message(CoordinationRequestPayload::GetChain).await,
+        matches!(actor.handle_message(CoordinationRequestPayload::GetChain { domain: DOMAIN }).await,
         Ok(CoordinationResponse::Chain { record }) if record.domain == chain.domain && record.height == Height(1))
     );
     assert!(
-        matches!(actor.handle_message(CoordinationRequestPayload::GetUser { user }).await,
+        matches!(actor.handle_message(CoordinationRequestPayload::GetUser { domain: DOMAIN, user }).await,
         Ok(CoordinationResponse::User { record: Some(committed) }) if committed.registered == record.body)
     );
-    assert!(actor.abci.pending_transactions().is_empty());
+    assert!(actor.hosts[&DOMAIN].abci.pending_transactions().is_empty());
     let (reply, ready) = tokio::sync::oneshot::channel();
     actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
         .abci
         .handle_app_msg(AppMsg::ConsensusReady { reply }, &network)
         .await
@@ -900,6 +1255,9 @@ async fn genesis_admission_and_decision_survive_reconstruction() {
     let (reply, history) = tokio::sync::oneshot::channel();
     let range = Height(1)..=Height(1);
     actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
         .abci
         .handle_app_msg(AppMsg::GetDecidedValues { range, reply }, &network)
         .await
@@ -922,23 +1280,20 @@ async fn chain_operations_fail_closed_until_the_host_activates_its_domain() {
 
     assert!(matches!(
         actor
-            .handle_message(CoordinationRequestPayload::RegisterUser { record })
+            .handle_message(CoordinationRequestPayload::RegisterUser { domain: DOMAIN, record })
             .await,
-        Err(CoordinationError::NotImplemented)
+        Err(CoordinationError::ChainNotHosted { domain }) if domain == DOMAIN
     ));
     assert!(matches!(
         actor
-            .handle_message(CoordinationRequestPayload::GetChain)
+            .handle_message(CoordinationRequestPayload::GetChain { domain: DOMAIN })
             .await,
-        Err(CoordinationError::NotImplemented)
+        Err(CoordinationError::ChainNotHosted { domain }) if domain == DOMAIN
     ));
 
-    actor
-        .abci
-        .activate_chain(DOMAIN)
-        .expect("activate real domain");
+    activate_host(&mut actor, DOMAIN);
     assert!(matches!(
-        actor.handle_message(CoordinationRequestPayload::GetChain).await,
+        actor.handle_message(CoordinationRequestPayload::GetChain { domain: DOMAIN }).await,
         Ok(CoordinationResponse::Chain { record }) if record.domain == DOMAIN && record.height == Height(0)
     ));
 }
@@ -947,13 +1302,16 @@ async fn chain_operations_fail_closed_until_the_host_activates_its_domain() {
 async fn admission_returns_only_pending_and_becomes_visible_after_commit() {
     let dir = tempfile::tempdir().expect("temporary configuration directory");
     let mut actor = new_actor(dir.path()).await;
-    actor.abci.activate_chain(DOMAIN).expect("activate domain");
+    activate_host(&mut actor, DOMAIN);
     let owner = signer(3);
     let user = UserId([4; 32]);
     let signed_record = signed(registration(4, PublicKey::from(owner.public_key())), &owner, DOMAIN);
 
     let response = actor
-        .handle_message(CoordinationRequestPayload::RegisterUser { record: signed_record })
+        .handle_message(CoordinationRequestPayload::RegisterUser {
+            domain: DOMAIN,
+            record: signed_record,
+        })
         .await
         .expect("admit signed registration");
     let event_id = match response {
@@ -962,28 +1320,31 @@ async fn admission_returns_only_pending_and_becomes_visible_after_commit() {
     };
     assert!(matches!(
         actor
-            .handle_message(CoordinationRequestPayload::GetUser { user })
+            .handle_message(CoordinationRequestPayload::GetUser { domain: DOMAIN, user })
             .await,
         Ok(CoordinationResponse::User { record: None })
     ));
 
     actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
         .abci
         .apply_committed(event_id, Height(1))
         .expect("apply decided record");
     assert!(matches!(
-        actor.handle_message(CoordinationRequestPayload::GetUser { user }).await,
+        actor.handle_message(CoordinationRequestPayload::GetUser { domain: DOMAIN, user }).await,
         Ok(CoordinationResponse::User { record: Some(record) })
             if record.user == user && record.registered.enc_epoch == 1
     ));
-    assert_eq!(actor.abci.get_chain().expect("chain").height, Height(1));
+    assert_eq!(actor.hosts[&DOMAIN].abci.get_chain().expect("chain").height, Height(1));
 }
 
 #[tokio::test]
 async fn invalid_signatures_and_unauthorized_registrations_are_rejected() {
     let dir = tempfile::tempdir().expect("temporary configuration directory");
     let mut actor = new_actor(dir.path()).await;
-    actor.abci.activate_chain(DOMAIN).expect("activate domain");
+    activate_host(&mut actor, DOMAIN);
     let owner = signer(5);
     let other = signer(6);
     let body = registration(7, PublicKey::from(owner.public_key()));
@@ -993,6 +1354,7 @@ async fn invalid_signatures_and_unauthorized_registrations_are_rejected() {
     assert!(matches!(
         actor
             .handle_message(CoordinationRequestPayload::RegisterUser {
+                domain: DOMAIN,
                 record: wrong_signature
             })
             .await,
@@ -1001,38 +1363,289 @@ async fn invalid_signatures_and_unauthorized_registrations_are_rejected() {
 
     let unauthorized = signed(body, &other, DOMAIN);
     let response = actor
-        .handle_message(CoordinationRequestPayload::RegisterUser { record: unauthorized })
+        .handle_message(CoordinationRequestPayload::RegisterUser {
+            domain: DOMAIN,
+            record: unauthorized,
+        })
         .await
         .expect("signature proves key ownership, commit enforces root authorization");
     let event_id = match response {
         CoordinationResponse::TransactionSubmitted { event_id } => event_id,
         other => panic!("unexpected admission response: {other:?}"),
     };
-    assert!(matches!(
-        actor.abci.apply_committed(event_id, Height(1)),
-        Err(CoordinationError::SignatureInvalid)
-    ));
+    actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
+        .abci
+        .apply_committed(event_id, Height(1))
+        .expect("record deterministic rejection");
+    assert!(
+        actor.hosts[&DOMAIN]
+            .abci
+            .state
+            .committed
+            .rejected_events
+            .contains_key(&event_id)
+    );
     assert!(matches!(
         actor
-            .handle_message(CoordinationRequestPayload::GetUser { user: UserId([7; 32]) })
+            .handle_message(CoordinationRequestPayload::GetUser {
+                domain: DOMAIN,
+                user: UserId([7; 32])
+            })
             .await,
         Ok(CoordinationResponse::User { record: None })
     ));
+}
+
+#[test]
+fn execution_and_schema_authority_are_recorded_as_rejections() {
+    use super::super::abci::{ChainOwner, CommittedState};
+    use super::super::transaction::{PendingTransaction, RejectionReason};
+    use super::super::types::{
+        BlobHash, CoordinationExecutionId, CoordinationFlowId, ExecutionCancelled, ExecutionCreated, ExecutionLanded,
+        MachineBound, MachineId, MachineRegistered, MachineUnbound, RecordHash, SchemaActivated, UserRootRotated,
+    };
+    use crate::flow::{FlowExecutionId, FlowId};
+    use uuid::Uuid;
+
+    let root = signer(41);
+    let rotated = signer(42);
+    let machine_signer = signer(43);
+    let other = signer(44);
+    let root_key = PublicKey::from(root.public_key());
+    let machine_key = PublicKey::from(machine_signer.public_key());
+    let user = UserId([45; 32]);
+    let machine = MachineId([46; 32]);
+    let mut state = CommittedState::default();
+    state.owner = Some(ChainOwner { user, root: root_key });
+    let registration = PendingTransaction::UserRegistered(signed(registration(45, root_key), &root, DOMAIN));
+    let machine_registration = PendingTransaction::MachineRegistered(signed(
+        MachineRegistered {
+            machine,
+            name: "machine".into(),
+            machine_key,
+            sonya_key: machine_key,
+            enc_key: EncKey([47; 32]),
+        },
+        &machine_signer,
+        DOMAIN,
+    ));
+    let binding = PendingTransaction::MachineBound(signed(
+        MachineBound {
+            user,
+            machine,
+            machine_key,
+            sonya_key: machine_key,
+            enc_key: EncKey([47; 32]),
+            enc_epoch: 1,
+        },
+        &root,
+        DOMAIN,
+    ));
+    let other_machine = MachineId([49; 32]);
+    let other_key = PublicKey::from(other.public_key());
+    let other_registration = PendingTransaction::MachineRegistered(signed(
+        MachineRegistered {
+            machine: other_machine,
+            name: "other".into(),
+            machine_key: other_key,
+            sonya_key: other_key,
+            enc_key: EncKey([50; 32]),
+        },
+        &other,
+        DOMAIN,
+    ));
+    let other_binding = PendingTransaction::MachineBound(signed(
+        MachineBound {
+            user,
+            machine: other_machine,
+            machine_key: other_key,
+            sonya_key: other_key,
+            enc_key: EncKey([50; 32]),
+            enc_epoch: 1,
+        },
+        &root,
+        DOMAIN,
+    ));
+    let rotation = PendingTransaction::UserRootRotated(signed(
+        UserRootRotated {
+            user,
+            previous_root: root_key,
+            new_root: PublicKey::from(rotated.public_key()),
+            effective_at: 1,
+        },
+        &root,
+        DOMAIN,
+    ));
+    state
+        .apply_transactions(
+            DOMAIN,
+            vec![
+                registration,
+                machine_registration,
+                binding,
+                other_registration,
+                other_binding,
+                rotation,
+            ],
+            Height(1),
+        )
+        .unwrap();
+
+    let execution_id = CoordinationExecutionId(FlowExecutionId(Uuid::from_u128(1)));
+    let created = ExecutionCreated {
+        execution_id,
+        flow_id: CoordinationFlowId(FlowId(Uuid::from_u128(2))),
+        machine,
+    };
+    let wrong = PendingTransaction::ExecutionCreated(signed(created.clone(), &other, DOMAIN));
+    let wrong_id = wrong.event_id().unwrap();
+    let accepted = PendingTransaction::ExecutionCreated(signed(created, &rotated, DOMAIN));
+    let accepted_id = accepted.event_id().unwrap();
+    state
+        .apply_transactions(DOMAIN, vec![wrong, accepted], Height(2))
+        .unwrap();
+    assert_eq!(
+        state.rejected_events.get(&wrong_id),
+        Some(&RejectionReason::UnauthorizedSigner)
+    );
+    assert!(state.applied_events.contains(&accepted_id));
+
+    let landed = PendingTransaction::ExecutionLanded(signed(
+        ExecutionLanded {
+            execution_id,
+            blob_uri: "blob".into(),
+            blob_hash: BlobHash([48; 32]),
+            decoding_schema_version: 1,
+        },
+        &other,
+        DOMAIN,
+    ));
+    let landed_id = landed.event_id().unwrap();
+    let schema = PendingTransaction::SchemaActivated(signed(
+        SchemaActivated {
+            machine,
+            schema_version: 1,
+            platform_minimum: 1,
+            active_from: Height(3),
+            schema: "{}".into(),
+        },
+        &other,
+        DOMAIN,
+    ));
+    let schema_id = schema.event_id().unwrap();
+    state
+        .apply_transactions(DOMAIN, vec![landed, schema], Height(3))
+        .unwrap();
+    assert_eq!(
+        state.rejected_events.get(&landed_id),
+        Some(&RejectionReason::UnauthorizedSigner)
+    );
+    assert_eq!(
+        state.rejected_events.get(&schema_id),
+        Some(&RejectionReason::UnauthorizedSigner)
+    );
+    assert!(
+        state
+            .executions
+            .get(execution_id.0.0.as_bytes())
+            .unwrap()
+            .landed
+            .is_none()
+    );
+    assert!(state.schemas.is_empty());
+    let authorized_schema = PendingTransaction::SchemaActivated(signed(
+        SchemaActivated {
+            machine,
+            schema_version: 1,
+            platform_minimum: 1,
+            active_from: Height(3),
+            schema: "{}".into(),
+        },
+        &rotated,
+        DOMAIN,
+    ));
+    state
+        .apply_transactions(DOMAIN, vec![authorized_schema], Height(4))
+        .unwrap();
+    assert_eq!(state.schemas.len(), 1);
+    let cancelled = PendingTransaction::ExecutionCancelled(signed(
+        ExecutionCancelled {
+            execution_id,
+            record_hash: RecordHash([51; 32]),
+            discarded_at: 1,
+            expires_at: 2,
+        },
+        &other,
+        DOMAIN,
+    ));
+    let cancelled_id = cancelled.event_id().unwrap();
+    let unbound = PendingTransaction::MachineUnbound(signed(
+        MachineUnbound {
+            user,
+            machine,
+            effective_at: 1,
+            compromised_from: None,
+        },
+        &rotated,
+        DOMAIN,
+    ));
+    let revoked_creation = PendingTransaction::ExecutionCreated(signed(
+        ExecutionCreated {
+            execution_id: CoordinationExecutionId(FlowExecutionId(Uuid::from_u128(3))),
+            flow_id: CoordinationFlowId(FlowId(Uuid::from_u128(2))),
+            machine,
+        },
+        &machine_signer,
+        DOMAIN,
+    ));
+    let revoked_id = revoked_creation.event_id().unwrap();
+    state
+        .apply_transactions(DOMAIN, vec![cancelled, unbound, revoked_creation], Height(5))
+        .unwrap();
+    assert_eq!(
+        state.rejected_events.get(&cancelled_id),
+        Some(&RejectionReason::UnauthorizedSigner)
+    );
+    assert_eq!(
+        state.rejected_events.get(&revoked_id),
+        Some(&RejectionReason::UnauthorizedSigner)
+    );
+    let owner_cancel = PendingTransaction::ExecutionCancelled(signed(
+        ExecutionCancelled {
+            execution_id,
+            record_hash: RecordHash([51; 32]),
+            discarded_at: 1,
+            expires_at: 2,
+        },
+        &rotated,
+        DOMAIN,
+    ));
+    let owner_cancel_id = owner_cancel.event_id().unwrap();
+    state
+        .apply_transactions(DOMAIN, vec![owner_cancel], Height(6))
+        .unwrap();
+    assert!(state.applied_events.contains(&owner_cancel_id));
 }
 
 #[tokio::test]
 async fn duplicate_admission_is_idempotent() {
     let dir = tempfile::tempdir().expect("temporary configuration directory");
     let mut actor = new_actor(dir.path()).await;
-    actor.abci.activate_chain(DOMAIN).expect("activate domain");
+    activate_host(&mut actor, DOMAIN);
     let owner = signer(8);
     let record = signed(registration(9, PublicKey::from(owner.public_key())), &owner, DOMAIN);
     let first = actor
-        .handle_message(CoordinationRequestPayload::RegisterUser { record: record.clone() })
+        .handle_message(CoordinationRequestPayload::RegisterUser {
+            domain: DOMAIN,
+            record: record.clone(),
+        })
         .await
         .expect("admit");
     let second = actor
-        .handle_message(CoordinationRequestPayload::RegisterUser { record })
+        .handle_message(CoordinationRequestPayload::RegisterUser { domain: DOMAIN, record })
         .await
         .expect("idempotently admit duplicate");
     let event_id = |response| match response {
@@ -1040,25 +1653,25 @@ async fn duplicate_admission_is_idempotent() {
         other => panic!("unexpected admission response: {other:?}"),
     };
     assert_eq!(event_id(first), event_id(second));
-    assert_eq!(actor.abci.pending_transactions().len(), 1);
+    assert_eq!(actor.hosts[&DOMAIN].abci.pending_transactions().len(), 1);
 
     assert!(matches!(
         actor
-            .handle_message(CoordinationRequestPayload::StopServer)
+            .handle_message(CoordinationRequestPayload::StopServer { domain: DOMAIN })
             .await,
         Ok(CoordinationResponse::ServerStopped)
     ));
-    assert!(actor.running.is_none());
+    assert!(actor.hosts[&DOMAIN].running.is_none());
 }
 
 #[tokio::test]
-#[should_panic(expected = "Machine domain must publish MachinePeerService before Coordination starts")]
-async fn starting_without_machine_peer_services_panics() {
+async fn starting_without_a_chain_is_rejected() {
     let dir = tempfile::tempdir().expect("temporary configuration directory");
     let mut actor = new_actor(dir.path()).await;
-    let _ = actor
-        .handle_message(CoordinationRequestPayload::StartServer)
-        .await;
+    assert!(
+        matches!(actor.handle_message(CoordinationRequestPayload::StartServer { domain: DOMAIN }).await,
+        Err(CoordinationError::ChainNotHosted { domain }) if domain == DOMAIN)
+    );
 }
 
 #[tokio::test]
@@ -1071,9 +1684,8 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
     let owner = signer(10);
     let domain = match actor
         .handle_message(CoordinationRequestPayload::Genesis {
-            genesis: Genesis {
-                validators: vec![(PublicKey::from(owner.public_key()), 1)],
-            },
+            domain: DOMAIN,
+            genesis: test_genesis(DOMAIN, vec![(PublicKey::from(owner.public_key()), 1)]),
         })
         .await
         .expect("create genesis")
@@ -1083,14 +1695,17 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
     };
     let key = PublicKey::from(owner.public_key());
     PendingTransaction::UserRegistered(signed(registration(10, key), &owner, domain))
-        .apply(&mut actor.abci.state.committed, Height(0))
+        .apply(
+            &mut actor.hosts.get_mut(&domain).unwrap().abci.state.committed,
+            Height(0),
+        )
         .expect("commit successor authority");
-    actor
-        .abci
-        .save_state(&actor.abci.state)
+    let host = &actor.hosts[&domain];
+    host.abci
+        .save_state(&host.abci.state)
         .await
         .expect("persist authority");
-    let snapshot = actor
+    let snapshot = actor.hosts[&domain]
         .abci
         .export_snapshot(None)
         .expect("export predecessor snapshot");
@@ -1107,19 +1722,28 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
         domain,
     );
     actor
-        .handle_message(CoordinationRequestPayload::Regenesis { record: genesis })
+        .handle_message(CoordinationRequestPayload::Regenesis {
+            domain,
+            record: genesis,
+        })
         .await
         .expect("admit successor-chain roster");
     let domain = successor;
     let user = UserId([11; 32]);
     let user_record = signed(registration(11, key), &owner, domain);
     actor
-        .handle_message(CoordinationRequestPayload::RegisterUser { record: user_record })
+        .handle_message(CoordinationRequestPayload::RegisterUser {
+            domain,
+            record: user_record,
+        })
         .await
         .expect("admit user registration");
 
     let (reply, proposed_value) = tokio::sync::oneshot::channel();
     actor
+        .hosts
+        .get_mut(&domain)
+        .unwrap()
         .abci
         .handle_app_msg(
             AppMsg::GetValue {
@@ -1141,7 +1765,7 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
         proposer: PublicKey::from(owner.public_key()),
     };
     let peer = peer_id(&owner);
-    let accepted = receive_proposal_parts(&mut actor, &proposal, StreamId::new(vec![1, 2, 3].into()), peer)
+    let accepted = receive_proposal_parts(&mut actor, domain, &proposal, StreamId::new(vec![1, 2, 3].into()), peer)
         .await
         .expect("complete proposal accepted");
     assert_eq!(accepted.validity, Validity::Valid);
@@ -1162,14 +1786,23 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
         pol_round: -1,
         proposer: PublicKey::from(owner.public_key()),
     };
-    let rejected = receive_proposal_parts(&mut actor, &invalid_proposal, StreamId::new(vec![4, 5, 6].into()), peer)
-        .await
-        .expect("malformed signed value receives a verdict");
-    assert_eq!(rejected.validity, Validity::Invalid);
+    let rejected = receive_proposal_parts(
+        &mut actor,
+        domain,
+        &invalid_proposal,
+        StreamId::new(vec![4, 5, 6].into()),
+        peer,
+    )
+    .await
+    .expect("malformed signed value receives a verdict");
+    assert_eq!(rejected.validity, Validity::Valid);
 
     let certificate = certificate(10, domain, &accepted.value).await;
     let (reply, decided) = tokio::sync::oneshot::channel();
     actor
+        .hosts
+        .get_mut(&domain)
+        .unwrap()
         .abci
         .handle_app_msg(
             AppMsg::Decided {
@@ -1183,20 +1816,30 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
         .expect("handle Decided");
     decided.await.expect("decided acknowledgement");
     assert!(matches!(
-        actor.handle_message(CoordinationRequestPayload::GetUser { user }).await,
+        actor.handle_message(CoordinationRequestPayload::GetUser { domain, user }).await,
         Ok(CoordinationResponse::User { record: Some(record) }) if record.user == user
     ));
 
     drop(actor);
     let mut actor = new_actor(dir.path()).await;
     assert!(matches!(
-        actor.handle_message(CoordinationRequestPayload::GetUser { user }).await,
+        actor.handle_message(CoordinationRequestPayload::GetUser { domain, user }).await,
         Ok(CoordinationResponse::User { record: Some(record) }) if record.user == user
     ));
-    assert_eq!(actor.abci.get_chain().expect("recovered chain").height, Height(1));
+    assert_eq!(
+        actor.hosts[&domain]
+            .abci
+            .get_chain()
+            .expect("recovered chain")
+            .height,
+        Height(1)
+    );
     let (reply, history) = tokio::sync::oneshot::channel();
     let range = Height(1)..=Height(1);
     actor
+        .hosts
+        .get_mut(&domain)
+        .unwrap()
         .abci
         .handle_app_msg(AppMsg::GetDecidedValues { range, reply }, &network)
         .await
@@ -1208,6 +1851,9 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
     let (reply, _finalized) = tokio::sync::oneshot::channel();
     assert!(matches!(
         actor
+            .hosts
+            .get_mut(&domain)
+            .unwrap()
             .abci
             .handle_app_msg(
                 AppMsg::Finalized {
@@ -1230,6 +1876,9 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
 
     let (reply, finalized) = tokio::sync::oneshot::channel();
     actor
+        .hosts
+        .get_mut(&domain)
+        .unwrap()
         .abci
         .handle_app_msg(
             AppMsg::Finalized {
@@ -1248,5 +1897,166 @@ async fn app_channel_callbacks_propose_decide_and_finalize_signed_records() {
     assert!(matches!(
         finalized.await.expect("finalized next-height response"),
         Next::Start(Height(2), _)
+    ));
+}
+
+#[tokio::test]
+async fn submission_status_is_domain_scoped_and_survives_restart() {
+    use super::super::messages::{SubmissionRejectionReason, SubmissionStatus};
+    use super::super::types::CoordinationEventId;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut actor = new_actor(directory.path()).await;
+    let other = DomainId::from_bytes([8; 32]);
+    let owner = signer(22);
+    let key = PublicKey::from(owner.public_key());
+    for domain in [DOMAIN, other] {
+        actor
+            .handle_message(CoordinationRequestPayload::Genesis {
+                domain,
+                genesis: test_genesis(domain, vec![(key, 1)]),
+            })
+            .await
+            .unwrap();
+    }
+    let absent = CoordinationEventId::from_bytes([42; 32]);
+    assert!(matches!(
+        actor
+            .handle_message(CoordinationRequestPayload::GetSubmissionStatus {
+                domain: DOMAIN,
+                event_id: absent
+            })
+            .await
+            .unwrap(),
+        CoordinationResponse::SubmissionStatus {
+            status: SubmissionStatus::Absent
+        }
+    ));
+    let record = signed(registration(40, key), &owner, DOMAIN);
+    let accepted = match actor
+        .handle_message(CoordinationRequestPayload::RegisterUser {
+            domain: DOMAIN,
+            record: record.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        CoordinationResponse::TransactionSubmitted { event_id } => event_id,
+        _ => panic!("expected admission"),
+    };
+    let conflicting = signed(registration(40, key), &owner, DOMAIN);
+    // A second distinct registration for the same identity is rejected at application.
+    let mut body = conflicting.body;
+    body.enc_epoch += 1;
+    let record = signed(body, &owner, DOMAIN);
+    let rejected = match actor
+        .handle_message(CoordinationRequestPayload::RegisterUser { domain: DOMAIN, record })
+        .await
+        .unwrap()
+    {
+        CoordinationResponse::TransactionSubmitted { event_id } => event_id,
+        _ => panic!("expected admission"),
+    };
+    assert!(matches!(
+        actor
+            .handle_message(CoordinationRequestPayload::GetSubmissionStatus {
+                domain: DOMAIN,
+                event_id: accepted
+            })
+            .await
+            .unwrap(),
+        CoordinationResponse::SubmissionStatus {
+            status: SubmissionStatus::Pending
+        }
+    ));
+    assert!(matches!(
+        actor
+            .handle_message(CoordinationRequestPayload::GetSubmissionStatus {
+                domain: other,
+                event_id: accepted
+            })
+            .await
+            .unwrap(),
+        CoordinationResponse::SubmissionStatus {
+            status: SubmissionStatus::Absent
+        }
+    ));
+    let (network, _receiver) = tokio::sync::mpsc::channel(4);
+    let (reply, proposed) = tokio::sync::oneshot::channel();
+    actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
+        .abci
+        .handle_app_msg(
+            AppMsg::GetValue {
+                height: Height(1),
+                round: Round::new(0),
+                timeout: std::time::Duration::ZERO,
+                reply,
+            },
+            &network,
+        )
+        .await
+        .unwrap();
+    let value = proposed.await.unwrap().value;
+    let certificate = certificate(22, DOMAIN, &value).await;
+    let (reply, decided) = tokio::sync::oneshot::channel();
+    actor
+        .hosts
+        .get_mut(&DOMAIN)
+        .unwrap()
+        .abci
+        .handle_app_msg(
+            AppMsg::Decided {
+                certificate,
+                extensions: VoteExtensions::default(),
+                reply,
+            },
+            &network,
+        )
+        .await
+        .unwrap();
+    decided.await.unwrap();
+    drop(actor);
+    let mut actor = new_actor(directory.path()).await;
+    assert!(matches!(
+        actor
+            .handle_message(CoordinationRequestPayload::GetSubmissionStatus {
+                domain: DOMAIN,
+                event_id: accepted
+            })
+            .await
+            .unwrap(),
+        CoordinationResponse::SubmissionStatus {
+            status: SubmissionStatus::Committed { height: Height(1) }
+        }
+    ));
+    assert!(matches!(
+        actor
+            .handle_message(CoordinationRequestPayload::GetSubmissionStatus {
+                domain: DOMAIN,
+                event_id: rejected
+            })
+            .await
+            .unwrap(),
+        CoordinationResponse::SubmissionStatus {
+            status: SubmissionStatus::Rejected {
+                reason: SubmissionRejectionReason::UnauthorizedSigner,
+                height: Height(1)
+            }
+        }
+    ));
+    assert!(matches!(
+        actor
+            .handle_message(CoordinationRequestPayload::GetSubmissionStatus {
+                domain: other,
+                event_id: accepted
+            })
+            .await
+            .unwrap(),
+        CoordinationResponse::SubmissionStatus {
+            status: SubmissionStatus::Absent
+        }
     ));
 }

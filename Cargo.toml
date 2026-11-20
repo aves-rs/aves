@@ -74,6 +74,7 @@ lettre = { version = "=0.11.24", default-features = false, features = [
 ] }
 mail-parser = { version = "=1.0.1" }
 native-tls = { version = "=0.2.18" }
+num-integer = { version = "=0.1.46" }
 oxc = { version = "=0.159.0", features = [
   "codegen",
   "semantic",
@@ -81,7 +82,7 @@ oxc = { version = "=0.159.0", features = [
 ] }
 pkcs8 = { version = "=0.11.0", features = ["alloc"] }
 proc-macro2 = { version = "=1.0.107" }
-quota-core = { git = "https://github.com/cortexkit/insula", tag = "v0.3.0" }
+quota-core = { git = "https://github.com/cortexkit/insula", tag = "v0.3.1" }
 quote = { version = "=1.0.47" }
 ractor = { version = "=0.15.10", features = ["async-trait"] } # exact version required by malachite
 rand = { version = "=0.10.4" }

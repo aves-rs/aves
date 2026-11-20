@@ -20,21 +20,119 @@ use arc_malachitebft_sync::{InboundRequestId, Response as SyncResponse, ValueRes
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use super::abci::{ApplicationState, CommittedState, CoordinationApplication, unique_map};
+use super::abci::{ApplicationState, ChainOwner, CommittedState, CoordinationApplication, StoredGenesis, unique_map};
+use super::messages::{SubmissionRejectionReason, SubmissionStatus};
 use super::persistence::{DecidedRow, PendingRow, ProposalRow, RecoveryState};
-use super::serialization::{decode_chain_network_event, serialize_sync_response};
+use super::serialization::{canonical_json, decode_chain_network_event, serialize_sync_response};
 use super::signing::{ChainPublicKey, ChainSigningScheme};
 use super::transaction::{
     ApplicationRecovery, CommittedRecovery, IdleValueReply, PendingTransaction, PersistedCertificate, ProposalMetadata,
-    ProposalPartAssembly, ProposalRecovery,
+    ProposalPartAssembly, ProposalRecovery, verify_body,
 };
 use super::types::{
-    ChainRecord, ConsensusProposal, ConsensusProposalPart, ConsensusValidator, ConsensusValidatorSet, ConsensusValue,
-    ConsensusValueId, CoordinationContext, CoordinationEventId, PublicKey,
+    AUTHORITY_RULES_VERSION, ChainRecord, ConsensusProposal, ConsensusProposalPart, ConsensusValidator,
+    ConsensusValidatorSet, ConsensusValue, ConsensusValueId, CoordinationContext, CoordinationEventId,
+    GenesisDescriptor, GenesisFingerprint, PublicKey, SignedBody,
 };
 use super::{CoordinationError, DomainId, Height};
 
 impl CoordinationApplication {
+    /// Pins a delivered genesis without creating a genesis transaction.
+    pub(super) async fn join_chain(
+        &mut self,
+        descriptor: SignedBody<GenesisDescriptor>,
+        expected_snapshot_hash: Option<super::types::RecordHash>,
+        participants: Vec<PublicKey>,
+    ) -> Result<ChainRecord, CoordinationError> {
+        let body = &descriptor.body;
+        let domain = body.domain;
+        if body.rules_version != AUTHORITY_RULES_VERSION {
+            return Err(CoordinationError::UnsupportedRulesVersion {
+                found: body.rules_version,
+            });
+        }
+        if descriptor.signer != body.owner_root || verify_body(&descriptor, domain).is_err() {
+            return Err(CoordinationError::GenesisSignatureInvalid);
+        }
+        Self::validator_set(&body.initial_roster)?;
+        let fingerprint = GenesisFingerprint(
+            Sha256::digest(canonical_json(&descriptor).map_err(|_| CoordinationError::Encoding)?).into(),
+        );
+        if let Some(stored) = &self.state.genesis {
+            if stored.fingerprint != fingerprint {
+                return Err(CoordinationError::GenesisConflict { domain });
+            }
+            if stored.joined && stored.expected_snapshot_hash != expected_snapshot_hash {
+                return Err(CoordinationError::InvalidSnapshot);
+            }
+            return Ok(ChainRecord {
+                domain,
+                height: self.state.committed.height,
+            });
+        }
+        if self.state.domain.is_some() {
+            return Err(CoordinationError::GenesisConflict { domain });
+        }
+        let mut candidate = self.state.clone();
+        candidate.domain = Some(domain);
+        candidate.genesis_validators = Some(body.initial_roster.clone());
+        candidate.committed.initial_roster = body.initial_roster.clone();
+        candidate
+            .committed
+            .roster_history
+            .insert(1, body.initial_roster.clone());
+        candidate.committed.owner = Some(ChainOwner {
+            user: body.owner_user,
+            root: body.owner_root,
+        });
+        candidate.committed.kind = Some(body.kind);
+        candidate.genesis = Some(StoredGenesis {
+            descriptor,
+            fingerprint,
+            joined: true,
+            expected_snapshot_hash,
+            participants,
+        });
+        self.save_state(&candidate).await?;
+        self.state = candidate;
+        Ok(ChainRecord {
+            domain,
+            height: Height(0),
+        })
+    }
+
+    /// Reads only the durable admission and committed outcome projection.
+    pub(super) fn submission_status(
+        &self,
+        event_id: CoordinationEventId,
+    ) -> Result<SubmissionStatus, CoordinationError> {
+        if self.state.pending.iter().any(|(id, _)| *id == event_id) {
+            return Ok(SubmissionStatus::Pending);
+        }
+        let committed = &self.state.committed;
+        if committed.applied_events.contains(&event_id) || committed.rejected_events.contains_key(&event_id) {
+            let height = *committed
+                .event_heights
+                .get(&event_id)
+                .ok_or(CoordinationError::Encoding)?;
+            if let Some(reason) = committed.rejected_events.get(&event_id) {
+                let reason = match reason {
+                    super::transaction::RejectionReason::UnauthorizedSigner => {
+                        SubmissionRejectionReason::UnauthorizedSigner
+                    }
+                    super::transaction::RejectionReason::InvalidPayload => SubmissionRejectionReason::InvalidPayload,
+                    super::transaction::RejectionReason::ConflictingAction => {
+                        SubmissionRejectionReason::ConflictingAction
+                    }
+                    super::transaction::RejectionReason::StaleRevision => SubmissionRejectionReason::StaleRevision,
+                };
+                return Ok(SubmissionStatus::Rejected { reason, height });
+            }
+            return Ok(SubmissionStatus::Committed { height });
+        }
+        Ok(SubmissionStatus::Absent)
+    }
+
     /// Handles application callbacks; the actor supplies the engine's network sender.
     pub(super) async fn handle_app_msg(
         &mut self,
@@ -172,11 +270,41 @@ impl CoordinationApplication {
     /// Creates and durably records a fresh chain from the caller-selected validator powers.
     pub(super) async fn create_genesis(
         &mut self,
-        roster: Vec<(PublicKey, u64)>,
+        descriptor: SignedBody<GenesisDescriptor>,
     ) -> Result<ChainRecord, CoordinationError> {
+        let body = &descriptor.body;
+        if body.rules_version != AUTHORITY_RULES_VERSION {
+            return Err(CoordinationError::UnsupportedRulesVersion {
+                found: body.rules_version,
+            });
+        }
+        if descriptor.signer != body.owner_root || verify_body(&descriptor, body.domain).is_err() {
+            return Err(CoordinationError::GenesisSignatureInvalid);
+        }
+        Self::validator_set(&body.initial_roster)?;
+        let domain = body.domain;
+        if self.state.legacy {
+            return Err(CoordinationError::LegacyChainReadOnly {
+                domain: self.state.domain.unwrap_or(domain),
+            });
+        }
+        let fingerprint = GenesisFingerprint(
+            Sha256::digest(canonical_json(&descriptor).map_err(|_| CoordinationError::Encoding)?).into(),
+        );
+        if let Some(stored) = &self.state.genesis {
+            if self.state.domain == Some(domain) && stored.fingerprint == fingerprint {
+                return Ok(ChainRecord {
+                    domain,
+                    height: self.state.committed.height,
+                });
+            }
+            return Err(CoordinationError::GenesisConflict { domain });
+        }
+        if let Some(domain) = self.state.domain {
+            return Err(CoordinationError::GenesisConflict { domain });
+        }
         let mut candidate = self.state.clone();
-        if candidate.domain.is_some()
-            || candidate.genesis_validators.is_some()
+        if candidate.genesis_validators.is_some()
             || candidate.committed.height != Height(0)
             || candidate.committed.regenesis.is_some()
             || !candidate.committed.applied_events.is_empty()
@@ -185,12 +313,34 @@ impl CoordinationApplication {
         {
             return Err(CoordinationError::NotImplemented);
         }
-        Self::validator_set(&roster)?;
-        let mut domain_bytes = [0; 32];
-        getrandom::fill(&mut domain_bytes).map_err(|_| CoordinationError::NotImplemented)?;
-        let domain = DomainId::from_bytes(domain_bytes);
         candidate.domain = Some(domain);
-        candidate.genesis_validators = Some(roster);
+        candidate.genesis_validators = Some(descriptor.body.initial_roster.clone());
+        candidate.committed.initial_roster = descriptor.body.initial_roster.clone();
+        candidate
+            .committed
+            .roster_history
+            .insert(1, descriptor.body.initial_roster.clone());
+        candidate.committed.roster_owners.insert(
+            1,
+            descriptor
+                .body
+                .initial_roster
+                .iter()
+                .map(|(key, _)| (*key, descriptor.body.owner_user))
+                .collect(),
+        );
+        candidate.committed.owner = Some(ChainOwner {
+            user: descriptor.body.owner_user,
+            root: descriptor.body.owner_root,
+        });
+        candidate.committed.kind = Some(descriptor.body.kind);
+        candidate.genesis = Some(StoredGenesis {
+            descriptor,
+            fingerprint,
+            joined: false,
+            expected_snapshot_hash: None,
+            participants: Vec::new(),
+        });
         let chain = ChainRecord {
             domain,
             height: candidate.committed.height,
@@ -209,10 +359,12 @@ impl CoordinationApplication {
             return Err(CoordinationError::NotImplemented);
         }
         let domain = self.state.domain.ok_or(CoordinationError::NotImplemented)?;
+        self.ensure_live_rules(domain)?;
         transaction.verify_signature(domain)?;
         transaction.validate_payload()?;
         let event_id = transaction.event_id()?;
         if !self.state.committed.applied_events.contains(&event_id)
+            && !self.state.committed.rejected_events.contains_key(&event_id)
             && !self.state.pending.iter().any(|(id, _)| *id == event_id)
         {
             let mut candidate = self.state.clone();
@@ -230,7 +382,33 @@ impl CoordinationApplication {
 
     pub(super) fn active_chain_consensus_params(&self) -> Result<(DomainId, ConsensusValidatorSet), CoordinationError> {
         let domain = self.state.domain.ok_or(CoordinationError::NotImplemented)?;
+        self.ensure_live_rules(domain)?;
         Ok((domain, Self::height_params(&self.state)?.validator_set))
+    }
+
+    pub(super) fn ensure_live_rules(&self, domain: DomainId) -> Result<(), CoordinationError> {
+        let next = Self::next_height(self.state.committed.height)?.0;
+        if self
+            .state
+            .committed
+            .roster_history
+            .get(&next)
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(CoordinationError::ChainHalted {
+                reason: super::types::ChainHalted::NoEligibleValidators,
+            });
+        }
+        if self.state.legacy {
+            return Err(CoordinationError::LegacyChainReadOnly { domain });
+        }
+        if let Some(genesis) = &self.state.genesis {
+            let found = genesis.descriptor.body.rules_version;
+            if found != AUTHORITY_RULES_VERSION {
+                return Err(CoordinationError::UnsupportedRulesVersion { found });
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn validator_set(roster: &[(PublicKey, u64)]) -> Result<ConsensusValidatorSet, CoordinationError> {
@@ -373,6 +551,8 @@ impl CoordinationApplication {
         let applied = candidate
             .committed
             .apply_transactions(domain, transactions, Height(height))?;
+        super::roster::record_next_roster(&mut candidate.committed, height)
+            .map_err(|_| CoordinationError::InvalidValidatorSet)?;
         candidate.committed.height = Height(height);
         candidate
             .pending
@@ -442,9 +622,68 @@ impl CoordinationApplication {
         let committed = &state.committed;
         let state_json = serde_json::to_string(&ApplicationRecovery {
             domain: state.domain,
+            legacy: state.legacy,
+            genesis: state.genesis.clone(),
             genesis_validators: state.genesis_validators.clone(),
             restream_nonce: state.restream_nonce,
             committed: CommittedRecovery {
+                roster_history: committed
+                    .roster_history
+                    .iter()
+                    .map(|(height, roster)| (*height, roster.clone()))
+                    .collect(),
+                roster_owners: committed
+                    .roster_owners
+                    .iter()
+                    .map(|(height, owners)| (*height, owners.clone()))
+                    .collect(),
+                sharing_notices: committed
+                    .sharing_notices
+                    .iter()
+                    .map(|(key, records)| (*key, records.clone()))
+                    .collect(),
+                sharing_notice_signers: committed
+                    .sharing_notice_signers
+                    .iter()
+                    .map(|(key, signers)| (*key, signers.clone()))
+                    .collect(),
+                share_grants: committed.share_grants.clone(),
+                publications: committed.publications.clone(),
+                envelope_additions: committed.envelope_additions.clone(),
+                verification_reports: committed.verification_reports.clone(),
+                owner_actions: committed.owner_actions.clone(),
+                owner_registration: committed.owner_registration.clone(),
+                invitations: committed
+                    .invitations
+                    .iter()
+                    .map(|(id, record)| (*id, record.clone()))
+                    .collect(),
+                members: committed
+                    .members
+                    .iter()
+                    .map(|(id, record)| (*id, record.clone()))
+                    .collect(),
+                member_power: committed
+                    .member_power
+                    .iter()
+                    .map(|(id, record)| (*id, record.clone()))
+                    .collect(),
+                member_splits: committed
+                    .member_splits
+                    .iter()
+                    .map(|(id, record)| (*id, record.clone()))
+                    .collect(),
+                member_machine_certs: committed
+                    .member_machine_certs
+                    .iter()
+                    .map(|(id, record)| (*id, record.clone()))
+                    .collect(),
+                member_authorities: committed
+                    .member_authorities
+                    .iter()
+                    .map(|(id, record)| (*id, record.clone()))
+                    .collect(),
+                policy: committed.policy.clone(),
                 users: committed
                     .users
                     .iter()
@@ -464,6 +703,16 @@ impl CoordinationApplication {
                 regenesis: committed.regenesis.clone(),
                 height: committed.height,
                 applied_events: committed.applied_events.iter().copied().collect(),
+                rejected_events: committed
+                    .rejected_events
+                    .iter()
+                    .map(|(id, reason)| (*id, *reason))
+                    .collect(),
+                event_heights: committed
+                    .event_heights
+                    .iter()
+                    .map(|(id, height)| (*id, *height))
+                    .collect(),
             },
         })
         .map_err(|_| CoordinationError::Encoding)?;
@@ -524,12 +773,44 @@ impl CoordinationApplication {
         if persisted.domain.is_some() != persisted.genesis_validators.is_some() {
             return Err(CoordinationError::Encoding);
         }
+        if let Some(genesis) = &persisted.genesis {
+            let descriptor = &genesis.descriptor;
+            if persisted.domain != Some(descriptor.body.domain)
+                || persisted.genesis_validators.as_ref() != Some(&descriptor.body.initial_roster)
+            {
+                return Err(CoordinationError::Encoding);
+            }
+            if descriptor.signer != descriptor.body.owner_root
+                || verify_body(descriptor, descriptor.body.domain).is_err()
+            {
+                return Err(CoordinationError::GenesisSignatureInvalid);
+            }
+            let fingerprint = GenesisFingerprint(
+                Sha256::digest(canonical_json(descriptor).map_err(|_| CoordinationError::Encoding)?).into(),
+            );
+            if genesis.fingerprint != fingerprint {
+                return Err(CoordinationError::GenesisConflict {
+                    domain: descriptor.body.domain,
+                });
+            }
+        }
         if let Some(roster) = persisted.genesis_validators.as_deref() {
             Self::validator_set(roster)?;
         }
-        let committed = Self::restore_committed(persisted.committed)?;
+        let mut committed = Self::restore_committed(persisted.committed)?;
+        committed.initial_roster = persisted.genesis_validators.clone().unwrap_or_default();
+        committed.owner = persisted.genesis.as_ref().map(|genesis| ChainOwner {
+            user: genesis.descriptor.body.owner_user,
+            root: genesis.descriptor.body.owner_root,
+        });
+        committed.kind = persisted
+            .genesis
+            .as_ref()
+            .map(|genesis| genesis.descriptor.body.kind);
         let mut state = ApplicationState {
             domain: persisted.domain,
+            legacy: persisted.legacy,
+            genesis: persisted.genesis,
             genesis_validators: persisted.genesis_validators,
             committed,
             pending: Vec::with_capacity(recovery.pending.len()),
@@ -548,7 +829,10 @@ impl CoordinationApplication {
             transaction.validate_payload()?;
             let event_id = transaction.event_id()?;
             transaction.verify_signature(recovery_domain.ok_or(CoordinationError::Encoding)?)?;
-            if !recovered_events.insert(event_id) || state.committed.applied_events.contains(&event_id) {
+            if !recovered_events.insert(event_id)
+                || state.committed.applied_events.contains(&event_id)
+                || state.committed.rejected_events.contains_key(&event_id)
+            {
                 return Err(CoordinationError::Encoding);
             }
             state.pending.push((event_id, transaction));
@@ -578,6 +862,24 @@ impl CoordinationApplication {
         }
         if expected_height - 1 != state.committed.height.0 {
             return Err(CoordinationError::Encoding);
+        }
+
+        // Older recovery units retain the decided values but not the outcome heights.
+        for (height, raw) in &state.committed_values {
+            let value: ConsensusValue =
+                serde_json::from_slice(&raw.value_bytes).map_err(|_| CoordinationError::Encoding)?;
+            for transaction in Self::decode_transactions(&value)? {
+                let event_id = transaction.event_id()?;
+                if state.committed.applied_events.contains(&event_id)
+                    || state.committed.rejected_events.contains_key(&event_id)
+                {
+                    state
+                        .committed
+                        .event_heights
+                        .entry(event_id)
+                        .or_insert(Height(*height));
+                }
+            }
         }
 
         for row in recovery.proposals {
@@ -621,7 +923,34 @@ impl CoordinationApplication {
         if applied_events.len() != value.applied_events.len() {
             return Err(CoordinationError::Encoding);
         }
+        let rejected_events = unique_map(value.rejected_events)?;
+        let event_heights = unique_map(value.event_heights)?;
+        if rejected_events.keys().any(|id| applied_events.contains(id)) {
+            return Err(CoordinationError::Encoding);
+        }
         Ok(CommittedState {
+            initial_roster: Vec::new(),
+            roster_history: unique_map(value.roster_history)?,
+            roster_owners: unique_map(value.roster_owners)?,
+            sharing_notices: unique_map(value.sharing_notices)?,
+            sharing_notice_signers: unique_map(value.sharing_notice_signers)?,
+            share_grants: value.share_grants,
+            publications: value.publications,
+            envelope_additions: value.envelope_additions,
+            verification_reports: value.verification_reports,
+            owner: None,
+            kind: None,
+            owner_actions: value.owner_actions,
+            owner_registration: value.owner_registration,
+            invitations: unique_map(value.invitations)?,
+            members: unique_map(value.members)?,
+            member_power: unique_map(value.member_power)?,
+            member_splits: unique_map(value.member_splits)?,
+            member_machine_certs: unique_map(value.member_machine_certs)?,
+            member_authorities: unique_map(value.member_authorities)?,
+            policy: value.policy,
+            rejected_events,
+            event_heights,
             users,
             machines,
             executions,
@@ -672,7 +1001,15 @@ impl CoordinationApplication {
 
     fn height_params(state: &ApplicationState) -> Result<HeightParams<CoordinationContext>, CoordinationError> {
         let domain = state.domain.ok_or(CoordinationError::NotImplemented)?;
-        let roster = if let Some(regenesis) = &state.committed.regenesis {
+        let next = Self::next_height(state.committed.height)?.0;
+        let roster = if let Some(roster) = state.committed.roster_history.get(&next) {
+            if roster.is_empty() {
+                return Err(CoordinationError::ChainHalted {
+                    reason: super::types::ChainHalted::NoEligibleValidators,
+                });
+            }
+            roster.as_slice()
+        } else if let Some(regenesis) = &state.committed.regenesis {
             if regenesis.successor != domain {
                 return Err(CoordinationError::NotImplemented);
             }
@@ -999,17 +1336,10 @@ impl CoordinationApplication {
     ) -> Result<CoordinationEventId, CoordinationError> {
         let state = &mut self.state;
         let domain = state.domain.ok_or(CoordinationError::NotImplemented)?;
-        transaction.verify_signature(domain)?;
         let event_id = transaction.event_id()?;
-        if state.committed.applied_events.contains(&event_id) {
-            state
-                .pending
-                .retain(|(candidate, _)| *candidate != event_id);
-            return Ok(event_id);
-        }
         let mut committed = state.committed.clone();
-        transaction.apply(&mut committed, height)?;
-        committed.applied_events.insert(event_id);
+        committed.apply_transactions(domain, vec![transaction], height)?;
+        committed.height = height;
         state.committed = committed;
         state
             .pending

@@ -30,6 +30,11 @@ use super::types::{
 /// Key bytes of one peer: its ed25519 node key, which is also its iroh `NodeId`.
 pub type NodeKey = [u8; 32];
 
+/// Encodes a typed value as deterministic JSON with recursively ordered object keys.
+pub(super) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::to_value(value)?)
+}
+
 /// JSON codec shared by the coordination WAL and Malachite's default sync actor.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CoordinationJsonCodec;
@@ -49,7 +54,7 @@ pub(super) fn encode_network_message(
             if matches!(message, SignedConsensusMsg::Vote(vote) if vote.message.extension.is_some()) {
                 return Err(ChainPayloadError::VoteExtensionUnsupported);
             }
-            ChainWireMessage::Consensus(message.clone())
+            ChainWireMessage::Consensus(Box::new(message.clone()))
         }
         MalachiteNetworkMsg::PublishLivenessMsg(message) => ChainWireMessage::Liveness(message.clone()),
         MalachiteNetworkMsg::PublishProposalPart(message) => ChainWireMessage::ProposalPart(message.clone()),
@@ -125,15 +130,15 @@ pub(super) fn decode_network_event(
     }
     let message: ChainWireMessage = serde_json::from_value(value)?;
     Ok(match message {
-        ChainWireMessage::Consensus(SignedConsensusMsg::Vote(vote)) => {
-            if vote.message.extension.is_some() {
-                return Err(ChainPayloadError::VoteExtensionUnsupported);
+        ChainWireMessage::Consensus(message) => match *message {
+            SignedConsensusMsg::Vote(vote) => {
+                if vote.message.extension.is_some() {
+                    return Err(ChainPayloadError::VoteExtensionUnsupported);
+                }
+                NetworkEvent::Vote(peer_id, vote)
             }
-            NetworkEvent::Vote(peer_id, vote)
-        }
-        ChainWireMessage::Consensus(SignedConsensusMsg::Proposal(proposal)) => {
-            NetworkEvent::Proposal(peer_id, proposal)
-        }
+            SignedConsensusMsg::Proposal(proposal) => NetworkEvent::Proposal(peer_id, proposal),
+        },
         ChainWireMessage::Liveness(LivenessMsg::Vote(vote)) => {
             if vote.message.extension.is_some() {
                 return Err(ChainPayloadError::VoteExtensionUnsupported);
@@ -414,6 +419,19 @@ struct ValidatorProofDef {
 enum SignedConsensusMsgDef {
     Vote(#[serde(with = "SignedVoteDef")] SignedVote<ConsensusContext>),
     Proposal(#[serde(with = "SignedProposalDef")] SignedProposal<ConsensusContext>),
+}
+
+mod boxed_signed_consensus_msg {
+    use serde::Serializer;
+
+    use super::{ConsensusContext, SignedConsensusMsg, SignedConsensusMsgDef};
+
+    pub fn serialize<S>(value: &SignedConsensusMsg<ConsensusContext>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SignedConsensusMsgDef::serialize(value, serializer)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -730,8 +748,8 @@ mod optional_responses {
 #[derive(Serialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub(super) enum ChainWireMessage {
-    Transaction(PendingTransaction),
-    Consensus(#[serde(with = "SignedConsensusMsgDef")] SignedConsensusMsg<ConsensusContext>),
+    Transaction(Box<PendingTransaction>),
+    Consensus(#[serde(with = "boxed_signed_consensus_msg")] Box<SignedConsensusMsg<ConsensusContext>>),
     Liveness(#[serde(with = "LivenessMsgDef")] LivenessMsg<ConsensusContext>),
     ProposalPart(#[serde(with = "StreamMessageDef")] StreamMessage<ConsensusProposalPart>),
     ValidatorProof(#[serde(with = "ValidatorProofDef")] ValidatorProof<ConsensusContext>),
@@ -767,8 +785,8 @@ struct NetworkStatusOwned(#[serde(with = "NetworkStatusDef")] NetworkStatus<Cons
 #[derive(Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 enum ChainWireMessageOwned {
-    Transaction(PendingTransaction),
-    Consensus(ConsensusOwned),
+    Transaction(Box<PendingTransaction>),
+    Consensus(Box<ConsensusOwned>),
     Liveness(LivenessOwned),
     ProposalPart(ProposalPartOwned),
     ValidatorProof(ValidatorProofOwned),
@@ -789,7 +807,7 @@ impl<'de> Deserialize<'de> for ChainWireMessage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(match ChainWireMessageOwned::deserialize(deserializer)? {
             ChainWireMessageOwned::Transaction(value) => Self::Transaction(value),
-            ChainWireMessageOwned::Consensus(value) => Self::Consensus(value.0),
+            ChainWireMessageOwned::Consensus(value) => Self::Consensus(Box::new((*value).0)),
             ChainWireMessageOwned::Liveness(value) => Self::Liveness(value.0),
             ChainWireMessageOwned::ProposalPart(value) => Self::ProposalPart(value.0),
             ChainWireMessageOwned::ValidatorProof(value) => Self::ValidatorProof(value.0),
@@ -984,7 +1002,7 @@ mod tests {
             ChainSignature([2; 64]),
         );
         let messages = [
-            ChainWireMessage::Consensus(SignedConsensusMsg::Vote(vote.clone())),
+            ChainWireMessage::Consensus(Box::new(SignedConsensusMsg::Vote(vote.clone()))),
             ChainWireMessage::Liveness(LivenessMsg::Vote(vote)),
             ChainWireMessage::ProposalPart(StreamMessage::new(
                 StreamId::new(vec![1, 2].into()),

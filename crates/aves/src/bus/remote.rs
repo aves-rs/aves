@@ -14,7 +14,7 @@ use iroh::{Endpoint, EndpointAddr};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::auth::{AvesAuthError, Jwt, MachineIssuerId, issuer_from_jwt};
+use crate::auth::{AuthAdmissionRegistry, AvesAuthError, Jwt, MachineIssuerId, NativeProtocol, issuer_from_jwt};
 
 use super::messages::{BusIngress, BusRpcContext};
 use super::operations::{DomainPublication, RequestOperationDescriptor};
@@ -87,7 +87,7 @@ pub(crate) struct RemoteOperationRequest {
 /// Runtime-owned installer for the generated public Bus operation surface.
 /// It captures descriptors only; transport ownership remains with IrohSubstrate.
 pub struct RemoteOperationInstaller {
-    install: Box<dyn Fn(BusIngress) -> IrohProtocolHandler + Send + Sync>,
+    install: Box<dyn Fn(BusIngress, AuthAdmissionRegistry) -> IrohProtocolHandler + Send + Sync>,
 }
 
 impl RemoteOperationInstaller {
@@ -98,7 +98,7 @@ impl RemoteOperationInstaller {
         RootError: serde::Serialize + Send + Sync + 'static,
     {
         Self {
-            install: Box::new(move |bus| {
+            install: Box::new(move |bus, registry| {
                 let publications = Arc::new(
                     descriptors
                         .iter()
@@ -112,9 +112,10 @@ impl RemoteOperationInstaller {
                 let handler = move |peer: iroh::PublicKey, request: Vec<u8>| {
                     let publications = publications.clone();
                     let bus = bus.clone();
+                    let registry = registry.clone();
                     Box::pin(async move {
                         let result: Result<Vec<u8>, Box<dyn StdError + Send + Sync>> =
-                            dispatch(peer, &request, &publications, bus)
+                            dispatch(peer, &request, &publications, bus, &registry)
                                 .await
                                 .map_err(|error| Box::new(error) as Box<dyn StdError + Send + Sync>);
                         result
@@ -125,8 +126,8 @@ impl RemoteOperationInstaller {
         }
     }
 
-    pub(crate) fn install(self, bus: BusIngress) -> IrohProtocolHandler {
-        (self.install)(bus)
+    pub(crate) fn install(self, bus: BusIngress, registry: AuthAdmissionRegistry) -> IrohProtocolHandler {
+        (self.install)(bus, registry)
     }
 }
 
@@ -137,6 +138,7 @@ pub(crate) async fn dispatch<RootError>(
     request: &[u8],
     publications: &[DomainPublication<BusRpcContext, RootError>],
     bus: BusIngress,
+    registry: &AuthAdmissionRegistry,
 ) -> Result<Vec<u8>, RemoteOperationError>
 where
     RootError: Serialize + Send + 'static,
@@ -166,6 +168,14 @@ where
         let reply = RemoteOperationReply::<RootError>::Rejected(RemoteOperationRejection::UnknownOperation);
         return serialize_reply(&reply);
     };
+
+    if !registry.allows_protocol(&peer_issuer, NativeProtocol::Bus)
+        || !registry.allows_operation(&peer_issuer, &request.qualified_operation)
+    {
+        return serialize_reply(&RemoteOperationReply::<RootError>::Rejected(
+            RemoteOperationRejection::NotAuthorized,
+        ));
+    }
 
     let context = BusRpcContext::authenticated(bus, request.jwt);
     let reply = match (operation.dispatch)(context, request.input).await {
@@ -237,6 +247,7 @@ where
 pub enum RemoteOperationRejection {
     MalformedRequest,
     UnknownOperation,
+    NotAuthorized,
 }
 
 /// Reply returned by the generated public-operation dispatch path.
@@ -289,4 +300,167 @@ pub enum RemoteOperationError {
         expected: iroh::EndpointId,
         actual: iroh::EndpointId,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    use super::*;
+    use crate::auth::{ApprovedIssuer, OperationGrants, PeerGrants, QualifiedOperation, RelationshipKey};
+    use crate::bus::{OperationDispatchFuture, RequestOperationKind};
+
+    fn dispatch_test(_: BusRpcContext, _: serde_json::Value) -> OperationDispatchFuture<String> {
+        Box::pin(async { Ok(serde_json::json!("invoked")) })
+    }
+
+    static OPERATIONS: [RequestOperationDescriptor<BusRpcContext, String>; 1] = [RequestOperationDescriptor {
+        domain: "test",
+        operation: "read",
+        qualified_operation: "test.read",
+        canonical_variant: "TestRequest::Read",
+        kind: RequestOperationKind::Query,
+        mcp_eligible: true,
+        input_type: "ReadInput",
+        response_type: "ReadOutput",
+        response_variant: "Read",
+        input_schema: schemars::Schema::default,
+        output_schema: schemars::Schema::default,
+        dispatch: dispatch_test,
+    }];
+
+    #[tokio::test]
+    async fn remote_dispatch_enforces_current_grants_before_invocation() {
+        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let issuer = MachineIssuerId::from(peer);
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local.into(),
+            relationships: Default::default(),
+        });
+        let relationship = RelationshipKey("sharing".into());
+        let bootstrap = PeerGrants {
+            protocols: [NativeProtocol::AuthFirstContact, NativeProtocol::Bus]
+                .into_iter()
+                .collect(),
+            operations: OperationGrants::Only(
+                [QualifiedOperation("test.bootstrap".into())]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        registry
+            .upsert_remote(ApprovedIssuer {
+                issuer: issuer.clone(),
+                relationships: [(relationship.clone(), bootstrap)].into_iter().collect(),
+            })
+            .unwrap();
+        assert!(!registry.allows_protocol(&issuer, NativeProtocol::Gossip));
+        assert!(!registry.allows_protocol(&issuer, NativeProtocol::Blobs));
+
+        let claims = serde_json::json!({"iss": issuer.to_string(), "aud": uuid::Uuid::nil(), "sub": "test", "jti": uuid::Uuid::nil(), "exp": 1, "cap": ["all_bus"]});
+        let jwt = Jwt::from_opaque(format!(
+            "x.{}.x",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        ));
+        let request = |name: &str| {
+            serde_json::to_vec(&RemoteOperationRequest {
+                qualified_operation: name.into(),
+                input: serde_json::Value::Null,
+                jwt: jwt.clone(),
+            })
+            .unwrap()
+        };
+        let publications = [DomainPublication {
+            server_name: "test",
+            route_slug: "test",
+            operations: &OPERATIONS,
+        }];
+        let (bus, _receiver) = tokio::sync::mpsc::channel(1);
+        let reply = dispatch(peer, &request("test.read"), &publications, bus.clone(), &registry)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<RemoteOperationReply<String>>(&reply).unwrap(),
+            RemoteOperationReply::Rejected(RemoteOperationRejection::NotAuthorized)
+        ));
+        let reply = dispatch(peer, &request("test.unknown"), &publications, bus.clone(), &registry)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<RemoteOperationReply<String>>(&reply).unwrap(),
+            RemoteOperationReply::Rejected(RemoteOperationRejection::UnknownOperation)
+        ));
+
+        let without_bus = PeerGrants {
+            protocols: [NativeProtocol::AuthFirstContact].into_iter().collect(),
+            operations: OperationGrants::All,
+        };
+        registry
+            .upsert_remote(ApprovedIssuer {
+                issuer: issuer.clone(),
+                relationships: [(relationship.clone(), without_bus)].into_iter().collect(),
+            })
+            .unwrap();
+        let reply = dispatch(peer, &request("test.read"), &publications, bus.clone(), &registry)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<RemoteOperationReply<String>>(&reply).unwrap(),
+            RemoteOperationReply::Rejected(RemoteOperationRejection::NotAuthorized)
+        ));
+
+        let sharing = PeerGrants {
+            protocols: [
+                NativeProtocol::AuthFirstContact,
+                NativeProtocol::Bus,
+                NativeProtocol::Gossip,
+                NativeProtocol::Blobs,
+            ]
+            .into_iter()
+            .collect(),
+            operations: OperationGrants::Only(
+                [QualifiedOperation("test.read".into())]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        registry
+            .upsert_remote(ApprovedIssuer {
+                issuer: issuer.clone(),
+                relationships: [(relationship.clone(), sharing)].into_iter().collect(),
+            })
+            .unwrap();
+        assert!(registry.allows_protocol(&issuer, NativeProtocol::Gossip));
+        assert!(registry.allows_protocol(&issuer, NativeProtocol::Blobs));
+        let reply = dispatch(peer, &request("test.read"), &publications, bus.clone(), &registry)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<RemoteOperationReply<String>>(&reply).unwrap(),
+            RemoteOperationReply::Success(_)
+        ));
+        registry
+            .upsert_remote(ApprovedIssuer {
+                issuer: issuer.clone(),
+                relationships: [(relationship, PeerGrants::full())].into_iter().collect(),
+            })
+            .unwrap();
+        let reply = dispatch(peer, &request("test.read"), &publications, bus, &registry)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<RemoteOperationReply<String>>(&reply).unwrap(),
+            RemoteOperationReply::Success(_)
+        ));
+        registry.remove_remote(&issuer).unwrap();
+        let (bus, _receiver) = tokio::sync::mpsc::channel(1);
+        let reply = dispatch(peer, &request("test.read"), &publications, bus, &registry)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<RemoteOperationReply<String>>(&reply).unwrap(),
+            RemoteOperationReply::Rejected(RemoteOperationRejection::NotAuthorized)
+        ));
+    }
 }

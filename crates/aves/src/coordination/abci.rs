@@ -1,25 +1,74 @@
 //! Actor-owned coordination application state, queries, persistence, and recovery.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use arc_malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use arc_malachitebft_core_types::{ThresholdParams, ValidatorSet as _};
 use arc_malachitebft_signing::VerifierExt;
 use sha2::{Digest, Sha256};
 
+use super::membership::OwnerAction;
 use super::persistence::{CoordinationStore, DecidedRow, RecoveryState};
 use super::signing::CoordinationVerifier;
 use super::transaction::{
-    ApplicationRecovery, IdleValueReply, PendingTransaction, ProposalPartAssembly, ProposalRecovery,
+    ApplicationRecovery, IdleValueReply, PendingTransaction, ProposalPartAssembly, ProposalRecovery, RejectionReason,
 };
 use super::types::{
-    ChainRecord, CommittedSnapshot, ConsensusValue, CoordinationContext, CoordinationError, CoordinationEventId,
-    CoordinationExecutionId, DomainId, ExecutionRecord, Height, MachineId, MachineRecord, PublicKey, RecordHash,
-    Regenesis, SchemaActivated, SignedBody, SnapshotDecided, UserId, UserRecord,
+    ChainKind, ChainPolicyRecord, ChainRecord, CommittedSnapshot, ConsensusValue, CoordinationContext,
+    CoordinationError, CoordinationEventId, CoordinationExecutionId, DomainId, EnvelopeAddition, ExecutionRecord,
+    GenesisDescriptor, GenesisFingerprint, Height, InvitationId, InvitationRecord, MachineId, MachineRecord,
+    MemberAuthority, MemberMachineCertUpdate, MemberPowerRecord, MemberRecord, MemberValidatorSplitRecord,
+    OwnerRegistration, PublicKey, PublicationRecord, RecordHash, Regenesis, SchemaActivated, ShareGrantChanged,
+    SharingNotice, SharingNoticeKey, SignedBody, SnapshotDecided, UserId, UserRecord, VerificationReport,
 };
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct StoredGenesis {
+    pub(super) descriptor: SignedBody<GenesisDescriptor>,
+    pub(super) fingerprint: GenesisFingerprint,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(super) joined: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) expected_snapshot_hash: Option<RecordHash>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) participants: Vec<PublicKey>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[derive(Clone)]
+pub(super) struct ChainOwner {
+    pub(super) user: UserId,
+    pub(super) root: PublicKey,
+}
 
 #[derive(Clone)]
 pub(super) struct CommittedState {
+    pub(super) initial_roster: Vec<(PublicKey, u64)>,
+    pub(super) roster_history: BTreeMap<u64, Vec<(PublicKey, u64)>>,
+    pub(super) roster_owners: BTreeMap<u64, Vec<(PublicKey, UserId)>>,
+    pub(super) sharing_notices: BTreeMap<SharingNoticeKey, Vec<SharingNotice>>,
+    pub(super) sharing_notice_signers: BTreeMap<SharingNoticeKey, Vec<Option<PublicKey>>>,
+    pub(super) share_grants: Vec<ShareGrantChanged>,
+    pub(super) publications: Vec<PublicationRecord>,
+    pub(super) envelope_additions: Vec<EnvelopeAddition>,
+    pub(super) verification_reports: Vec<VerificationReport>,
+    pub(super) owner: Option<ChainOwner>,
+    pub(super) kind: Option<ChainKind>,
+    pub(super) owner_registration: Option<OwnerRegistration>,
+    pub(super) owner_actions: Vec<OwnerAction>,
+    pub(super) invitations: BTreeMap<InvitationId, InvitationRecord>,
+    pub(super) members: BTreeMap<UserId, MemberRecord>,
+    pub(super) member_power: BTreeMap<UserId, MemberPowerRecord>,
+    pub(super) member_splits: BTreeMap<UserId, MemberValidatorSplitRecord>,
+    pub(super) member_machine_certs: BTreeMap<(UserId, MachineId), MemberMachineCertUpdate>,
+    pub(super) member_authorities: BTreeMap<UserId, MemberAuthority>,
+    pub(super) policy: Option<ChainPolicyRecord>,
+    pub(super) rejected_events: BTreeMap<CoordinationEventId, RejectionReason>,
+    pub(super) event_heights: BTreeMap<CoordinationEventId, Height>,
     pub(super) users: BTreeMap<UserId, UserRecord>,
     pub(super) machines: BTreeMap<MachineId, MachineRecord>,
     pub(super) executions: BTreeMap<[u8; 16], ExecutionRecord>,
@@ -32,6 +81,28 @@ pub(super) struct CommittedState {
 impl Default for CommittedState {
     fn default() -> Self {
         Self {
+            initial_roster: Vec::new(),
+            roster_history: BTreeMap::new(),
+            roster_owners: BTreeMap::new(),
+            sharing_notices: BTreeMap::new(),
+            sharing_notice_signers: BTreeMap::new(),
+            share_grants: Vec::new(),
+            publications: Vec::new(),
+            envelope_additions: Vec::new(),
+            verification_reports: Vec::new(),
+            owner: None,
+            kind: None,
+            owner_registration: None,
+            owner_actions: Vec::new(),
+            invitations: BTreeMap::new(),
+            members: BTreeMap::new(),
+            member_power: BTreeMap::new(),
+            member_splits: BTreeMap::new(),
+            member_machine_certs: BTreeMap::new(),
+            member_authorities: BTreeMap::new(),
+            policy: None,
+            rejected_events: BTreeMap::new(),
+            event_heights: BTreeMap::new(),
             users: BTreeMap::new(),
             machines: BTreeMap::new(),
             executions: BTreeMap::new(),
@@ -46,6 +117,8 @@ impl Default for CommittedState {
 #[derive(Clone, Default)]
 pub(super) struct ApplicationState {
     pub(super) domain: Option<DomainId>,
+    pub(super) legacy: bool,
+    pub(super) genesis: Option<StoredGenesis>,
     pub(super) genesis_validators: Option<Vec<(PublicKey, u64)>>,
     pub(super) committed: CommittedState,
     pub(super) pending: Vec<(CoordinationEventId, PendingTransaction)>,
@@ -61,7 +134,7 @@ pub(super) struct ApplicationState {
 /// decided values, and proposal replay data; consensus and transport remain engine-owned.
 pub(super) struct CoordinationApplication {
     pub(super) state: ApplicationState,
-    store: CoordinationStore,
+    store: Arc<CoordinationStore>,
     pub(super) idle_value_replies: Vec<IdleValueReply>,
 }
 
@@ -71,6 +144,9 @@ impl CoordinationApplication {
         &mut self,
         record: SignedBody<Regenesis>,
     ) -> Result<CoordinationEventId, CoordinationError> {
+        if let Some(domain) = self.state.domain {
+            self.ensure_live_rules(domain)?;
+        }
         let transaction = PendingTransaction::Regenesis(record.clone());
         let event_id = transaction.event_id()?;
         let body = &record.body;
@@ -129,9 +205,13 @@ impl CoordinationApplication {
         candidate.committed.height = Height(0);
         candidate.committed.regenesis = Some(body.clone());
         candidate.committed.applied_events.insert(event_id);
+        candidate
+            .committed
+            .event_heights
+            .insert(event_id, Height(0));
         let successor = Self::recovery_state(&candidate)?;
         self.store
-            .save_successor(body.predecessor, &previous, &successor)
+            .save_successor(body.predecessor, &previous, body.successor, &successor)
             .await?;
         self.state = candidate;
         self.cancel_value_requests();
@@ -172,6 +252,11 @@ impl CoordinationApplication {
         let recovery = Self::recovery_state(state)?;
         let mut application: ApplicationRecovery =
             serde_json::from_str(&recovery.state_json).map_err(|_| CoordinationError::Encoding)?;
+        if let Some(genesis) = &mut application.genesis {
+            genesis.joined = false;
+            genesis.expected_snapshot_hash = None;
+            genesis.participants.clear();
+        }
         application.restream_nonce = 0;
         application
             .committed
@@ -229,7 +314,19 @@ impl CoordinationApplication {
                 })
                 .collect(),
         };
-        let candidate = Self::restore_recovery(recovery)?;
+        let mut candidate = Self::restore_recovery(recovery)?;
+        if candidate.legacy {
+            return Err(CoordinationError::LegacyChainReadOnly {
+                domain: snapshot.domain,
+            });
+        }
+        if let Some(genesis) = &candidate.genesis
+            && genesis.descriptor.body.rules_version != super::types::AUTHORITY_RULES_VERSION
+        {
+            return Err(CoordinationError::UnsupportedRulesVersion {
+                found: genesis.descriptor.body.rules_version,
+            });
+        }
         let roster = candidate
             .genesis_validators
             .as_deref()
@@ -241,6 +338,15 @@ impl CoordinationApplication {
         }
         let verifier = CoordinationVerifier::new(snapshot.domain);
         for value in candidate.committed_values.values() {
+            let height = value.certificate.height.0;
+            let validators = match candidate.committed.roster_history.get(&height) {
+                Some(roster) => Self::validator_set(roster)?,
+                None if candidate.committed.roster_history.is_empty() => validators.clone(),
+                None => return Err(CoordinationError::InvalidSnapshot),
+            };
+            if validators.total_voting_power() > u64::MAX / 3 {
+                return Err(CoordinationError::InvalidValidatorSet);
+            }
             verifier
                 .verify_commit_certificate(
                     &CoordinationContext,
@@ -251,7 +357,29 @@ impl CoordinationApplication {
                 .await
                 .map_err(|_| CoordinationError::SignatureInvalid)?;
         }
-        if self.state.domain.is_some() {
+        let joined = self.state.genesis.as_ref().filter(|genesis| genesis.joined);
+        if let Some(pin) = joined {
+            if pin
+                .expected_snapshot_hash
+                .is_some_and(|hash| hash != expected_hash)
+                || candidate
+                    .genesis
+                    .as_ref()
+                    .is_none_or(|genesis| genesis.fingerprint != pin.fingerprint)
+                || self.state.committed.height != Height(0)
+                || !self.state.pending.is_empty()
+                || !self.state.committed_values.is_empty()
+            {
+                return Err(CoordinationError::InvalidSnapshot);
+            }
+            let genesis = candidate
+                .genesis
+                .as_mut()
+                .ok_or(CoordinationError::InvalidSnapshot)?;
+            genesis.joined = true;
+            genesis.expected_snapshot_hash = None;
+            genesis.participants.clone_from(&pin.participants);
+        } else if self.state.domain.is_some() {
             let current = self.export_snapshot(None)?;
             if current.domain == snapshot.domain && current.height == snapshot.height && current.hash == snapshot.hash {
                 return Ok(ChainRecord {
@@ -262,20 +390,22 @@ impl CoordinationApplication {
             return Err(CoordinationError::SnapshotHostNotEmpty);
         }
         let existing = &self.state;
-        if existing.genesis_validators.is_some()
-            || existing.committed.height != Height(0)
-            || !existing.committed.users.is_empty()
-            || !existing.committed.machines.is_empty()
-            || !existing.committed.executions.is_empty()
-            || !existing.committed.schemas.is_empty()
-            || existing.committed.regenesis.is_some()
-            || !existing.committed.applied_events.is_empty()
-            || !existing.pending.is_empty()
-            || !existing.proposals.is_empty()
-            || !existing.committed_values.is_empty()
-            || !existing.proposal_parts.is_empty()
-            || existing.restream_nonce != 0
-            || !self.idle_value_replies.is_empty()
+        if joined.is_none()
+            && (existing.genesis_validators.is_some()
+                || existing.committed.height != Height(0)
+                || !existing.committed.users.is_empty()
+                || !existing.committed.machines.is_empty()
+                || !existing.committed.executions.is_empty()
+                || !existing.committed.schemas.is_empty()
+                || existing.committed.regenesis.is_some()
+                || !existing.committed.applied_events.is_empty()
+                || !existing.committed.rejected_events.is_empty()
+                || !existing.pending.is_empty()
+                || !existing.proposals.is_empty()
+                || !existing.committed_values.is_empty()
+                || !existing.proposal_parts.is_empty()
+                || existing.restream_nonce != 0
+                || !self.idle_value_replies.is_empty())
         {
             return Err(CoordinationError::SnapshotHostNotEmpty);
         }
@@ -300,7 +430,7 @@ impl CoordinationApplication {
 
     /// Restores one application instance with the actor-opened store and its recovery snapshot.
     pub(super) fn with_store(
-        store: CoordinationStore,
+        store: Arc<CoordinationStore>,
         recovery: Option<RecoveryState>,
     ) -> Result<Self, CoordinationError> {
         let state = recovery
@@ -378,7 +508,9 @@ impl CoordinationApplication {
 
     pub(super) async fn save_state(&self, state: &ApplicationState) -> Result<(), CoordinationError> {
         let recovery = Self::recovery_state(state)?;
-        self.store.save(&recovery).await
+        self.store
+            .save(state.domain.ok_or(CoordinationError::Encoding)?, &recovery)
+            .await
     }
 
     /// Builds a JSON application value only when admitted transactions exist.

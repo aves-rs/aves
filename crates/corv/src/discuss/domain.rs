@@ -15,10 +15,11 @@ use super::boot::{DiscussBootOptions, DiscussSettings};
 use super::handle::new as construct_discuss_domain;
 use super::messages::{
     AgentNodeStartedOutput, AgentNodeTickedOutput, AnswerElicitationInput, AnswerPermissionInput, AssignMcpInput,
-    CancelAgentExecutionInput, CancelElicitationInput, CancelSessionInput, CancelTurnInput, CreateCustomMcpInput,
-    DeleteCustomMcpInput, DiscussBroadcast, DiscussPrivilegedAnswerElicitation, DiscussPrivilegedAnswerPermission,
-    DiscussPrivilegedAssignMcp, DiscussPrivilegedCancelAgentExecution, DiscussPrivilegedCancelElicitation,
-    DiscussPrivilegedCancelSession, DiscussPrivilegedCancelTurn, DiscussPrivilegedCreateCustomMcp,
+    CancelAgentExecutionInput, CancelElicitationInput, CancelSessionInput, CancelTurnInput,
+    ChangeSessionWorkingDirInput, CreateCustomMcpInput, DeleteCustomMcpInput, DiscussBroadcast,
+    DiscussPrivilegedAnswerElicitation, DiscussPrivilegedAnswerPermission, DiscussPrivilegedAssignMcp,
+    DiscussPrivilegedCancelAgentExecution, DiscussPrivilegedCancelElicitation, DiscussPrivilegedCancelSession,
+    DiscussPrivilegedCancelTurn, DiscussPrivilegedChangeSessionWorkingDir, DiscussPrivilegedCreateCustomMcp,
     DiscussPrivilegedDeleteCustomMcp, DiscussPrivilegedDisposeInspector, DiscussPrivilegedImportCustomAgentFromUrl,
     DiscussPrivilegedImportCustomSkillFromUrl, DiscussPrivilegedInstallProviderConfig,
     DiscussPrivilegedRemoveProviderConfig, DiscussPrivilegedReserveInspector, DiscussPrivilegedResolveSessionIdentity,
@@ -74,6 +75,7 @@ aves::domain! {
         CancelElicitation => Success,
         CancelTurn => Success,
         CancelSession => Success,
+        ChangeSessionWorkingDir => Success,
         ReserveInspector => ReserveInspector,
         StartInspector => Success,
         DisposeInspector => Success,

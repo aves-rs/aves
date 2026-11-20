@@ -7,7 +7,12 @@ use crate::runtime::{
 use crate::utils::errors::SharedInfraError;
 
 use super::handle::Handle;
-use super::messages::{CoordinationBroadcast, CoordinationRequest, CoordinationRequestPayload, CoordinationResponse};
+use super::messages::{
+    CoordinationBroadcast, CoordinationPrivilegedSignMachineRecord, CoordinationPrivilegedStartAllServers,
+    CoordinationPrivilegedStopAllServers, CoordinationRequest, CoordinationRequestPayload, CoordinationResponse,
+    CoordinationSudoServicePrivilegeMapping, ServerStartedOutput, ServerStoppedOutput, SignMachineRecordInput,
+    SignedMachineRecordOutput, StartAllServersInput, StopAllServersInput,
+};
 use super::types::CoordinationError;
 
 /// Marker for application-neutral chain coordination bus requests.
@@ -20,6 +25,15 @@ aves::domain! {
     error = CoordinationError
     transport = SharedInfraError
     target = "coordination";
+
+    pub service CoordinationSigningService {
+        SignMachineRecord => SignedMachineRecord,
+    }
+
+    pub service CoordinationLifecycleService {
+        StartAllServers => ServerStarted,
+        StopAllServers => ServerStopped,
+    }
 
     outbound CoordinationBroadcast => CoordinationBroadcast {
         event => event,
@@ -45,7 +59,8 @@ where
                 .0
                 .clone();
             let sync_services = facade.reader::<dyn MachinePeerService>();
-            let future = Handle::new(facade.bus_mut(), config_dir, sync_services);
+            let signing_service = facade.publisher::<dyn CoordinationSigningService>();
+            let future = Handle::new(facade.bus_mut(), config_dir, sync_services, signing_service);
             Box::pin(async move {
                 let handle = future.await;
                 tokio::spawn(handle.run());
@@ -66,7 +81,7 @@ impl CoordinationDomain {
         let result =
             dispatch_lifecycle_request::<CoordinationDomain, _, _, _>(context, |reply_to| CoordinationRequest {
                 reply_to,
-                payload: CoordinationRequestPayload::StartServer,
+                payload: CoordinationRequestPayload::StartAllServers,
             })
             .await;
         if !matches!(&result, Some(Ok(CoordinationResponse::ServerStarted))) {
@@ -79,7 +94,7 @@ impl CoordinationDomain {
         let result =
             dispatch_lifecycle_request::<CoordinationDomain, _, _, _>(context, |reply_to| CoordinationRequest {
                 reply_to,
-                payload: CoordinationRequestPayload::StopServer,
+                payload: CoordinationRequestPayload::StopAllServers,
             })
             .await;
         if !matches!(&result, Some(Ok(CoordinationResponse::ServerStopped))) {

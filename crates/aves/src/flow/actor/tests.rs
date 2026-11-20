@@ -98,6 +98,20 @@ struct TestAuth;
 
 #[async_trait]
 impl AuthSudoService for TestAuth {
+    async fn set_peer_relationship(
+        &self,
+        _input: crate::auth::messages::SetPeerRelationshipInput,
+    ) -> Result<SuccessOutput, AvesAuthError> {
+        Err(AvesAuthError::PeerGrantsPending)
+    }
+
+    async fn read_peer_grants(
+        &self,
+        _input: crate::auth::messages::ReadPeerGrantsInput,
+    ) -> Result<crate::auth::messages::PeerGrantsOutput, AvesAuthError> {
+        Err(AvesAuthError::PeerGrantsPending)
+    }
+
     async fn issue_jwt(&self, _input: IssueJwtInput) -> Result<DelegatedJwtIssuedOutput, AvesAuthError> {
         Ok(DelegatedJwtIssuedOutput {
             token: Jwt::from_opaque("test-node-token".to_owned()),

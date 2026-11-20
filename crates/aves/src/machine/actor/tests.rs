@@ -29,7 +29,15 @@ fn issuer() -> MachineIssuerId {
 }
 
 fn registry(local: &MachineIssuerId) -> AuthAdmissionRegistry {
-    AuthAdmissionRegistry::new(ApprovedIssuer { issuer: local.clone() })
+    AuthAdmissionRegistry::new(ApprovedIssuer {
+        issuer: local.clone(),
+        relationships: [(
+            crate::auth::RelationshipKey("test".to_owned()),
+            crate::auth::PeerGrants::full(),
+        )]
+        .into_iter()
+        .collect(),
+    })
 }
 
 #[test]
@@ -44,7 +52,15 @@ fn peers_list_only_admitted_remote_machines() {
     let remote = issuer();
     let registry = registry(&local);
     registry
-        .upsert_remote(ApprovedIssuer { issuer: remote.clone() })
+        .upsert_remote(ApprovedIssuer {
+            issuer: remote.clone(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
+        })
         .expect("remote admitted");
 
     let availability = peers(&registry, &local);
@@ -257,7 +273,15 @@ async fn status_reports_inventory_and_admitted_peers() {
     let remote = issuer();
     harness
         .registry
-        .upsert_remote(ApprovedIssuer { issuer: remote.clone() })
+        .upsert_remote(ApprovedIssuer {
+            issuer: remote.clone(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
+        })
         .expect("remote admitted");
     let response = actor
         .handle_message(MachineRequestPayload::ReadMachineStatus {})
@@ -316,7 +340,12 @@ async fn peer_server_transitions_broadcast_once_and_repeated_requests_succeed() 
         .await
         .expect("prepare peer substrate");
     let services = substrate.peer_services();
-    let running = substrate.start(None, AuthFirstContactHandler::new(pairing.clone()), pairing);
+    let running = substrate.start(
+        None,
+        AuthFirstContactHandler::new(pairing.clone()),
+        pairing,
+        admission.clone(),
+    );
     let (_sender, requests) = mpsc::channel(1);
     let (broadcasts, mut receiver) = mpsc::channel(16);
     let mut actor = Actor::new(
@@ -688,6 +717,12 @@ async fn peer_fetch_denies_unadmitted_removed_self_and_disabled_before_network()
         .registry
         .upsert_remote(ApprovedIssuer {
             issuer: remote_id.clone(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
         })
         .expect("admit remote");
     assert!(matches!(

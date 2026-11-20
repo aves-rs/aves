@@ -1922,6 +1922,13 @@ pub enum DiscussError {
         discuss_session_id: DiscussSessionId,
     },
 
+    /// The session has an active turn that cannot be disturbed.
+    #[error("Discuss session busy: discuss_session_id={discuss_session_id}")]
+    SessionBusy {
+        /// Session id with an active turn.
+        discuss_session_id: DiscussSessionId,
+    },
+
     /// Provider did not advertise the capability required for the operation.
     #[error("Discuss unsupported capability: {capability}")]
     UnsupportedCapability {
@@ -2216,6 +2223,7 @@ impl DiscussError {
             DiscussError::WorkspaceInvalidAssetId { .. } => "WorkspaceInvalidAssetId",
             DiscussError::InvalidWorkspaceCopySource { .. } => "InvalidWorkspaceCopySource",
             DiscussError::SessionNotFound { .. } => "SessionNotFound",
+            DiscussError::SessionBusy { .. } => "SessionBusy",
             DiscussError::UnsupportedCapability { .. } => "UnsupportedCapability",
             DiscussError::InspectorUnavailable { .. } => "InspectorUnavailable",
             DiscussError::InspectorLoadFailed { .. } => "InspectorLoadFailed",

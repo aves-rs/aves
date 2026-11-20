@@ -13,7 +13,9 @@ use specta::{DataType, Generics, Type, TypeCollection};
 use zeroize::Zeroize;
 
 use super::peer::{PeerConfig, PeerEndpoint, PeerRecord, PeerTrustState};
-use super::types::{ApprovedIssuer, AuthAdmissionRegistry, AvesAuthError, MachineIssuerId};
+use super::types::{
+    ApprovedIssuer, AuthAdmissionRegistry, AvesAuthError, MachineIssuerId, PeerGrants, RelationshipKey,
+};
 
 pub(crate) const AUTH_ALPN: &[u8] = b"aves_app/auth";
 
@@ -158,6 +160,7 @@ pub struct PairingCoordinator {
     endpoint: Option<Endpoint>,
     endpoint_addr: Option<EndpointAddr>,
     invitations: Vec<InvitationRecord>,
+    confirmation_grants: PeerGrants,
 }
 
 #[derive(Clone)]
@@ -168,13 +171,24 @@ struct InvitationRecord {
 }
 
 impl PairingCoordinator {
+    #[cfg(test)]
     pub fn load(
         path: &Path,
         admission_registry: AuthAdmissionRegistry,
         local_issuer: MachineIssuerId,
         audience: uuid::Uuid,
     ) -> Result<Self, AvesAuthError> {
-        let config = PeerConfig::load(path)?;
+        Self::load_with_grants(path, admission_registry, local_issuer, audience, PeerGrants::default())
+    }
+
+    pub(super) fn load_with_grants(
+        path: &Path,
+        admission_registry: AuthAdmissionRegistry,
+        local_issuer: MachineIssuerId,
+        audience: uuid::Uuid,
+        confirmation_grants: PeerGrants,
+    ) -> Result<Self, AvesAuthError> {
+        let mut config = PeerConfig::load(path)?;
         for record in &config.peers {
             if record.endpoint.public_key() != record.peer {
                 return Err(AvesAuthError::PairingRejected {
@@ -182,6 +196,32 @@ impl PairingCoordinator {
                 });
             }
         }
+        let mut migrated = false;
+        for record in &mut config.peers {
+            if record.relationships.is_none() {
+                let mut relationships = std::collections::BTreeMap::new();
+                if record.state == PeerTrustState::Confirmed {
+                    relationships.insert(RelationshipKey("legacy".to_owned()), PeerGrants::full());
+                }
+                record.relationships = Some(relationships);
+                migrated = true;
+            }
+        }
+        if migrated {
+            config.persist(path)?;
+        }
+        let mut seen = std::collections::HashSet::new();
+        admission_registry.replace_remotes(
+            config
+                .peers
+                .iter()
+                .filter(|record| seen.insert(record.peer) && record.state == PeerTrustState::Confirmed)
+                .map(|record| ApprovedIssuer {
+                    issuer: record.peer.into(),
+                    relationships: record.relationships.clone().unwrap_or_default(),
+                })
+                .collect(),
+        )?;
         Ok(Self {
             peers: config.peers,
             pending: Vec::new(),
@@ -192,6 +232,7 @@ impl PairingCoordinator {
             endpoint: None,
             endpoint_addr: None,
             invitations: Vec::new(),
+            confirmation_grants,
         })
     }
 
@@ -314,6 +355,14 @@ impl PairingCoordinator {
             endpoint: pending.endpoint,
             state: PeerTrustState::Confirmed,
             updated_at: Utc::now(),
+            relationships: Some(
+                [(
+                    RelationshipKey("bootstrap".to_owned()),
+                    self.confirmation_grants.clone(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
         };
         let mut peers = self.peers.clone();
         if let Some(existing) = peers
@@ -325,8 +374,15 @@ impl PairingCoordinator {
             peers.push(record);
         }
         self.persist(&peers)?;
-        self.admission_registry
-            .upsert_remote(ApprovedIssuer { issuer: peer })?;
+        let relationships = peers
+            .iter()
+            .find(|record| record.peer == public_key)
+            .and_then(|record| record.relationships.clone())
+            .unwrap_or_default();
+        self.admission_registry.upsert_remote(ApprovedIssuer {
+            issuer: peer,
+            relationships,
+        })?;
         self.peers = peers;
         self.pending.remove(pending_index);
         Ok(())
@@ -440,6 +496,54 @@ impl PairingCoordinator {
 
     pub fn peers(&self) -> Vec<PeerRecord> {
         self.peers.clone()
+    }
+
+    /// Persists one relationship before publishing its effective permissions.
+    pub fn set_relationship(
+        &mut self,
+        peer: MachineIssuerId,
+        key: RelationshipKey,
+        grants: Option<PeerGrants>,
+    ) -> Result<(), AvesAuthError> {
+        let mut peers = self.peers.clone();
+        let record = peers
+            .iter_mut()
+            .find(|record| record.peer == peer.public_key())
+            .filter(|record| record.state == PeerTrustState::Confirmed)
+            .ok_or(AvesAuthError::PeerNotTrusted)?;
+        let relationships = record.relationships.get_or_insert_default();
+        if let Some(grants) = grants {
+            relationships.insert(key, grants);
+        } else {
+            relationships.remove(&key);
+        }
+        record.updated_at = Utc::now();
+        let relationships = relationships.clone();
+        self.persist(&peers)?;
+        self.admission_registry.upsert_remote(ApprovedIssuer {
+            issuer: peer,
+            relationships,
+        })?;
+        self.peers = peers;
+        Ok(())
+    }
+
+    /// Reads persisted relationships and their effective union.
+    pub fn read_grants(
+        &self,
+        peer: &MachineIssuerId,
+    ) -> Result<(PeerGrants, std::collections::BTreeMap<RelationshipKey, PeerGrants>), AvesAuthError> {
+        let record = self
+            .peers
+            .iter()
+            .find(|record| record.peer == peer.public_key())
+            .filter(|record| record.state == PeerTrustState::Confirmed)
+            .ok_or(AvesAuthError::PeerNotTrusted)?;
+        let effective = self
+            .admission_registry
+            .effective_grants(peer)
+            .ok_or(AvesAuthError::PeerNotTrusted)?;
+        Ok((effective, record.relationships.clone().unwrap_or_default()))
     }
 
     pub fn pending_candidates(&self) -> Vec<MachineIssuerId> {
@@ -560,6 +664,7 @@ impl PairingCoordinator {
             endpoint: None,
             endpoint_addr: None,
             invitations: Vec::new(),
+            confirmation_grants: PeerGrants::default(),
         }
     }
 
@@ -570,6 +675,11 @@ impl PairingCoordinator {
             endpoint: PeerEndpoint::new(EndpointAddr::new(peer.public_key())),
             state: PeerTrustState::Confirmed,
             updated_at: Utc::now(),
+            relationships: Some(
+                [(RelationshipKey("legacy".to_owned()), PeerGrants::full())]
+                    .into_iter()
+                    .collect(),
+            ),
         });
     }
 }
@@ -662,7 +772,15 @@ mod tests {
     #[test]
     fn invitation_secret_is_consumed_once() {
         let local = machine_id();
-        let registry = AuthAdmissionRegistry::new(ApprovedIssuer { issuer: local.clone() });
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local.clone(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
+        });
         let mut coordinator = PairingCoordinator::ephemeral(registry, local, uuid::Uuid::new_v4());
         let invitation = coordinator.new_invitation(60).unwrap();
         coordinator.consume_invitation(invitation.secret()).unwrap();
@@ -675,7 +793,15 @@ mod tests {
     #[test]
     fn expired_invitation_secret_is_rejected() {
         let local = machine_id();
-        let registry = AuthAdmissionRegistry::new(ApprovedIssuer { issuer: local.clone() });
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local.clone(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
+        });
         let mut coordinator = PairingCoordinator::ephemeral(registry, local, uuid::Uuid::new_v4());
         let invitation = coordinator.new_invitation(60).unwrap();
         coordinator.invitations[0].expires_at = Utc::now() - Duration::seconds(1);
@@ -689,7 +815,15 @@ mod tests {
     fn authenticated_identity_mismatch_is_rejected_before_invitation_consumption() {
         let local = machine_id();
         let remote = machine_id();
-        let registry = AuthAdmissionRegistry::new(ApprovedIssuer { issuer: local.clone() });
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local.clone(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
+        });
         let mut coordinator = PairingCoordinator::ephemeral(registry, local, uuid::Uuid::new_v4());
         let invitation = coordinator.new_invitation(60).unwrap();
         let error = coordinator
@@ -715,7 +849,15 @@ mod tests {
         let local = machine_id();
         let first = machine_id();
         let second = machine_id();
-        let registry = AuthAdmissionRegistry::new(ApprovedIssuer { issuer: local.clone() });
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local.clone(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
+        });
         let mut coordinator = PairingCoordinator::ephemeral(registry, local, uuid::Uuid::new_v4());
         for peer in [&second, &first, &second] {
             coordinator.pending.push((
@@ -738,11 +880,127 @@ mod tests {
     #[test]
     fn confirm_rejects_an_unobserved_fingerprint() {
         let local = machine_id();
-        let registry = AuthAdmissionRegistry::new(ApprovedIssuer { issuer: local.clone() });
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local.clone(),
+            relationships: [(
+                crate::auth::RelationshipKey("test".to_owned()),
+                crate::auth::PeerGrants::full(),
+            )]
+            .into_iter()
+            .collect(),
+        });
         let mut coordinator = PairingCoordinator::ephemeral(registry, local, uuid::Uuid::new_v4());
         assert_eq!(
             coordinator.confirm(machine_id()),
             Err(AvesAuthError::FingerprintNotConfirmed)
         );
+    }
+
+    #[test]
+    fn migration_restores_legacy_grants_and_leaves_revoked_empty() {
+        let path = std::env::temp_dir()
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("peers.json");
+        let local = machine_id();
+        let confirmed = machine_id();
+        let revoked = machine_id();
+        let record = |peer: &MachineIssuerId, state| PeerRecord {
+            peer: peer.public_key(),
+            endpoint: PeerEndpoint::new(EndpointAddr::new(peer.public_key())),
+            state,
+            updated_at: Utc::now(),
+            relationships: None,
+        };
+        PeerConfig {
+            peers: vec![
+                record(&confirmed, PeerTrustState::Confirmed),
+                record(&revoked, PeerTrustState::Revoked),
+            ],
+        }
+        .persist(&path)
+        .unwrap();
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local.clone(),
+            relationships: Default::default(),
+        });
+        let coordinator = PairingCoordinator::load(&path, registry.clone(), local, uuid::Uuid::new_v4()).unwrap();
+        assert_eq!(registry.effective_grants(&confirmed), Some(PeerGrants::full()));
+        assert_eq!(registry.effective_grants(&revoked), None);
+        assert!(
+            coordinator.peers()[1]
+                .relationships
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            PeerConfig::load(&path)
+                .unwrap()
+                .peers
+                .iter()
+                .all(|record| record.relationships.is_some())
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn confirmation_bootstraps_and_failed_persist_does_not_publish() {
+        let path = std::env::temp_dir()
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("peers.json");
+        let local = machine_id();
+        let remote = machine_id();
+        let registry = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: local.clone(),
+            relationships: Default::default(),
+        });
+        let mut coordinator = PairingCoordinator::load(&path, registry.clone(), local, uuid::Uuid::new_v4()).unwrap();
+        coordinator
+            .observe(
+                remote.public_key(),
+                EndpointAddr::new(remote.public_key()),
+                uuid::Uuid::new_v4(),
+            )
+            .unwrap();
+        coordinator.confirm(remote.clone()).unwrap();
+        assert_eq!(registry.effective_grants(&remote), Some(PeerGrants::default()));
+        coordinator
+            .set_relationship(
+                remote.clone(),
+                RelationshipKey("extra".to_owned()),
+                Some(PeerGrants::full()),
+            )
+            .unwrap();
+        assert_eq!(registry.effective_grants(&remote), Some(PeerGrants::full()));
+        coordinator
+            .set_relationship(remote.clone(), RelationshipKey("extra".to_owned()), None)
+            .unwrap();
+        assert_eq!(registry.effective_grants(&remote), Some(PeerGrants::default()));
+        let reloaded = AuthAdmissionRegistry::new(ApprovedIssuer {
+            issuer: coordinator.local_issuer.clone(),
+            relationships: Default::default(),
+        });
+        PairingCoordinator::load(
+            &path,
+            reloaded.clone(),
+            coordinator.local_issuer.clone(),
+            uuid::Uuid::new_v4(),
+        )
+        .unwrap();
+        assert_eq!(reloaded.effective_grants(&remote), Some(PeerGrants::default()));
+        let generation = *registry.subscribe_generation().borrow();
+        coordinator.config_path = None;
+        assert!(
+            coordinator
+                .set_relationship(
+                    remote.clone(),
+                    RelationshipKey("extra".to_owned()),
+                    Some(PeerGrants::full())
+                )
+                .is_err()
+        );
+        assert_eq!(registry.effective_grants(&remote), Some(PeerGrants::default()));
+        assert_eq!(*registry.subscribe_generation().borrow(), generation);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

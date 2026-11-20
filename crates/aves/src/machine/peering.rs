@@ -16,7 +16,14 @@ use iroh::{
     endpoint::{Connection, PortmapperConfig, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
-use iroh_blobs::{BlobsProtocol, api::Store, store::fs::FsStore};
+use iroh_blobs::{
+    BlobsProtocol,
+    api::Store,
+    store::{
+        GcConfig,
+        fs::{FsStore, options::Options},
+    },
+};
 use iroh_docs::{
     NamespaceId,
     api::{Doc, DocsApi},
@@ -27,8 +34,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::auth::{
-    AUTH_ALPN, AuthCapability, AuthFirstContactHandler, AuthSudoService, MachineIssuerId, PairingCoordinator,
-    PairingOwner, messages::IssuePeerJwtInput,
+    AUTH_ALPN, AuthAdmissionRegistry, AuthCapability, AuthFirstContactHandler, AuthSudoService, MachineIssuerId,
+    NativeProtocol, PairingCoordinator, PairingOwner, messages::IssuePeerJwtInput,
 };
 use crate::bus::{
     BusControlError, IrohProtocolHandler, RemoteOperationError, RemoteOperationReply, RemoteOperationRequest, call,
@@ -192,6 +199,7 @@ impl PeerConnectivity {
 struct GatedGossip {
     gossip: Gossip,
     connectivity: PeerConnectivity,
+    registry: AuthAdmissionRegistry,
 }
 
 impl fmt::Debug for GatedGossip {
@@ -206,7 +214,15 @@ impl ProtocolHandler for GatedGossip {
             connection.close(0u32.into(), b"peer connectivity disabled");
             return Ok(());
         }
-        self.gossip.accept(connection).await
+        let Some(watcher) = track_connection(&self.registry, &connection, NativeProtocol::Gossip) else {
+            return Ok(());
+        };
+        let result = self.gossip.accept(connection.clone()).await;
+        if result.is_err() {
+            connection.close(1u32.into(), b"protocol handler failed");
+            watcher.abort();
+        }
+        result
     }
 
     async fn shutdown(&self) {
@@ -237,6 +253,7 @@ struct ConnectivityController {
     bus: Option<IrohProtocolHandler>,
     auth: AuthFirstContactHandler,
     pairing: PairingOwner,
+    registry: AuthAdmissionRegistry,
     lifecycle: tokio::sync::Mutex<ConnectivityLifecycle>,
 }
 
@@ -253,12 +270,53 @@ enum ConnectivityChange {
 }
 
 #[derive(Clone, Debug)]
-struct PersistentBlobs(BlobsProtocol);
+struct PersistentBlobs {
+    blobs: BlobsProtocol,
+    registry: AuthAdmissionRegistry,
+}
 
 impl ProtocolHandler for PersistentBlobs {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        self.0.accept(connection).await
+        let Some(watcher) = track_connection(&self.registry, &connection, NativeProtocol::Blobs) else {
+            return Ok(());
+        };
+        let result = self.blobs.accept(connection.clone()).await;
+        watcher.abort();
+        if result.is_err() {
+            connection.close(1u32.into(), b"protocol handler failed");
+        }
+        result
     }
+}
+
+fn track_connection(
+    registry: &AuthAdmissionRegistry,
+    connection: &Connection,
+    protocol: NativeProtocol,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut generation = registry.subscribe_generation();
+    let peer = MachineIssuerId::from(connection.remote_id());
+    let registration = registry.register_connection(peer.clone(), protocol, connection.clone());
+    if !registry.allows_protocol(&peer, protocol) {
+        connection.close(1u32.into(), b"peer protocol grant revoked");
+        return None;
+    }
+    let registry = registry.clone();
+    let connection = connection.clone();
+    Some(tokio::spawn(async move {
+        let _registration = registration;
+        loop {
+            tokio::select! {
+                _ = connection.closed() => break,
+                changed = generation.changed() => {
+                    if changed.is_err() || !registry.allows_protocol(&peer, protocol) {
+                        connection.close(1u32.into(), b"peer protocol grant revoked");
+                        break;
+                    }
+                }
+            }
+        }
+    }))
 }
 
 impl IrohSubstrate {
@@ -267,7 +325,13 @@ impl IrohSubstrate {
         secret_key: &SecretKey,
         connectivity: PeerConnectivity,
     ) -> Result<Self, IrohSubstrateError> {
-        let blobs = FsStore::load(root.join("flow-workspace-blobs"))
+        let blob_root = root.join("flow-workspace-blobs");
+        let mut options = Options::new(&blob_root);
+        options.gc = Some(GcConfig {
+            interval: Duration::from_secs(3600),
+            add_protected: None,
+        });
+        let blobs = FsStore::load_with_opts(blob_root.join("blobs.db"), options)
             .await
             .map_err(|source| IrohSubstrateError::Blob {
                 source: Box::new(source),
@@ -317,6 +381,7 @@ impl IrohSubstrate {
         bus: Option<IrohProtocolHandler>,
         auth: AuthFirstContactHandler,
         pairing: PairingOwner,
+        registry: AuthAdmissionRegistry,
     ) -> RunningIrohSubstrate {
         let Self {
             endpoint,
@@ -329,15 +394,16 @@ impl IrohSubstrate {
             services,
             ..
         } = self;
-        let router = start_router(
+        let router = start_router(RouterConfig {
             endpoint,
-            bus.clone(),
-            auth.clone(),
-            blob_protocol,
-            docs_protocol,
+            bus: bus.clone(),
+            auth: auth.clone(),
+            blobs: blob_protocol,
+            docs: docs_protocol,
             gossip,
-            connectivity.clone(),
-        );
+            connectivity: connectivity.clone(),
+            registry: registry.clone(),
+        });
         let controller = Arc::new(ConnectivityController {
             root,
             secret_key,
@@ -345,6 +411,7 @@ impl IrohSubstrate {
             bus,
             auth,
             pairing,
+            registry,
             lifecycle: tokio::sync::Mutex::new(ConnectivityLifecycle {
                 router: Some(router),
                 stopped: false,
@@ -502,15 +569,16 @@ impl ConnectivityController {
             open_documents: tokio::sync::Mutex::new(HashMap::new()),
             sync_peers: tokio::sync::Mutex::new(sync_peers.clone()),
         };
-        let router = start_router(
+        let router = start_router(RouterConfig {
             endpoint,
-            self.bus.clone(),
-            self.auth.clone(),
-            BlobsProtocol::new(&blob_store, None),
+            bus: self.bus.clone(),
+            auth: self.auth.clone(),
+            blobs: BlobsProtocol::new(&blob_store, None),
             docs,
             gossip,
-            self.services.connectivity.clone(),
-        );
+            connectivity: self.services.connectivity.clone(),
+            registry: self.registry.clone(),
+        });
         if enabled {
             let result = async {
                 for (namespace, source) in sync_peers {
@@ -536,7 +604,7 @@ impl ConnectivityController {
     }
 }
 
-fn start_router(
+struct RouterConfig {
     endpoint: Endpoint,
     bus: Option<IrohProtocolHandler>,
     auth: AuthFirstContactHandler,
@@ -544,15 +612,41 @@ fn start_router(
     docs: Docs,
     gossip: Gossip,
     connectivity: PeerConnectivity,
-) -> Router {
+    registry: AuthAdmissionRegistry,
+}
+
+fn start_router(config: RouterConfig) -> Router {
+    let RouterConfig {
+        endpoint,
+        bus,
+        auth,
+        blobs,
+        docs,
+        gossip,
+        connectivity,
+        registry,
+    } = config;
     let mut router = Router::builder(endpoint);
     if let Some(bus) = bus {
         router = router.accept(crate::bus::BUS_ALPN, bus);
     }
     router
         .accept(AUTH_ALPN, auth)
-        .accept(iroh_blobs::protocol::ALPN, PersistentBlobs(blobs))
-        .accept(iroh_gossip::net::GOSSIP_ALPN, GatedGossip { gossip, connectivity })
+        .accept(
+            iroh_blobs::protocol::ALPN,
+            PersistentBlobs {
+                blobs,
+                registry: registry.clone(),
+            },
+        )
+        .accept(
+            iroh_gossip::net::GOSSIP_ALPN,
+            GatedGossip {
+                gossip,
+                connectivity,
+                registry,
+            },
+        )
         .accept(iroh_docs::net::ALPN, docs)
         .spawn()
 }

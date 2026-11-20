@@ -10,19 +10,19 @@ use crate::utils::database::{MigrationRunner, connect_database, maintain_databas
 
 use super::types::{CoordinationError, DomainId};
 
-const CLEAR_DECIDED: &str = include_str!("queries/clear_decided.sql");
-const CLEAR_PENDING: &str = include_str!("queries/clear_pending.sql");
-const CLEAR_PROPOSALS: &str = include_str!("queries/clear_proposals.sql");
-const INSERT_DECIDED: &str = include_str!("queries/insert_decided.sql");
-const INSERT_PENDING: &str = include_str!("queries/insert_pending.sql");
-const INSERT_PROPOSAL: &str = include_str!("queries/insert_proposal.sql");
+const CLEAR_DECIDED: &str = include_str!("queries/domain_clear_decided.sql");
+const CLEAR_PENDING: &str = include_str!("queries/domain_clear_pending.sql");
+const CLEAR_PROPOSALS: &str = include_str!("queries/domain_clear_proposals.sql");
+const INSERT_DECIDED: &str = include_str!("queries/domain_insert_decided.sql");
+const INSERT_PENDING: &str = include_str!("queries/domain_insert_pending.sql");
+const INSERT_PROPOSAL: &str = include_str!("queries/domain_insert_proposal.sql");
 const INSERT_RETIRED: &str = include_str!("queries/insert_retired.sql");
-const LOAD_DECIDED: &str = include_str!("queries/load_decided.sql");
-const LOAD_PENDING: &str = include_str!("queries/load_pending.sql");
-const LOAD_PROPOSALS: &str = include_str!("queries/load_proposals.sql");
+const LOAD_DECIDED: &str = include_str!("queries/domain_load_decided.sql");
+const LOAD_PENDING: &str = include_str!("queries/domain_load_pending.sql");
+const LOAD_PROPOSALS: &str = include_str!("queries/domain_load_proposals.sql");
 const LOAD_RETIRED: &str = include_str!("queries/load_retired.sql");
-const LOAD_SNAPSHOT: &str = include_str!("queries/load_snapshot.sql");
-const SAVE_SNAPSHOT: &str = include_str!("queries/save_snapshot.sql");
+const LOAD_SNAPSHOT: &str = include_str!("queries/domain_load_snapshot.sql");
+const SAVE_SNAPSHOT: &str = include_str!("queries/domain_save_snapshot.sql");
 
 /// Serialized ABCI recovery unit; JSON representation belongs to the ABCI and network owners.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,17 +73,93 @@ impl CoordinationStore {
             .await
             .map_err(CoordinationError::Database)?;
         maintain_database(&database, &path).await;
-        Ok(Self { database })
+        let store = Self { database };
+        store.migrate_legacy().await?;
+        Ok(store)
     }
 
-    /// Loads the recovery unit, if one has been saved.
-    pub(super) async fn load(&self) -> Result<Option<RecoveryState>, CoordinationError> {
+    async fn migrate_legacy(&self) -> Result<(), CoordinationError> {
         let mut connection = connect_database(&self.database)
             .await
             .map_err(CoordinationError::Database)?;
         let transaction = connection.transaction().await.map_err(storage_error)?;
         let mut rows = transaction
-            .query(LOAD_SNAPSHOT, ())
+            .query(include_str!("queries/load_snapshot.sql"), ())
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            drop(rows);
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(());
+        };
+        let json: String = row.get(0).map_err(storage_error)?;
+        drop(rows);
+        #[derive(Deserialize)]
+        struct LegacyDomain {
+            domain: DomainId,
+        }
+        let domain: LegacyDomain = serde_json::from_str(&json).map_err(|_| CoordinationError::Encoding)?;
+        let mut state: serde_json::Value = serde_json::from_str(&json).map_err(|_| CoordinationError::Encoding)?;
+        state
+            .as_object_mut()
+            .ok_or(CoordinationError::Encoding)?
+            .insert("legacy".into(), true.into());
+        let marked = serde_json::to_string(&state).map_err(|_| CoordinationError::Encoding)?;
+        transaction
+            .execute(
+                include_str!("queries/migrate_legacy_snapshot.sql"),
+                (domain.domain.as_bytes().to_vec(), marked),
+            )
+            .await
+            .map_err(storage_error)?;
+        for sql in [
+            include_str!("queries/migrate_legacy_pending.sql"),
+            include_str!("queries/migrate_legacy_decided.sql"),
+            include_str!("queries/migrate_legacy_proposals.sql"),
+        ] {
+            transaction
+                .execute(sql, (domain.domain.as_bytes().to_vec(),))
+                .await
+                .map_err(storage_error)?;
+        }
+        for sql in [
+            include_str!("queries/clear_pending.sql"),
+            include_str!("queries/clear_decided.sql"),
+            include_str!("queries/clear_proposals.sql"),
+            include_str!("queries/clear_legacy_snapshot.sql"),
+        ] {
+            transaction.execute(sql, ()).await.map_err(storage_error)?;
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub(super) async fn list_domains(&self) -> Result<Vec<DomainId>, CoordinationError> {
+        let connection = connect_database(&self.database)
+            .await
+            .map_err(CoordinationError::Database)?;
+        let mut rows = connection
+            .query(include_str!("queries/list_domains.sql"), ())
+            .await
+            .map_err(storage_error)?;
+        let mut domains = Vec::new();
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            let bytes: Vec<u8> = row.get(0).map_err(storage_error)?;
+            domains.push(DomainId::from_bytes(
+                bytes.try_into().map_err(|_| CoordinationError::Encoding)?,
+            ));
+        }
+        Ok(domains)
+    }
+
+    /// Loads the recovery unit, if one has been saved.
+    pub(super) async fn load(&self, domain: DomainId) -> Result<Option<RecoveryState>, CoordinationError> {
+        let mut connection = connect_database(&self.database)
+            .await
+            .map_err(CoordinationError::Database)?;
+        let transaction = connection.transaction().await.map_err(storage_error)?;
+        let mut rows = transaction
+            .query(LOAD_SNAPSHOT, (domain.as_bytes().to_vec(),))
             .await
             .map_err(storage_error)?;
         let Some(row) = rows.next().await.map_err(storage_error)? else {
@@ -95,7 +171,7 @@ impl CoordinationStore {
         drop(rows);
         let mut pending = Vec::new();
         let mut rows = transaction
-            .query(LOAD_PENDING, ())
+            .query(LOAD_PENDING, (domain.as_bytes().to_vec(),))
             .await
             .map_err(storage_error)?;
         while let Some(row) = rows.next().await.map_err(storage_error)? {
@@ -107,7 +183,7 @@ impl CoordinationStore {
         drop(rows);
         let mut decided = Vec::new();
         let mut rows = transaction
-            .query(LOAD_DECIDED, ())
+            .query(LOAD_DECIDED, (domain.as_bytes().to_vec(),))
             .await
             .map_err(storage_error)?;
         while let Some(row) = rows.next().await.map_err(storage_error)? {
@@ -120,7 +196,7 @@ impl CoordinationStore {
         drop(rows);
         let mut proposals = Vec::new();
         let mut rows = transaction
-            .query(LOAD_PROPOSALS, ())
+            .query(LOAD_PROPOSALS, (domain.as_bytes().to_vec(),))
             .await
             .map_err(storage_error)?;
         while let Some(row) = rows.next().await.map_err(storage_error)? {
@@ -143,13 +219,13 @@ impl CoordinationStore {
     }
 
     /// Atomically replaces projection, pending queue, decided history and retained proposals.
-    pub(super) async fn save(&self, state: &RecoveryState) -> Result<(), CoordinationError> {
+    pub(super) async fn save(&self, domain: DomainId, state: &RecoveryState) -> Result<(), CoordinationError> {
         state.validate_json()?;
         let mut connection = connect_database(&self.database)
             .await
             .map_err(CoordinationError::Database)?;
         let transaction = connection.transaction().await.map_err(storage_error)?;
-        Self::write_active(&transaction, state).await?;
+        Self::write_active(&transaction, domain, state).await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(())
     }
@@ -159,6 +235,7 @@ impl CoordinationStore {
         &self,
         predecessor: DomainId,
         previous: &RecoveryState,
+        successor_domain: DomainId,
         successor: &RecoveryState,
     ) -> Result<(), CoordinationError> {
         previous.validate_json()?;
@@ -179,7 +256,36 @@ impl CoordinationStore {
         {
             return Err(CoordinationError::Encoding);
         }
-        Self::write_active(&transaction, successor).await?;
+        if predecessor != successor_domain {
+            let mut rows = transaction
+                .query(LOAD_SNAPSHOT, (successor_domain.as_bytes().to_vec(),))
+                .await
+                .map_err(storage_error)?;
+            if let Some(row) = rows.next().await.map_err(storage_error)? {
+                let existing: String = row.get(0).map_err(storage_error)?;
+                drop(rows);
+                if existing != successor.state_json {
+                    return Err(CoordinationError::InvalidSnapshot);
+                }
+                transaction.commit().await.map_err(storage_error)?;
+                return Ok(());
+            }
+            drop(rows);
+        }
+        if predecessor != successor_domain {
+            for sql in [
+                CLEAR_PENDING,
+                CLEAR_DECIDED,
+                CLEAR_PROPOSALS,
+                include_str!("queries/domain_clear_snapshot.sql"),
+            ] {
+                transaction
+                    .execute(sql, (predecessor.as_bytes().to_vec(),))
+                    .await
+                    .map_err(storage_error)?;
+            }
+        }
+        Self::write_active(&transaction, successor_domain, successor).await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(())
     }
@@ -209,21 +315,25 @@ impl CoordinationStore {
         Ok(Some(state))
     }
 
-    async fn write_active(transaction: &Connection, state: &RecoveryState) -> Result<(), CoordinationError> {
+    async fn write_active(
+        transaction: &Connection,
+        domain: DomainId,
+        state: &RecoveryState,
+    ) -> Result<(), CoordinationError> {
         transaction
-            .execute(SAVE_SNAPSHOT, (state.state_json.clone(),))
+            .execute(SAVE_SNAPSHOT, (domain.as_bytes().to_vec(), state.state_json.clone()))
             .await
             .map_err(storage_error)?;
         transaction
-            .execute(CLEAR_PENDING, ())
+            .execute(CLEAR_PENDING, (domain.as_bytes().to_vec(),))
             .await
             .map_err(storage_error)?;
         transaction
-            .execute(CLEAR_DECIDED, ())
+            .execute(CLEAR_DECIDED, (domain.as_bytes().to_vec(),))
             .await
             .map_err(storage_error)?;
         transaction
-            .execute(CLEAR_PROPOSALS, ())
+            .execute(CLEAR_PROPOSALS, (domain.as_bytes().to_vec(),))
             .await
             .map_err(storage_error)?;
         for (index, item) in state.pending.iter().enumerate() {
@@ -231,7 +341,12 @@ impl CoordinationStore {
             transaction
                 .execute(
                     INSERT_PENDING,
-                    (sequence, item.event_json.clone(), item.body_json.clone()),
+                    (
+                        domain.as_bytes().to_vec(),
+                        sequence,
+                        item.event_json.clone(),
+                        item.body_json.clone(),
+                    ),
                 )
                 .await
                 .map_err(storage_error)?;
@@ -241,6 +356,7 @@ impl CoordinationStore {
                 .execute(
                     INSERT_DECIDED,
                     (
+                        domain.as_bytes().to_vec(),
                         item.height.to_be_bytes().to_vec(),
                         item.value_bytes.clone(),
                         item.certificate_json.clone(),
@@ -254,6 +370,7 @@ impl CoordinationStore {
                 .execute(
                     INSERT_PROPOSAL,
                     (
+                        domain.as_bytes().to_vec(),
                         item.height.to_be_bytes().to_vec(),
                         item.value_id.clone(),
                         item.payload_json.clone(),
@@ -324,14 +441,17 @@ mod tests {
         let successor = recovery(2);
         let store = CoordinationStore::open(dir.path()).await.unwrap();
         assert!(store.load_retired(domain).await.unwrap().is_none());
-        store.save(&previous).await.unwrap();
+        store.save(domain, &previous).await.unwrap();
         store
-            .save_successor(domain, &previous, &successor)
+            .save_successor(domain, &previous, DomainId::from_bytes([9; 32]), &successor)
             .await
             .unwrap();
         drop(store);
         let store = CoordinationStore::open(dir.path()).await.unwrap();
-        assert_eq!(store.load().await.unwrap(), Some(successor));
+        assert_eq!(
+            store.load(DomainId::from_bytes([9; 32])).await.unwrap(),
+            Some(successor)
+        );
         assert_eq!(store.load_retired(domain).await.unwrap(), Some(previous));
     }
 
@@ -343,21 +463,24 @@ mod tests {
         let successor = recovery(2);
         let store = CoordinationStore::open(dir.path()).await.unwrap();
         store
-            .save_successor(domain, &previous, &successor)
+            .save_successor(domain, &previous, DomainId::from_bytes([9; 32]), &successor)
             .await
             .unwrap();
         store
-            .save_successor(domain, &previous, &successor)
+            .save_successor(domain, &previous, DomainId::from_bytes([9; 32]), &successor)
             .await
             .unwrap();
         assert!(
             store
-                .save_successor(domain, &recovery(3), &recovery(4))
+                .save_successor(domain, &recovery(3), DomainId::from_bytes([9; 32]), &recovery(4))
                 .await
                 .is_err()
         );
         assert_eq!(store.load_retired(domain).await.unwrap(), Some(previous));
-        assert_eq!(store.load().await.unwrap(), Some(successor));
+        assert_eq!(
+            store.load(DomainId::from_bytes([9; 32])).await.unwrap(),
+            Some(successor)
+        );
     }
 
     #[tokio::test]
@@ -372,16 +495,57 @@ mod tests {
             certificate_json: "{}".into(),
         });
         let store = CoordinationStore::open(dir.path()).await.unwrap();
-        store.save(&previous).await.unwrap();
+        store.save(domain, &previous).await.unwrap();
         assert!(
             store
-                .save_successor(domain, &previous, &invalid)
+                .save_successor(domain, &previous, DomainId::from_bytes([9; 32]), &invalid)
                 .await
                 .is_err()
         );
         drop(store);
         let store = CoordinationStore::open(dir.path()).await.unwrap();
         assert!(store.load_retired(domain).await.unwrap().is_none());
-        assert_eq!(store.load().await.unwrap(), Some(previous));
+        assert_eq!(store.load(domain).await.unwrap(), Some(previous));
+    }
+
+    #[tokio::test]
+    async fn replacing_one_domain_preserves_other_pending_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CoordinationStore::open(dir.path()).await.unwrap();
+        let a = DomainId::from_bytes([1; 32]);
+        let b = DomainId::from_bytes([2; 32]);
+        store.save(a, &recovery(1)).await.unwrap();
+        store.save(b, &recovery(2)).await.unwrap();
+        store.save(a, &recovery(3)).await.unwrap();
+        assert_eq!(store.load(b).await.unwrap(), Some(recovery(2)));
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_unit_under_its_committed_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = DomainId::from_bytes([4; 32]);
+        let store = CoordinationStore::open(dir.path()).await.unwrap();
+        let connection = super::connect_database(&store.database).await.unwrap();
+        let json = serde_json::json!({ "domain": domain }).to_string();
+        connection
+            .execute(include_str!("queries/save_snapshot.sql"), (json.clone(),))
+            .await
+            .unwrap();
+        connection
+            .execute(include_str!("queries/insert_pending.sql"), (0_i64, "{}", "{}"))
+            .await
+            .unwrap();
+        drop(connection);
+        drop(store);
+        let store = CoordinationStore::open(dir.path()).await.unwrap();
+        assert_eq!(store.list_domains().await.unwrap(), vec![domain]);
+        let recovery = store.load(domain).await.unwrap().unwrap();
+        let migrated: serde_json::Value = serde_json::from_str(&recovery.state_json).unwrap();
+        assert_eq!(migrated["domain"], serde_json::to_value(domain).unwrap());
+        assert_eq!(migrated["legacy"], true);
+        assert_eq!(recovery.pending.len(), 1);
+        drop(store);
+        let store = CoordinationStore::open(dir.path()).await.unwrap();
+        assert_eq!(store.load(domain).await.unwrap().unwrap(), recovery);
     }
 }

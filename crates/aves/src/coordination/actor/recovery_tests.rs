@@ -2,6 +2,7 @@ use super::*;
 use serde::Serialize;
 
 use super::super::signing::ChainSigner;
+use super::super::transaction::test_genesis;
 use super::super::types::{EncKey, RegisteredTransaction, UserRegistered, ValidatorSet};
 
 fn signed<T: Serialize + RegisteredTransaction>(body: T, signer: &ChainSigner, domain: DomainId) -> SignedBody<T> {
@@ -17,8 +18,12 @@ fn signed<T: Serialize + RegisteredTransaction>(body: T, signer: &ChainSigner, d
 
 async fn open(path: &std::path::Path) -> CoordinationApplication {
     let store = CoordinationStore::open(path).await.unwrap();
-    let recovery = store.load().await.unwrap();
-    CoordinationApplication::with_store(store, recovery).unwrap()
+    let domains = store.list_domains().await.unwrap();
+    let recovery = match domains.first() {
+        Some(domain) => store.load(*domain).await.unwrap(),
+        None => None,
+    };
+    CoordinationApplication::with_store(std::sync::Arc::new(store), recovery).unwrap()
 }
 
 #[tokio::test]
@@ -28,7 +33,11 @@ async fn recovery_rejects_invalid_requests_and_preserves_retired_pending_on_rest
     let other = ChainSigner::new(iroh::SecretKey::from_bytes(&[14; 32]));
     let key: PublicKey = signer.public_key().into();
     let mut app = open(directory.path()).await;
-    let predecessor = app.create_genesis(vec![(key, 1)]).await.unwrap().domain;
+    let predecessor = app
+        .create_genesis(test_genesis(DomainId::from_bytes([1; 32]), vec![(key, 1)]))
+        .await
+        .unwrap()
+        .domain;
     let registration = UserRegistered {
         user: UserId([3; 32]),
         root_key: key,
@@ -72,6 +81,8 @@ async fn recovery_rejects_invalid_requests_and_preserves_retired_pending_on_rest
     assert_eq!(app.state.pending.len(), 1);
     let record = signed(body.clone(), &signer, predecessor);
     let event = app.begin_successor(record.clone()).await.unwrap();
+    assert!(!app.state.legacy);
+    assert!(app.state.genesis.is_none());
     assert_eq!(app.state.committed.height, Height(0));
     assert!(app.state.pending.is_empty());
     assert_eq!(
@@ -87,6 +98,7 @@ async fn recovery_rejects_invalid_requests_and_preserves_retired_pending_on_rest
     drop(app);
     let mut app = open(directory.path()).await;
     assert_eq!(app.state.domain, Some(body.successor));
+    assert!(!app.state.legacy);
     assert_eq!(app.export_chain_snapshot(Some(predecessor)).await.unwrap(), snapshot);
     let (network, _receiver) = tokio::sync::mpsc::channel(4);
     let (reply, ready) = tokio::sync::oneshot::channel();
@@ -102,4 +114,37 @@ async fn recovery_rejects_invalid_requests_and_preserves_retired_pending_on_rest
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn explicitly_legacy_state_is_readable_but_cannot_accept_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let signer = ChainSigner::new(iroh::SecretKey::from_bytes(&[13; 32]));
+    let key: PublicKey = signer.public_key().into();
+    let domain = DomainId::from_bytes([1; 32]);
+    let mut app = open(directory.path()).await;
+    app.create_genesis(test_genesis(domain, vec![(key, 1)]))
+        .await
+        .unwrap();
+    app.state.genesis = None;
+    app.state.legacy = true;
+    app.save_state(&app.state).await.unwrap();
+    drop(app);
+    let mut app = open(directory.path()).await;
+    assert_eq!(app.get_chain().unwrap().domain, domain);
+    assert!(
+        matches!(app.active_chain_consensus_params(), Err(CoordinationError::LegacyChainReadOnly { domain: d }) if d == domain)
+    );
+    let record = UserRegistered {
+        user: UserId([3; 32]),
+        root_key: key,
+        enc_key: EncKey([4; 32]),
+        enc_epoch: 1,
+    };
+    assert!(
+        matches!(app.submit(PendingTransaction::UserRegistered(signed(record, &signer, domain))).await,
+        Err(CoordinationError::LegacyChainReadOnly { domain: d }) if d == domain)
+    );
+    assert!(matches!(app.create_genesis(test_genesis(domain, vec![(key, 1)])).await,
+        Err(CoordinationError::LegacyChainReadOnly { domain: d }) if d == domain));
 }

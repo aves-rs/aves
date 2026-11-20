@@ -10,9 +10,9 @@ use super::actor::{Actor, ActorRequest, ActorResponse};
 use super::domain::{AuthSudoService, AuthSudoServiceImpl};
 use super::jwt::Jwt;
 use super::keystore::MachineIdentityKeyring;
-use super::messages::{AuthRequest, AuthResponse};
+use super::messages::{AuthRequest, AuthRequestPayload, AuthResponse};
 use super::pairing::{AuthFirstContactHandler, PairingOwner};
-use super::types::{ApprovedIssuer, AuthAdmissionRegistry, AvesAuthError};
+use super::types::{ApprovedIssuer, AuthAdmissionRegistry, AvesAuthError, PeerGrants};
 
 pub struct ConstructionResult {
     pub root_jwt: Jwt,
@@ -29,6 +29,7 @@ pub fn construct(
     namespace: &str,
     audience: Uuid,
     peer_config_path: &Path,
+    confirmation_grants: PeerGrants,
 ) -> Result<(ConstructionResult, mpsc::Receiver<AuthRequest>), AvesAuthError> {
     let keyring = MachineIdentityKeyring::new(namespace)?;
     let machine_secret_key = keyring.secret_key().clone();
@@ -39,6 +40,7 @@ pub fn construct(
 
     let local_issuer = ApprovedIssuer {
         issuer: machine_secret_key.public().into(),
+        relationships: Default::default(),
     };
     let admission_registry = AuthAdmissionRegistry::new(local_issuer);
     let mut actor = Actor::with_registry(
@@ -47,6 +49,7 @@ pub fn construct(
         audience,
         admission_registry.clone(),
         peer_config_path,
+        confirmation_grants,
     )?;
     let root_jwt = actor.issue_root(Utc::now() + Duration::days(365))?;
     let pairing_owner = actor.pairing_owner();
@@ -56,6 +59,10 @@ pub fn construct(
     tokio::spawn(async move {
         while let Some(request) = auth_receiver.recv().await {
             let (actor_reply, actor_response) = oneshot::channel();
+            let grant_request = matches!(
+                &request.payload,
+                AuthRequestPayload::SetPeerRelationship { .. } | AuthRequestPayload::ReadPeerGrants { .. }
+            );
 
             if actor_sender
                 .send(ActorRequest::Issue {
@@ -65,15 +72,24 @@ pub fn construct(
                 .await
                 .is_err()
             {
-                let _ = request.reply_to.send(Err(AvesAuthError::Internal(
-                    "Auth actor request channel is closed".to_owned(),
-                )));
+                let error = if grant_request {
+                    AvesAuthError::PeerGrantsPending
+                } else {
+                    AvesAuthError::Internal("Auth actor request channel is closed".to_owned())
+                };
+                let _ = request.reply_to.send(Err(error));
                 break;
             }
 
             let response = actor_response
                 .await
-                .map_err(|_| AvesAuthError::Internal("Auth actor response channel is closed".to_owned()))
+                .map_err(|_| {
+                    if grant_request {
+                        AvesAuthError::PeerGrantsPending
+                    } else {
+                        AvesAuthError::Internal("Auth actor response channel is closed".to_owned())
+                    }
+                })
                 .and_then(|result| result.map(AuthResponse::from));
 
             let _ = request.reply_to.send(response);
@@ -105,6 +121,13 @@ impl From<ActorResponse> for AuthResponse {
             ActorResponse::Success => Self::Success,
             ActorResponse::Peers(peers) => Self::Peers { peers },
             ActorResponse::PairingCandidates(candidates) => Self::PairingCandidates { candidates },
+            ActorResponse::PeerGrants {
+                effective,
+                relationships,
+            } => Self::PeerGrants {
+                effective,
+                relationships,
+            },
             ActorResponse::Invitation(invitation) => Self::Invitation { invitation },
             ActorResponse::FirstContacted { peer } => Self::FirstContacted { peer },
         }

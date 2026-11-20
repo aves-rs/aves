@@ -606,22 +606,49 @@ pub trait RegisteredTransaction {
     const PURPOSE: &'static str;
 }
 
+/// Authority rules implemented by this host for new chains.
+pub const AUTHORITY_RULES_VERSION: u32 = 1;
+
+/// The ownership scope of a coordination chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum ChainKind {
+    /// A user's personal chain.
+    Personal,
+    /// A shared collective chain.
+    Collective,
+}
+
+/// Immutable owner-authorized chain identity and initial validator roster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct GenesisDescriptor {
+    pub domain: DomainId,
+    pub kind: ChainKind,
+    pub owner_user: UserId,
+    pub owner_root: PublicKey,
+    pub creator_machine: PublicKey,
+    pub initial_roster: Vec<(PublicKey, u64)>,
+    pub rules_version: u32,
+}
+
+impl RegisteredTransaction for GenesisDescriptor {
+    const PURPOSE: &'static str = "aves/coordination/genesis/v1";
+}
+
+/// Digest of the complete signed genesis descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct GenesisFingerprint(pub [u8; 32]);
+
 /// Validator identities and voting power committed by a regenesis record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct ValidatorSet(pub Vec<(PublicKey, u64)>);
 
-/// Initial validator roster for a new, empty coordination chain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
-pub struct Genesis {
-    /// Caller-selected validator public keys and their voting powers.
-    pub validators: Vec<(PublicKey, u64)>,
-}
-
 /// Stable identity returned when a signed transaction is admitted to a chain host.
 ///
 /// The identifier names the exact signed bytes; it is not a chain-state projection.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize, Type, schemars::JsonSchema,
+)]
 pub struct CoordinationEventId([u8; 32]);
 
 impl CoordinationEventId {
@@ -665,6 +692,446 @@ byte_id!(MachineId, 32);
 byte_id!(EncKey, 32);
 byte_id!(BlobHash, 32);
 byte_id!(RecordHash, 32);
+byte_id!(InvitationId, 32);
+
+/// Stable address of a sharing notice on the recipient's personal chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct SharingNoticeKey {
+    pub collective_domain: DomainId,
+    pub invitation: InvitationId,
+    pub target_user: UserId,
+}
+
+/// The recipient's response to an invitation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum SharingResponse {
+    /// The recipient accepts the invitation.
+    Accept,
+    /// The recipient dismisses the invitation.
+    Dismiss,
+}
+
+/// The owner's decision on membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum SharingDecision {
+    /// The owner approved membership.
+    Approved,
+    /// The owner denied membership.
+    Denied,
+}
+
+/// Current state of an addressed notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum SharingNoticeState {
+    /// The invitation has been received.
+    Invited,
+    /// The recipient recorded a response.
+    Responded(SharingResponse),
+    /// The owner recorded a decision.
+    Decided(SharingDecision),
+}
+
+/// Public, authenticated bootstrap references for the collective.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct SharingBootstrap {
+    pub descriptor_ref: BlobHash,
+    pub descriptor: SignedBody<GenesisDescriptor>,
+    pub genesis_fingerprint: GenesisFingerprint,
+    pub expected_snapshot_hash: RecordHash,
+    pub owner: UserId,
+    pub owner_root: PublicKey,
+}
+
+/// Machine-signed personal-chain receipt containing collective evidence, never a foreign transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct SharingNotice {
+    pub domain: DomainId,
+    pub key: SharingNoticeKey,
+    pub revision: u64,
+    pub state: SharingNoticeState,
+    pub response: Option<SharingResponse>,
+    pub invitation: SignedBody<Invitation>,
+    pub decision: Option<SignedBody<MembershipDecision>>,
+    pub bootstrap: SharingBootstrap,
+}
+
+/// Latest committed notice body and the machine signer retained by Coordination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct SharingNoticeRecord {
+    pub notice: SharingNotice,
+    /// Absent only for legacy snapshots created before signer retention was added.
+    pub signer: Option<PublicKey>,
+}
+
+impl RegisteredTransaction for SharingNotice {
+    const PURPOSE: &'static str = "aves/coordination/record/sharing-notice/v1";
+}
+
+/// Owner-qualified identity of one deliberately published story version.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Type, schemars::JsonSchema,
+)]
+pub struct ScopedPublicationKey {
+    pub domain: DomainId,
+    pub origin_owner_user: UserId,
+    pub source_project_id: [u8; 16],
+    pub source_ticket_id: [u8; 16],
+    pub operation_id: [u8; 16],
+}
+
+/// Scope of a grant in the granting user's namespace.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Type, schemars::JsonSchema,
+)]
+pub enum ShareScope {
+    Ticket([u8; 16]),
+    Project([u8; 16]),
+}
+
+/// Root-authorized grant revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct ShareGrantChanged {
+    pub domain: DomainId,
+    pub grantor: UserId,
+    pub recipient: UserId,
+    pub scope: ShareScope,
+    pub revision: u64,
+    pub previous_revision: u64,
+    pub active: bool,
+}
+impl RegisteredTransaction for ShareGrantChanged {
+    const PURPOSE: &'static str = "aves/coordination/record/share-grant-changed/v1";
+}
+
+/// An opaque envelope location and integrity digest, never wrap material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct PublicationEnvelopeRef {
+    pub record_root: BlobHash,
+    pub recipient: UserId,
+    pub target_machine: MachineId,
+    pub certificate_revision: u64,
+    pub envelope_ref: String,
+    pub envelope_digest: RecordHash,
+}
+
+/// An opaque envelope reference for one target machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct EnvelopeRef {
+    pub target_machine: MachineId,
+    pub certificate_revision: u64,
+    pub envelope_reference: String,
+    pub envelope_digest: RecordHash,
+}
+
+/// Original verification evidence, or explicit absence of evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum RecordAttestation {
+    Unattested,
+    Reported {
+        report: Box<SignedBody<VerificationReport>>,
+        source_proof: Box<SignedBody<MachineBound>>,
+    },
+}
+
+/// One frozen record descriptor and its opaque recipient references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct PublishedRecordRef {
+    pub source_flow_id: CoordinationFlowId,
+    pub source_execution_id: CoordinationExecutionId,
+    pub stage_number: u32,
+    pub root: BlobHash,
+    pub format_version: u32,
+    pub attestation: RecordAttestation,
+    pub envelopes: Vec<EnvelopeRef>,
+}
+
+/// Immutable ordered story records and their opaque recipient envelope references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct StoryPublished {
+    pub key: ScopedPublicationKey,
+    pub publisher: MachineId,
+    pub records: Vec<PublishedRecordRef>,
+    /// SHA-256 of the JSON serialization of the ordered record list.
+    pub digest: RecordHash,
+}
+impl RegisteredTransaction for StoryPublished {
+    const PURPOSE: &'static str = "aves/coordination/record/story-published/v1";
+}
+
+/// Adds an opaque envelope reference to a committed publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct EnvelopeAddition {
+    pub key: ScopedPublicationKey,
+    pub publisher: MachineId,
+    pub envelope: PublicationEnvelopeRef,
+}
+impl RegisteredTransaction for EnvelopeAddition {
+    const PURPOSE: &'static str = "aves/coordination/record/envelope-addition/v1";
+}
+
+/// Machine-signed evidence references for one exact execution and work state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct VerificationReport {
+    pub domain: DomainId,
+    pub user: UserId,
+    pub work_id: String,
+    pub flow_id: CoordinationFlowId,
+    pub execution_id: CoordinationExecutionId,
+    pub revision: u64,
+    pub work_state_id: String,
+    pub parquet_root: BlobHash,
+    pub reporting_machine: MachineId,
+    pub agent_correlation: Option<String>,
+    pub node_correlation: Option<String>,
+    pub check_ref: Option<String>,
+    pub environment_ref: Option<String>,
+    pub policy_ref: Option<String>,
+}
+impl RegisteredTransaction for VerificationReport {
+    const PURPOSE: &'static str = "aves/coordination/record/verification-report/v1";
+}
+
+/// A publication and its original committed height.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct PublicationRecord {
+    pub publication: StoryPublished,
+    pub height: Height,
+}
+
+/// A source-domain root certificate; it is evidence, not a collective transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberIdentityProof {
+    pub source_domain: DomainId,
+    pub certificate: SignedBody<MachineBound>,
+}
+
+/// The collective owner's root-signed registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct OwnerRegistration {
+    pub domain: DomainId,
+    pub owner: UserId,
+    pub root: PublicKey,
+    pub revision: u64,
+}
+
+impl RegisteredTransaction for OwnerRegistration {
+    const PURPOSE: &'static str = "aves/coordination/record/owner-registration/v1";
+}
+
+/// An owner invitation pinned to a user's root and source machine certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct Invitation {
+    pub domain: DomainId,
+    pub invitation: InvitationId,
+    pub revision: u64,
+    pub target_user: UserId,
+    pub target_root: PublicKey,
+    pub proof: MemberIdentityProof,
+}
+
+impl RegisteredTransaction for Invitation {
+    const PURPOSE: &'static str = "aves/coordination/record/invitation/v1";
+}
+
+/// The invited machine's acceptance of an invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct Acceptance {
+    pub domain: DomainId,
+    pub invitation: InvitationId,
+    pub revision: u64,
+    pub proof: MemberIdentityProof,
+}
+
+impl RegisteredTransaction for Acceptance {
+    const PURPOSE: &'static str = "aves/coordination/record/acceptance/v1";
+}
+
+/// The owner's decision on a particular invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MembershipDecision {
+    pub domain: DomainId,
+    pub invitation: InvitationId,
+    pub revision: u64,
+    pub approved: bool,
+    pub member: UserId,
+    pub root: PublicKey,
+    pub proof: MemberIdentityProof,
+}
+
+impl RegisteredTransaction for MembershipDecision {
+    const PURPOSE: &'static str = "aves/coordination/record/membership-decision/v1";
+}
+
+/// Owner-authorized removal of a member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberRemoved {
+    pub domain: DomainId,
+    pub member: UserId,
+    pub revision: u64,
+    pub previous_revision: u64,
+}
+
+impl RegisteredTransaction for MemberRemoved {
+    const PURPOSE: &'static str = "aves/coordination/record/member-removed/v1";
+}
+
+/// Owner-assigned total voting power for a member; zero means nonvalidator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberPowerChanged {
+    pub domain: DomainId,
+    pub member: UserId,
+    pub revision: u64,
+    pub previous_revision: u64,
+    pub total: u64,
+}
+
+impl RegisteredTransaction for MemberPowerChanged {
+    const PURPOSE: &'static str = "aves/coordination/record/member-power-changed/v1";
+}
+
+/// A certified machine's relative share of its member's voting power.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct ValidatorSplitPart {
+    pub machine: MachineId,
+    pub parts: u64,
+}
+
+/// A member's allocation of its owner-assigned total among certified machines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberValidatorSplitChanged {
+    pub domain: DomainId,
+    pub member: UserId,
+    pub revision: u64,
+    pub previous_revision: u64,
+    pub splits: Vec<ValidatorSplitPart>,
+}
+
+impl RegisteredTransaction for MemberValidatorSplitChanged {
+    const PURPOSE: &'static str = "aves/coordination/record/member-validator-split-changed/v1";
+}
+
+/// Owner-authorized version of the fixed chain authority rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct ChainPolicyChanged {
+    pub domain: DomainId,
+    pub version: u32,
+    pub previous_version: u32,
+    pub rules_version: u32,
+}
+
+impl RegisteredTransaction for ChainPolicyChanged {
+    const PURPOSE: &'static str = "aves/coordination/record/chain-policy-changed/v1";
+}
+
+/// Machine-signed possession proof for a member certificate update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberMachineSelfRegistration {
+    pub domain: DomainId,
+    pub member: UserId,
+    pub machine: MachineId,
+    pub machine_key: PublicKey,
+    pub revision: u64,
+}
+
+impl RegisteredTransaction for MemberMachineSelfRegistration {
+    const PURPOSE: &'static str = "aves/coordination/record/member-machine-self-registration/v1";
+}
+
+/// Root-certified member-machine update with an independent machine possession proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberMachineCertUpdate {
+    pub domain: DomainId,
+    pub member: UserId,
+    pub machine: MachineId,
+    pub revision: u64,
+    pub previous_revision: u64,
+    pub registration: SignedBody<MemberMachineSelfRegistration>,
+    pub proof: MemberIdentityProof,
+}
+
+impl RegisteredTransaction for MemberMachineCertUpdate {
+    const PURPOSE: &'static str = "aves/coordination/record/member-machine-cert-update/v1";
+}
+
+/// An authenticated source-domain authority event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum SourceProof {
+    MachineBound(SignedBody<MachineBound>),
+    MachineUnbound(SignedBody<MachineUnbound>),
+    UserRootRotated(SignedBody<UserRootRotated>),
+}
+
+/// Ordered source proofs relayed by a currently certified member machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberAuthorityUpdated {
+    pub domain: DomainId,
+    pub member: UserId,
+    pub source_domain: DomainId,
+    pub previous_revision: u64,
+    pub new_revision: u64,
+    pub proofs: Vec<SourceProof>,
+}
+
+impl RegisteredTransaction for MemberAuthorityUpdated {
+    const PURPOSE: &'static str = "aves/coordination/record/member-authority-updated/v1";
+}
+
+/// Current verified member authority and retained proof revisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberAuthority {
+    pub root: PublicKey,
+    pub certified_machines: Vec<MachineBound>,
+    pub proof_revision: u64,
+    pub history: Vec<SignedBody<MemberAuthorityUpdated>>,
+}
+
+/// Committed membership status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum MemberStatus {
+    Active,
+    Removed,
+}
+
+/// Committed member identity and its pinned source proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberRecord {
+    pub member: UserId,
+    pub status: MemberStatus,
+    pub revision: u64,
+    pub root: PublicKey,
+    pub proof: MemberIdentityProof,
+}
+
+/// Committed invitation and its optional acceptance and owner decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct InvitationRecord {
+    pub invitation: Invitation,
+    pub acceptance: Option<Acceptance>,
+    pub decision: Option<MembershipDecision>,
+}
+
+/// Committed total power assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberPowerRecord {
+    pub member: UserId,
+    pub revision: u64,
+    pub total: u64,
+}
+
+/// Committed relative machine allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct MemberValidatorSplitRecord {
+    pub member: UserId,
+    pub revision: u64,
+    pub splits: Vec<ValidatorSplitPart>,
+}
+
+/// Committed authority policy version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct ChainPolicyRecord {
+    pub version: u32,
+    pub rules_version: u32,
+}
 
 /// Typed Flow identity encoded as its canonical 16 UUID bytes in coordination bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type, schemars::JsonSchema)]
@@ -847,9 +1314,51 @@ impl RegisteredTransaction for SchemaActivated {
     const PURPOSE: &'static str = "aves/coordination/record/schema-activated/v1";
 }
 
+/// A chain cannot continue safely without eligible voting machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub enum ChainHalted {
+    /// Security changes removed every eligible validator.
+    NoEligibleValidators,
+}
+
+/// One effective validator and the member whose allocation supplies its power.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, schemars::JsonSchema)]
+pub struct EffectiveValidator {
+    pub machine_key: PublicKey,
+    pub voting_power: u64,
+    pub member: UserId,
+}
+
 /// Typed failures produced by coordination foundations.
 #[derive(Debug, Error, Type)]
 pub enum CoordinationError {
+    /// The requested height or its historical ownership projection is unavailable.
+    #[error("coordination roster at height {height} is unavailable")]
+    RosterHeightUnavailable { height: u64 },
+    /// The chain is readable but cannot admit new authority or submissions.
+    #[error("coordination chain halted: {reason:?}")]
+    ChainHalted { reason: ChainHalted },
+    /// The requested domain is a retired predecessor and cannot be recreated.
+    #[error("coordination chain {domain:?} is retired")]
+    DomainRetired { domain: DomainId },
+    /// The requested chain is not hosted by this coordination actor.
+    #[error("coordination chain {domain:?} is not hosted")]
+    ChainNotHosted { domain: DomainId },
+    /// The Machine domain has not published its peer services yet.
+    #[error("coordination peer services are pending")]
+    PeerServicesPending,
+    /// A different signed genesis already identifies this domain.
+    #[error("conflicting coordination genesis for {domain:?}")]
+    GenesisConflict { domain: DomainId },
+    /// The chain's authority rules are not implemented by this host.
+    #[error("unsupported coordination authority rules version {found}")]
+    UnsupportedRulesVersion { found: u32 },
+    /// A legacy chain can be read but not activated.
+    #[error("legacy coordination chain {domain:?} is read-only")]
+    LegacyChainReadOnly { domain: DomainId },
+    /// The genesis was not signed by its declared owner root.
+    #[error("invalid coordination genesis signature")]
+    GenesisSignatureInvalid,
     /// The snapshot is corrupt, inconsistent, or does not match the trust anchor.
     #[error("invalid coordination snapshot")]
     InvalidSnapshot,

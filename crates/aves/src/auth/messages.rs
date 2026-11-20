@@ -7,7 +7,9 @@ use crate::bus::BusRpcContext;
 use super::jwt::Jwt;
 use super::pairing::PairingInvitation;
 use super::peer::PeerRecord;
-use super::types::{ApprovedIssuer, AuthCapability, AuthProjection, AvesAuthError, MachineIssuerId};
+use super::types::{
+    ApprovedIssuer, AuthCapability, AuthProjection, AvesAuthError, MachineIssuerId, PeerGrants, RelationshipKey,
+};
 
 /// Requests handled by the Aves Auth control-plane actor.
 pub struct AuthRequest {
@@ -76,6 +78,16 @@ pub enum AuthRequestPayload {
 
     #[privileged(reason = "pairing first contact is internal Auth authority")]
     FirstContact { invitation: PairingInvitation },
+
+    #[privileged(reason = "Peer permission grants are security authority")]
+    SetPeerRelationship {
+        peer: MachineIssuerId,
+        relationship: RelationshipKey,
+        grants: Option<PeerGrants>,
+    },
+
+    #[privileged(reason = "Peer permission grants are security authority")]
+    ReadPeerGrants { peer: MachineIssuerId },
 }
 
 /// Responses produced by Auth operations.
@@ -100,4 +112,9 @@ pub enum AuthResponse {
     Invitation { invitation: PairingInvitation },
     #[serde(skip)]
     FirstContacted { peer: MachineIssuerId },
+    #[serde(skip)]
+    PeerGrants {
+        effective: PeerGrants,
+        relationships: std::collections::BTreeMap<RelationshipKey, PeerGrants>,
+    },
 }

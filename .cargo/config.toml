@@ -1,2 +1,4 @@
+include = [{ path = "local.toml", optional = true }]
+
 [target.'cfg(all())']
 rustflags = ["-D", "unused-crate-dependencies"]

@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
+use super::types::{PeerGrants, RelationshipKey};
 use chrono::{DateTime, Utc};
 use iroh::{EndpointAddr, PublicKey};
 
@@ -17,6 +19,8 @@ pub struct PeerRecord {
     pub endpoint: PeerEndpoint,
     pub state: PeerTrustState,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub relationships: Option<BTreeMap<RelationshipKey, PeerGrants>>,
 }
 
 /// Local Auth policy for an Iroh peer.

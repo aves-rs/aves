@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -23,10 +23,10 @@ use super::config::{
 };
 use super::database::persist_session_anchor_inner;
 use super::identity::{Binding, flow_node_subject, persist_binding};
-use super::library::{AgentId, ResolvedAgent};
+use super::library::{AgentId, ResolvedAgent, ResolvedTeam};
 use super::mcp::composed_launch_config;
 use super::messages::DiscussResponse;
-use super::plugins::{self, LaunchContext, PrimaryAgentSelection};
+use super::plugins::{self, ConnectionStrategy, DiscussAgentPlugin, LaunchContext, PrimaryAgentSelection};
 use super::session::{
     PendingElicitationCancel, SESSION_WORKER_JWT_EXPIRATION, SessionWorkerFailure, WorkerSessionParams,
     ensure_agents_workspace_dir, initialize_request, issue_worker_jwt, load_session_request, revoke_worker_jti,
@@ -59,6 +59,34 @@ struct SessionLaunchPreparation {
     primary_agent: Option<ResolvedAgent>,
     isolated_configured: bool,
     agent: AcpAgent,
+}
+
+struct ConfiguredSessionInputs<'a> {
+    launch_inputs: Option<(&'a SessionLaunchConfig, &'a Path)>,
+    materialization: Option<(&'a Path, &'a [&'a AgentId])>,
+    explicit_config: bool,
+    restores_team_at_root: bool,
+}
+
+fn configure_session_server(
+    plugin: &dyn DiscussAgentPlugin,
+    server: &McpServer,
+    inputs: ConfiguredSessionInputs<'_>,
+) -> Result<(McpServer, bool, Vec<LaunchLimitation>), DiscussError> {
+    let Some((config, workspace)) = inputs.launch_inputs else {
+        return Ok((server.clone(), false, Vec::new()));
+    };
+    if let Some((root, team)) = inputs.materialization
+        && plugin.connection_strategy() == ConnectionStrategy::Shared
+        && plugin.materializes_session_config()
+    {
+        let limitations = plugin.materialize_session_config(root, team, config)?;
+        return Ok((server.clone(), false, limitations));
+    }
+    let configured = plugin.configured_launch_server(server, workspace, config)?;
+    let isolated =
+        inputs.explicit_config || plugin.uses_mcp_launch_env() || configured != *server || inputs.restores_team_at_root;
+    Ok((configured, isolated, Vec::new()))
 }
 
 struct SessionWorkerInputs<'a> {
@@ -340,9 +368,7 @@ impl Actor {
                 reconnect_acp_session_id.is_some(),
             )
             .await?;
-        // Resolve the restored setup before choosing the launch: a root-materialized Team
-        // needs an isolated launch configured against its restored session root, even when
-        // the caller supplied no launch config.
+        // Restore the setup before materializing the session's launch configuration.
         let setup = if reconnect_acp_session_id.is_some() {
             restored_setup
         } else {
@@ -704,13 +730,26 @@ impl Actor {
         }
         let root_default_config = SessionLaunchConfig::default();
         let launch_workspace = Self::launch_workspace(setup.as_ref(), session_cwd, &self.agents_workspace)?;
+        let session_root = session_cwd.filter(|root| {
+            if *root == &self.agents_workspace {
+                return false;
+            }
+            match (root.canonicalize(), self.agents_workspace.canonicalize()) {
+                (Ok(root), Ok(homebase)) => root != homebase,
+                _ => true,
+            }
+        });
+        let root_config = (plugin.connection_strategy() == ConnectionStrategy::Shared
+            && plugin.materializes_session_config()
+            && session_root.is_some())
+        .then_some(launch_config.unwrap_or(&root_default_config));
         if let Some(DiscussSessionSetup::TeamAtRoot { leader_id }) = setup.as_ref() {
-            self.materialize_custom_team_at_root(key, launch_workspace, leader_id)
+            self.materialize_custom_team_at_root(key, launch_workspace, leader_id, root_config)
                 .await?;
         }
         let restores_team_at_root = matches!(setup, Some(DiscussSessionSetup::TeamAtRoot { .. }));
         let persisted_setup_kind = Self::setup_kind_for(setup.as_ref());
-        let (assigned_agent_name, setup_settings) = self.resolve_session_setup(key, setup).await?;
+        let (assigned_agent_name, setup_settings) = self.resolve_session_setup(key, setup.clone()).await?;
         let primary_agent = if let Some(leader_id) = assigned_agent_name.as_deref() {
             let agent_id =
                 AgentId::try_from(leader_id.to_string()).map_err(|error| DiscussError::WorkspaceInvalidAssetId {
@@ -724,23 +763,61 @@ impl Actor {
         let launch_inputs = match launch_config {
             Some(config) => Some((config, launch_workspace)),
             None if restores_team_at_root => Some((&root_default_config, launch_workspace)),
+            None if root_config.is_some() => Some((&root_default_config, launch_workspace)),
             None => None,
         };
-        let prepared = if let Some((config, _)) = launch_inputs {
+        let mut prepared = if let Some((config, _)) = launch_inputs {
             plugin.launch_preparation(&LaunchContext::new(&self.agents_workspace, discuss_session_id), config)?
         } else {
             Default::default()
         };
         let effective_config = launch_inputs.map(|(config, _)| config.clone());
-        let mut isolated_configured = if let Some((config, workspace)) = launch_inputs {
-            let configured = plugin.configured_launch_server(&launch_server, workspace, config)?;
-            let isolated =
-                explicit_config || plugin.uses_mcp_launch_env() || configured != launch_server || restores_team_at_root;
-            launch_server = configured;
-            isolated
-        } else {
-            false
-        };
+        let launch_arguments = primary_agent.as_ref().is_some_and(|agent| {
+            matches!(
+                plugin.primary_agent_selection(&agent.selection_view()),
+                PrimaryAgentSelection::LaunchArguments(_)
+            )
+        });
+        let materialize = plugin.connection_strategy() == ConnectionStrategy::Shared
+            && plugin.materializes_session_config()
+            && session_root.is_some()
+            && !launch_arguments;
+        let mut members = Vec::new();
+        if materialize
+            && launch_inputs.is_some()
+            && let Some(DiscussSessionSetup::TeamAtRoot { leader_id }) = setup.as_ref()
+        {
+            let leader =
+                AgentId::try_from(leader_id.clone()).map_err(|error| DiscussError::WorkspaceInvalidAssetId {
+                    asset_id: leader_id.clone(),
+                    violation: error.to_string(),
+                })?;
+            match self.resolve_team(&leader).await? {
+                ResolvedTeam::Builtin(team) => {
+                    members.push(team.leader.clone());
+                    members.extend(team.followers.iter().cloned());
+                }
+                ResolvedTeam::Custom(team) => {
+                    members.push(team.leader.clone());
+                    members.extend(team.followers.iter().cloned());
+                }
+            }
+        }
+        let members: Vec<_> = members.iter().collect();
+        let (configured, mut isolated_configured, limitations) = configure_session_server(
+            plugin,
+            &launch_server,
+            ConfiguredSessionInputs {
+                launch_inputs: launch_inputs.map(|(config, workspace)| (config, workspace.as_path())),
+                materialization: session_root
+                    .filter(|_| materialize)
+                    .map(|root| (root.as_path(), members.as_slice())),
+                explicit_config,
+                restores_team_at_root,
+            },
+        )?;
+        launch_server = configured;
+        prepared.limitations.extend(limitations);
         // A launch-argument selection names the Agent per process, so the session needs its own.
         if let Some(agent) = &primary_agent
             && let PrimaryAgentSelection::LaunchArguments(arguments) =
@@ -1595,6 +1672,63 @@ pub(super) fn dedupe_session_list(sessions: Vec<DiscussSessionInfo>) -> Vec<Disc
 mod team_at_root_setup_tests {
     use super::*;
     use crate::discuss::storage::DiscussSessionRow;
+    use agent_client_protocol::v1::schema::{EnvVariable, McpServerStdio};
+
+    #[test]
+    fn shared_materializing_provider_keeps_unconfigured_server_with_root() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = plugins::for_agent("opencode");
+        let mut stdio = McpServerStdio::new("OpenCode", "opencode");
+        stdio
+            .env
+            .push(EnvVariable::new("OPENCODE_CONFIG_CONTENT", "{}"));
+        let server = McpServer::Stdio(stdio);
+        let config = SessionLaunchConfig {
+            mcp_servers: vec![McpServer::Stdio(McpServerStdio::new("example", "example"))],
+            ..Default::default()
+        };
+        let (configured, isolated, _) = configure_session_server(
+            plugin,
+            &server,
+            ConfiguredSessionInputs {
+                launch_inputs: Some((&config, root.path())),
+                materialization: Some((root.path(), &[])),
+                explicit_config: true,
+                restores_team_at_root: false,
+            },
+        )
+        .unwrap();
+        assert!(!isolated);
+        assert_eq!(configured, server);
+    }
+
+    #[test]
+    fn shared_provider_with_config_and_no_root_is_isolated() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = plugins::for_agent("opencode");
+        let mut stdio = McpServerStdio::new("OpenCode", "opencode");
+        stdio
+            .env
+            .push(EnvVariable::new("OPENCODE_CONFIG_CONTENT", "{}"));
+        let server = McpServer::Stdio(stdio);
+        let config = SessionLaunchConfig {
+            mcp_servers: vec![McpServer::Stdio(McpServerStdio::new("example", "example"))],
+            ..Default::default()
+        };
+        let (configured, isolated, _) = configure_session_server(
+            plugin,
+            &server,
+            ConfiguredSessionInputs {
+                launch_inputs: Some((&config, root.path())),
+                materialization: None,
+                explicit_config: true,
+                restores_team_at_root: false,
+            },
+        )
+        .unwrap();
+        assert!(isolated);
+        assert_ne!(configured, server);
+    }
 
     fn row(team_leader_id: Option<&str>, setup_kind: Option<&str>) -> DiscussSessionRow {
         DiscussSessionRow {

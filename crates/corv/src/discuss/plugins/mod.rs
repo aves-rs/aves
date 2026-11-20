@@ -476,6 +476,31 @@ pub trait DiscussAgentPlugin: Sync {
         false
     }
 
+    /// Whether this provider can write session configuration under its own root.
+    fn materializes_session_config(&self) -> bool {
+        false
+    }
+
+    /// Merge provider-specific session settings into a Team member's render settings.
+    fn session_member_settings(
+        &self,
+        settings: &ConfigSettings,
+        _config: &SessionLaunchConfig,
+    ) -> Result<ConfigSettings, DiscussError> {
+        Ok(settings.clone())
+    }
+
+    /// Write provider-native configuration at the session root.
+    /// Sessions sharing a root share this configuration; the last writer wins.
+    fn materialize_session_config(
+        &self,
+        _root: &Path,
+        _team: &[&AgentId],
+        _config: &SessionLaunchConfig,
+    ) -> Result<Vec<LaunchLimitation>, DiscussError> {
+        Ok(Vec::new())
+    }
+
     /// Apply explicitly supplied session configuration to a private process.
     fn configured_launch_server(
         &self,

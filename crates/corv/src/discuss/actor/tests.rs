@@ -1845,7 +1845,7 @@ async fn team_at_root_materializes_saved_member_settings_without_central_install
     drop(conn);
 
     actor
-        .materialize_custom_team_at_root("opencode", root.path(), &leader)
+        .materialize_custom_team_at_root("opencode", root.path(), &leader, None)
         .await
         .expect("materialize Team");
     let output = fs::read_to_string(

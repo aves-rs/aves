@@ -14,7 +14,10 @@ use aves::bus::BusMcpEndpoint;
 use aves::runtime::ServiceReader;
 use aves::utils::buffers::DEFAULT_BUFFER_SIZE;
 
-use super::actor::{Actor, SpawnSessionOptions, TransientWorkerEvent, channel_send_error, validate_user_turn};
+use super::actor::{
+    Actor, PROVIDER_CHILD_REAP_DEADLINE, SpawnSessionOptions, TransientWorkerEvent, channel_send_error,
+    validate_user_turn,
+};
 use super::config::{
     config_options_from_json, config_settings_from_json, config_settings_from_value, provider_config_options_json,
 };
@@ -1019,6 +1022,84 @@ impl Actor {
         }
 
         Ok(DiscussResponse::SessionList { sessions })
+    }
+
+    /// Reload an existing session at the requested working directory.
+    /// An anchor without a provider session id uses the normal first-attachment path.
+    pub(super) async fn handle_change_working_dir(
+        &mut self,
+        discuss_session_id: DiscussSessionId,
+        session_cwd: PathBuf,
+    ) -> Result<DiscussResponse, DiscussError> {
+        let conn = self.persistence.acquire_connection().await?;
+        let session_id = discuss_session_id.to_string();
+        let row = load_discuss_session(&conn, &session_id)
+            .await?
+            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
+        let stored_cwd = row
+            .session_cwd_json
+            .as_deref()
+            .map(serde_json::from_str::<PathBuf>)
+            .transpose()?;
+        let live_worker = self
+            .worker_registry
+            .get(&discuss_session_id)
+            .filter(|entry| !entry.join_handle.is_finished() && !entry.command_tx.is_closed());
+        let cwd_changed = stored_cwd.as_ref() != Some(&session_cwd);
+        if !cwd_changed && live_worker.is_some() {
+            return Ok(DiscussResponse::Success);
+        }
+        if cwd_changed && live_worker.is_some_and(|entry| entry.active_turn) {
+            return Err(DiscussError::SessionBusy { discuss_session_id });
+        }
+        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
+            let _ = entry.command_tx.send(WorkerCommand::Stop).await;
+            drop(entry.command_tx);
+            let mut join_handle = entry.join_handle;
+            if tokio::time::timeout(PROVIDER_CHILD_REAP_DEADLINE, &mut join_handle)
+                .await
+                .is_err()
+            {
+                join_handle.abort();
+                return Err(DiscussError::WorkerStopTimeout { discuss_session_id });
+            }
+            revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
+            if let Some(supervisor) = self.provider_supervisors.get_mut(&entry.agent_name) {
+                supervisor.disassociate_chat(&discuss_session_id);
+            }
+            self.worker_capabilities.remove(&discuss_session_id);
+            self.cancel_pending_permissions_for_session(&discuss_session_id);
+            self.cancel_pending_elicitations_for_session(&discuss_session_id);
+        }
+        if cwd_changed {
+            update_session_launch_context(&conn, &session_id, Some(serde_json::to_string(&session_cwd)?), None).await?;
+        }
+        let setup = match Self::restored_team_setup(&row) {
+            Some(DiscussSessionSetup::Team { leader_id }) => {
+                update_session_setup_kind(&conn, &session_id, Some("team_at_root")).await?;
+                Some(DiscussSessionSetup::TeamAtRoot { leader_id })
+            }
+            setup => setup,
+        };
+        drop(conn);
+        self.spawn_session(
+            discuss_session_id,
+            &row.agent_name,
+            SpawnSessionOptions {
+                launch_config: None,
+                name: Some(row.session_name.clone()),
+                setup,
+                session_config_overrides: BTreeMap::new(),
+                acp_session_id: None,
+                announce_desktop_association: true,
+                transient_connectivity: false,
+                session_cwd: None,
+                application_mcp_enabled: None,
+                node_token: None,
+                flow_mcp_endpoints: None,
+            },
+        )
+        .await
     }
 
     /// Remove a local Discuss chat session anchor and clean live worker state.

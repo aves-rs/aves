@@ -847,6 +847,35 @@ impl Actor {
                 )
                 .await
             }
+            DiscussRequestPayload::ConnectProviderSession {
+                launch_config,
+                discuss_session_id,
+                agent_key,
+                session_name,
+                setup,
+                session_cwd,
+                application_mcp_enabled,
+                provider_session_id,
+            } => {
+                self.spawn_session(
+                    discuss_session_id,
+                    &agent_key,
+                    SpawnSessionOptions {
+                        launch_config,
+                        name: session_name,
+                        setup,
+                        session_config_overrides: BTreeMap::new(),
+                        acp_session_id: Some(provider_session_id),
+                        announce_desktop_association: true,
+                        transient_connectivity: false,
+                        session_cwd,
+                        application_mcp_enabled,
+                        node_token: None,
+                        flow_mcp_endpoints: None,
+                    },
+                )
+                .await
+            }
             DiscussRequestPayload::ListSessions => self.handle_list_sessions().await,
             DiscussRequestPayload::LoadSession { discuss_session_id } => {
                 self.handle_load_session(discuss_session_id).await
@@ -864,6 +893,13 @@ impl Actor {
             }
             DiscussRequestPayload::RemoveSession { discuss_session_id } => {
                 self.handle_remove_session(discuss_session_id).await
+            }
+            DiscussRequestPayload::ChangeSessionWorkingDir {
+                discuss_session_id,
+                session_cwd,
+            } => {
+                self.handle_change_working_dir(discuss_session_id, session_cwd)
+                    .await
             }
             DiscussRequestPayload::RenameSession {
                 discuss_session_id,
@@ -1322,11 +1358,13 @@ fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
         DiscussRequestPayload::EditTeam { .. } => "editTeam",
         DiscussRequestPayload::UninstallTeam { .. } => "uninstallTeam",
         DiscussRequestPayload::NewSession { .. } => "newSession",
+        DiscussRequestPayload::ConnectProviderSession { .. } => "connectProviderSession",
         DiscussRequestPayload::ListSessions => "listSessions",
         DiscussRequestPayload::LoadSession { .. } => "loadSession",
         DiscussRequestPayload::GetConfigOptions { .. } => "getConfigOptions",
         DiscussRequestPayload::SetConfigOption { .. } => "setConfigOption",
         DiscussRequestPayload::RemoveSession { .. } => "removeSession",
+        DiscussRequestPayload::ChangeSessionWorkingDir { .. } => "changeSessionWorkingDir",
         DiscussRequestPayload::RenameSession { .. } => "renameSession",
     }
 }

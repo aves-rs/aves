@@ -162,6 +162,15 @@ pub enum DiscussRequestPayload {
         discuss_session_id: DiscussSessionId,
     },
 
+    /// Reload a session at a different working directory.
+    #[privileged(reason = "Session working directory changes are internal bus-only control requests")]
+    ChangeSessionWorkingDir {
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
+        /// Requested session working directory.
+        session_cwd: PathBuf,
+    },
+
     /// Reserve an ephemeral viewer for a Provider child ACP session without starting its worker.
 
     #[privileged(reason = "Inspector open/dispose is an internal bus-only control request, not public RPC")]
@@ -255,9 +264,8 @@ pub enum DiscussRequestPayload {
     /// New Discuss session.
     ///
     /// The caller generates the `discuss_session_id` (UUID v4) before opening
-    /// the Tauri channel. Discuss does not accept a provider ACP session id
-    /// as input; reconnect and provider recovery are resolved by Discuss
-    /// alone through its persisted mapping.
+    /// the Tauri channel. Reconnect and provider recovery are resolved through
+    /// the persisted mapping.
 
     #[operation(name = "newSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
     NewSession {
@@ -279,6 +287,31 @@ pub enum DiscussRequestPayload {
         /// Override application MCP for this session; absent uses the Provider default.
         #[serde(default)]
         application_mcp_enabled: Option<bool>,
+    },
+
+    /// Connect a Discuss session to an existing provider conversation.
+    #[operation(name = "connectProviderSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    ConnectProviderSession {
+        /// Optional session-specific launch inputs.
+        #[serde(default)]
+        launch_config: Option<SessionLaunchConfig>,
+        /// Caller-generated session identity (UUID v4).
+        discuss_session_id: DiscussSessionId,
+        /// The json representation from the Discuss registry that can be used to spawn the agent.
+        agent_key: String,
+        /// Human-readable session name (metadata, not a routing key).
+        session_name: Option<String>,
+        /// Configuration intent for a newly created session. Reconnects use
+        /// the settings already persisted on the session anchor.
+        setup: Option<DiscussSessionSetup>,
+        /// Optional execution directory; absence retains the provider workspace default.
+        #[serde(default)]
+        session_cwd: Option<PathBuf>,
+        /// Override application MCP for this session; absent uses the Provider default.
+        #[serde(default)]
+        application_mcp_enabled: Option<bool>,
+        /// Provider conversation identity to load.
+        provider_session_id: String,
     },
 
     /// Install a Team and resolve a new session in one serialized actor request.
@@ -607,6 +640,7 @@ impl DiscussRequestPayload {
                 | DiscussRequestPayload::AddProvider { .. }
                 | DiscussRequestPayload::RefreshProviderConfig { .. }
                 | DiscussRequestPayload::NewSession { .. }
+                | DiscussRequestPayload::ConnectProviderSession { .. }
                 | DiscussRequestPayload::InstallTeamAndStartSession { .. }
                 | DiscussRequestPayload::LoadSession { .. }
                 | DiscussRequestPayload::GetConfigOptions { .. }

@@ -66,6 +66,10 @@ impl DiscussAgentPlugin for CodexPlugin {
         ConnectionStrategy::Shared
     }
 
+    fn materializes_session_config(&self) -> bool {
+        true
+    }
+
     fn launch_preparation(
         &self,
         _context: &LaunchContext,
@@ -261,7 +265,7 @@ mod tests {
     use super::super::super::test_library;
     use super::super::super::types::{DiscussConfigOptionValue, DiscussSessionId, Rule, RuleSet};
     use super::*;
-    use agent_client_protocol::v1::schema::{McpServer, McpServerStdio};
+    use agent_client_protocol::v1::schema::{McpServer, McpServerStdio, NewSessionRequest};
     use tempfile::tempdir;
 
     fn config(read: Effect, write: Effect, execute: Effect) -> SessionLaunchConfig {
@@ -383,6 +387,35 @@ mod tests {
             PLUGIN.launch_option_selections(&SessionLaunchConfig::default(), &[mode_option(&["agent", "read-only"])]);
         assert!(result.settings.is_empty());
         assert!(result.limitations.is_empty());
+    }
+
+    #[test]
+    fn session_requests_keep_mcp_and_mode_separate() {
+        let option = mode_option(&["read-only", "agent"]);
+        let first = config(Effect::Allow, Effect::Deny, Effect::Deny);
+        let second = config(Effect::Allow, Effect::Allow, Effect::Ask);
+        let first_mode = PLUGIN.launch_option_selections(&first, std::slice::from_ref(&option));
+        let second_mode = PLUGIN.launch_option_selections(&second, &[option]);
+        assert_eq!(first_mode.settings.get("mode").map(String::as_str), Some("read-only"));
+        assert_eq!(second_mode.settings.get("mode").map(String::as_str), Some("agent"));
+
+        let request = |name| {
+            NewSessionRequest::new(PathBuf::from("workspace"))
+                .mcp_servers(vec![McpServer::Stdio(McpServerStdio::new(name, "server"))])
+        };
+        let first_request = serde_json::to_value(request("first")).expect("serialize first request");
+        let second_request = serde_json::to_value(request("second")).expect("serialize second request");
+        assert_eq!(first_request["mcpServers"][0]["name"], "first");
+        assert_eq!(second_request["mcpServers"][0]["name"], "second");
+        assert!(PLUGIN.materializes_session_config());
+        let root = tempdir().expect("temporary workspace");
+        assert!(
+            PLUGIN
+                .materialize_session_config(root.path(), &[], &first)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::{
 
 use agent_client_protocol::v1::schema::{EnvVariable, McpServer, SessionId};
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     process::Command,
     sync::mpsc,
@@ -22,7 +22,8 @@ use super::super::library::{
 };
 use super::super::types::{
     DiscussError, DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTodoItem, DiscussTodoSnapshot,
-    DiscussTodoStatus, DiscussUtilityPayload, SessionCliLogin, SessionLaunchConfig,
+    DiscussTodoStatus, DiscussUtilityPayload, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject,
+    SessionCliLogin, SessionLaunchConfig,
 };
 use super::files::{RenderedFile, write_rendered_files};
 use super::{
@@ -34,6 +35,8 @@ pub const OPENCODE_PLUGIN_NAME: &str = "opencode";
 
 const AGENTS_DIRECTORY: &str = ".opencode/agents";
 const CONFIG_PATH: &str = ".opencode/opencode.json";
+const SESSION_CONFIG_PATH: &str = ".opencode/corv-session.json";
+const SESSION_PERMISSIONS_SETTING: &str = "__corv_session_permissions";
 /// OpenCode's session config option selecting the primary agent.
 const MODE_CONFIG_ID: &str = "mode";
 const CHILD_SESSION_LOOKUP_ATTEMPTS: usize = 3;
@@ -78,15 +81,6 @@ impl OpenCodeCaptureState {
 }
 
 #[derive(Serialize)]
-struct AgentFrontmatter<'a> {
-    name: &'a str,
-    mode: &'static str,
-    description: &'a str,
-    #[serde(flatten)]
-    settings: BTreeMap<String, String>,
-}
-
-#[derive(Serialize)]
 struct EnabledAgent {
     disable: bool,
 }
@@ -106,6 +100,12 @@ struct OpenCodeConfig {
     agent: OpenCodeBuiltinAgents,
 }
 
+#[derive(Default, Deserialize, Serialize)]
+struct SessionConfigOwnership {
+    mcp_servers: BTreeSet<String>,
+    permissions: bool,
+}
+
 impl DiscussAgentPlugin for OpenCodePlugin {
     fn connection_strategy(&self) -> ConnectionStrategy {
         ConnectionStrategy::Shared
@@ -118,6 +118,247 @@ impl DiscussAgentPlugin for OpenCodePlugin {
 
     fn uses_mcp_launch_env(&self) -> bool {
         true
+    }
+
+    fn materializes_session_config(&self) -> bool {
+        true
+    }
+
+    fn session_member_settings(
+        &self,
+        settings: &ConfigSettings,
+        config: &SessionLaunchConfig,
+    ) -> Result<ConfigSettings, DiscussError> {
+        let mut merged = settings.clone();
+        if ["permission", "permissions", "policies", SESSION_PERMISSIONS_SETTING]
+            .iter()
+            .any(|key| merged.contains_key(*key))
+            && !config.rule_sources.is_empty()
+        {
+            return Err(DiscussError::Validation {
+                message: "OpenCode agent security policy conflicts with session rules".to_string(),
+            });
+        }
+        if !config.rule_sources.is_empty()
+            && ["name", "temperature"]
+                .iter()
+                .any(|key| merged.contains_key(*key))
+        {
+            return Err(DiscussError::Validation {
+                message: "OpenCode V1 agent settings cannot be mixed with session permissions".to_string(),
+            });
+        }
+        if !config.rule_sources.is_empty() {
+            let translation = permissions::translate(&config.rule_sources);
+            if translation.resolution.is_err() {
+                return Err(DiscussError::Validation {
+                    message: "Incomplete session rule sources".to_string(),
+                });
+            }
+            let mut rules = Vec::new();
+            if let Some(tools) = merged.remove("tools") {
+                let tools: BTreeMap<String, bool> =
+                    yaml_serde::from_str(&tools).map_err(|error| DiscussError::Validation {
+                        message: error.to_string(),
+                    })?;
+                for (tool, enabled) in tools {
+                    let action = match tool.as_str() {
+                        "bash" => "shell",
+                        "write" | "patch" => "edit",
+                        "task" => "subagent",
+                        _ => tool.as_str(),
+                    };
+                    rules.push(serde_json::json!({
+                        "action": action,
+                        "resource": "*",
+                        "effect": if enabled { "allow" } else { "deny" },
+                    }));
+                }
+            }
+            // OpenCode uses the last matching rule, so session rules follow member tool rules.
+            for rule in translation.config.permissions {
+                rules.push(serde_json::to_value(rule)?);
+            }
+            merged.insert(SESSION_PERMISSIONS_SETTING.to_string(), serde_json::to_string(&rules)?);
+        }
+        Ok(merged)
+    }
+
+    fn materialize_session_config(
+        &self,
+        root: &Path,
+        team: &[&AgentId],
+        config: &SessionLaunchConfig,
+    ) -> Result<Vec<LaunchLimitation>, DiscussError> {
+        if config
+            .cli_tools
+            .iter()
+            .any(|tool| tool.login == SessionCliLogin::Required)
+        {
+            return Err(DiscussError::SessionCliLoginUnsupported);
+        }
+        if !config.cli_tools.is_empty() {
+            return Err(DiscussError::SessionCliToolUnsupported);
+        }
+        let path = root.join("opencode.json");
+        let ownership_path = root.join(SESSION_CONFIG_PATH);
+        let previous: SessionConfigOwnership = match fs::read_to_string(&ownership_path) {
+            Ok(content) => serde_json::from_str(&content)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionConfigOwnership::default(),
+            Err(error) => {
+                return Err(DiscussError::WorkspaceIo {
+                    plugin: OPENCODE_PLUGIN_NAME.to_string(),
+                    path: ownership_path.to_string_lossy().into_owned(),
+                    message: error.to_string(),
+                });
+            }
+        };
+        let mut project = match fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str::<serde_json::Value>(&content)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(error) => {
+                return Err(DiscussError::WorkspaceIo {
+                    plugin: OPENCODE_PLUGIN_NAME.to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    message: error.to_string(),
+                });
+            }
+        };
+        let object = project
+            .as_object_mut()
+            .ok_or_else(|| DiscussError::Validation {
+                message: "OpenCode project configuration must be a JSON object".to_string(),
+            })?;
+        if previous.permissions {
+            object.remove("permissions");
+            object.remove("policies");
+        }
+        if !previous.mcp_servers.is_empty() {
+            let servers = object
+                .get_mut("mcp")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|mcp| mcp.get_mut("servers"))
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| DiscussError::Validation {
+                    message: "Unsupported OpenCode project MCP configuration".to_string(),
+                })?;
+            for name in &previous.mcp_servers {
+                servers.remove(name);
+            }
+        }
+        let mut ownership = SessionConfigOwnership::default();
+        let mut files = Vec::new();
+        if !config.rule_sources.is_empty() {
+            let translation = permissions::translate(&config.rule_sources);
+            if translation.resolution.is_err() {
+                return Err(DiscussError::Validation {
+                    message: "Incomplete session rule sources".to_string(),
+                });
+            }
+            let permissions = serde_json::to_value(&translation.config.permissions)?;
+            if team.is_empty() {
+                let policies = serde_json::to_value(&translation.config.policies)?;
+                if object.contains_key("permission")
+                    || object
+                        .get("permissions")
+                        .is_some_and(|value| value != &permissions)
+                    || object
+                        .get("policies")
+                        .is_some_and(|value| value != &policies)
+                {
+                    return Err(DiscussError::Validation {
+                        message: "OpenCode project security policy conflicts with session rules".to_string(),
+                    });
+                }
+                object.insert("permissions".to_string(), permissions.clone());
+                object.insert("policies".to_string(), policies);
+                ownership.permissions = true;
+            }
+        }
+        if !config.mcp_servers.is_empty() {
+            let mut incoming = serde_json::Map::new();
+            for descriptor in &config.mcp_servers {
+                let (name, value) = match descriptor {
+                    McpServer::Stdio(mcp) => {
+                        let mut command = vec![mcp.command.to_string_lossy().into_owned()];
+                        command.extend(mcp.args.iter().cloned());
+                        let environment: BTreeMap<_, _> = mcp
+                            .env
+                            .iter()
+                            .map(|entry| (entry.name.clone(), entry.value.clone()))
+                            .collect();
+                        (
+                            mcp.name.clone(),
+                            serde_json::json!({"type": "local", "command": command, "environment": environment}),
+                        )
+                    }
+                    McpServer::Http(mcp) => {
+                        let headers: BTreeMap<_, _> = mcp
+                            .headers
+                            .iter()
+                            .map(|entry| (entry.name.clone(), entry.value.clone()))
+                            .collect();
+                        (
+                            mcp.name.clone(),
+                            serde_json::json!({"type": "remote", "url": mcp.url, "headers": headers}),
+                        )
+                    }
+                    _ => {
+                        return Err(DiscussError::Validation {
+                            message: "Unsupported OpenCode MCP transport".to_string(),
+                        });
+                    }
+                };
+                if incoming.insert(name, value).is_some() {
+                    return Err(DiscussError::Validation {
+                        message: "Duplicate session MCP server name".to_string(),
+                    });
+                }
+            }
+            let mcp = object
+                .entry("mcp".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            let servers = mcp
+                .as_object_mut()
+                .and_then(|mcp| {
+                    mcp.entry("servers".to_string())
+                        .or_insert_with(|| serde_json::json!({}))
+                        .as_object_mut()
+                })
+                .ok_or_else(|| DiscussError::Validation {
+                    message: "Unsupported OpenCode project MCP configuration".to_string(),
+                })?;
+            for (name, value) in incoming {
+                if servers.contains_key(&name) {
+                    return Err(DiscussError::Validation {
+                        message: "OpenCode project MCP server conflicts with session server".to_string(),
+                    });
+                }
+                ownership.mcp_servers.insert(name.clone());
+                servers.insert(name, value);
+            }
+        }
+        if !config.mcp_servers.is_empty()
+            || (!config.rule_sources.is_empty() && team.is_empty())
+            || !previous.mcp_servers.is_empty()
+            || previous.permissions
+        {
+            files.push(RenderedFile {
+                relative_path: PathBuf::from("opencode.json"),
+                contents: serde_json::to_string_pretty(&project)?,
+            });
+        }
+        files.push(RenderedFile {
+            relative_path: PathBuf::from(SESSION_CONFIG_PATH),
+            contents: serde_json::to_string_pretty(&ownership)?,
+        });
+        write_rendered_files(OPENCODE_PLUGIN_NAME, root, &files)?;
+        Ok((0..config.plugin_references.len())
+            .map(|index| LaunchLimitation {
+                subject: LaunchLimitationSubject::PluginReference { index },
+                reason: LaunchLimitationReason::UnsupportedPluginReference,
+            })
+            .collect())
     }
 
     fn launch_preparation(
@@ -833,16 +1074,40 @@ fn render_agent(
     member_settings: Option<&ConfigSettings>,
 ) -> Result<RenderedFile, DiscussError> {
     let path = PathBuf::from(AGENTS_DIRECTORY).join(format!("{}.md", agent.id.normalized_destination()));
-    let frontmatter = AgentFrontmatter {
-        name: agent.id.as_ref(),
-        description: agent.description,
-        mode: match role {
-            Some(AgentRole::Leader) => "primary",
-            Some(AgentRole::Follower) => "subagent",
-            None => "all",
-        },
-        settings: member_settings.cloned().unwrap_or_default(),
-    };
+    let mut settings = member_settings.cloned().unwrap_or_default();
+    let permissions = settings
+        .remove(SESSION_PERMISSIONS_SETTING)
+        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+        .transpose()?;
+    let mut frontmatter = BTreeMap::new();
+    let has_permissions = permissions.is_some();
+    if !has_permissions {
+        let name: &str = agent.id.as_ref();
+        frontmatter.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+    }
+    frontmatter.insert(
+        "description".to_string(),
+        serde_json::Value::String(agent.description.to_string()),
+    );
+    frontmatter.insert(
+        "mode".to_string(),
+        serde_json::Value::String(
+            match role {
+                Some(AgentRole::Leader) => "primary",
+                Some(AgentRole::Follower) => "subagent",
+                None => "all",
+            }
+            .to_string(),
+        ),
+    );
+    frontmatter.extend(
+        settings
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::Value::String(value))),
+    );
+    if let Some(permissions) = permissions {
+        frontmatter.insert("permissions".to_string(), permissions);
+    }
     render_markdown(&path, &frontmatter, agent.body)
 }
 
@@ -902,6 +1167,114 @@ mod tests {
     use super::super::super::test_library;
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn materializes_permissions_and_mcp_in_session_root() {
+        let root = tempdir().unwrap();
+        let id = AgentId::try_from("reviewer".to_string()).unwrap();
+        let agent_path = root.path().join(PLUGIN.installed_agent_path(&id));
+        fs::write(
+            root.path().join("opencode.json"),
+            r#"{"theme":"night","mcp":{"servers":{"foreign":{"type":"local","command":["other"]}}}}"#,
+        )
+        .unwrap();
+        let config = SessionLaunchConfig {
+            rule_sources: vec![Default::default()],
+            mcp_servers: vec![McpServer::Stdio(McpServerStdio::new("example", "server"))],
+            ..Default::default()
+        };
+        let overrides = ConfigSettings::from([
+            ("model".to_string(), "example/model".to_string()),
+            ("mode".to_string(), "subagent".to_string()),
+            ("description".to_string(), "Custom description".to_string()),
+        ]);
+        let settings = PLUGIN.session_member_settings(&overrides, &config).unwrap();
+        let agent = AgentSelectionView {
+            id: &id,
+            description: "Review",
+            body: "Review code",
+        };
+        let file = render_agent(&agent, Some(AgentRole::Leader), Some(&settings)).unwrap();
+        write_rendered_files(OPENCODE_PLUGIN_NAME, root.path(), &[file]).unwrap();
+        PLUGIN
+            .materialize_session_config(root.path(), &[&id], &config)
+            .unwrap();
+        let agent_text = fs::read_to_string(agent_path).unwrap();
+        let yaml = agent_text
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap()
+            .0;
+        let frontmatter: serde_json::Value = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(frontmatter["permissions"][0]["effect"], "deny");
+        assert_eq!(frontmatter["model"], "example/model");
+        assert_eq!(frontmatter["mode"], "subagent");
+        assert_eq!(frontmatter["description"], "Custom description");
+        let project: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.path().join("opencode.json")).unwrap()).unwrap();
+        assert_eq!(project["theme"], "night");
+        assert_eq!(project["mcp"]["servers"]["example"]["command"][0], "server");
+        let settings = PLUGIN
+            .session_member_settings(&overrides, &SessionLaunchConfig::default())
+            .unwrap();
+        let file = render_agent(&agent, Some(AgentRole::Leader), Some(&settings)).unwrap();
+        write_rendered_files(OPENCODE_PLUGIN_NAME, root.path(), &[file]).unwrap();
+        PLUGIN
+            .materialize_session_config(root.path(), &[&id], &SessionLaunchConfig::default())
+            .unwrap();
+        assert!(
+            !fs::read_to_string(root.path().join(PLUGIN.installed_agent_path(&id)))
+                .unwrap()
+                .contains("permissions:")
+        );
+        let project: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.path().join("opencode.json")).unwrap()).unwrap();
+        assert_eq!(project["theme"], "night");
+        assert!(project["mcp"]["servers"].get("example").is_none());
+        assert_eq!(project["mcp"]["servers"]["foreign"]["command"][0], "other");
+    }
+
+    #[test]
+    fn converts_legacy_tools_before_session_permissions() {
+        let overrides = ConfigSettings::from([("tools".to_string(), r#"{"write":true,"bash":false}"#.to_string())]);
+        let config = SessionLaunchConfig {
+            rule_sources: vec![Default::default()],
+            ..Default::default()
+        };
+        let settings = PLUGIN.session_member_settings(&overrides, &config).unwrap();
+        let id = AgentId::try_from("reviewer".to_string()).unwrap();
+        let agent = AgentSelectionView {
+            id: &id,
+            description: "Review",
+            body: "Review code",
+        };
+        let file = render_agent(&agent, Some(AgentRole::Leader), Some(&settings)).unwrap();
+        let yaml = file
+            .contents
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap()
+            .0;
+        let frontmatter: serde_json::Value = yaml_serde::from_str(yaml).unwrap();
+        assert!(frontmatter.get("tools").is_none());
+        let rules = frontmatter["permissions"].as_array().unwrap();
+        assert_eq!(rules[0]["action"], "shell");
+        assert_eq!(rules[0]["effect"], "deny");
+        assert_eq!(rules[1]["action"], "edit");
+        assert_eq!(rules[1]["effect"], "allow");
+        let last_edit = rules
+            .iter()
+            .rev()
+            .find(|rule| rule["action"] == "edit" || rule["action"] == "*")
+            .unwrap();
+        assert_eq!(last_edit["effect"], "deny");
+        let unchanged = PLUGIN
+            .session_member_settings(&overrides, &SessionLaunchConfig::default())
+            .unwrap();
+        assert_eq!(unchanged.get("tools"), overrides.get("tools"));
+    }
 
     #[test]
     fn configured_launch_does_not_invent_permissions() {

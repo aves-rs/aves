@@ -86,6 +86,10 @@ impl DiscussAgentPlugin for ClaudePlugin {
         ConnectionStrategy::Shared
     }
 
+    fn materializes_session_config(&self) -> bool {
+        true
+    }
+
     fn launch_preparation(
         &self,
         context: &LaunchContext,
@@ -309,6 +313,80 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn session_metadata_and_settings_are_independent() {
+        let directory = tempdir().expect("workspace");
+        let first = LaunchContext::new(directory.path(), DiscussSessionId::new());
+        let second = LaunchContext::new(directory.path(), DiscussSessionId::new());
+        let config = |effect| SessionLaunchConfig {
+            rule_sources: vec![RuleSet {
+                rules: vec![Rule {
+                    operation: Operation::Read,
+                    effect,
+                }],
+            }],
+            ..Default::default()
+        };
+        let first_meta = PLUGIN
+            .launch_preparation(&first, &config(Effect::Allow))
+            .expect("first")
+            .meta
+            .expect("meta");
+        let second_meta = PLUGIN
+            .launch_preparation(&second, &config(Effect::Deny))
+            .expect("second")
+            .meta
+            .expect("meta");
+        let first_path = first.settings_root.join("settings.json");
+        let second_path = second.settings_root.join("settings.json");
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            first_meta["claudeCode"]["options"]["settings"],
+            serde_json::json!(first_path)
+        );
+        assert_eq!(
+            second_meta["claudeCode"]["options"]["settings"],
+            serde_json::json!(second_path)
+        );
+        assert!(
+            !first_meta["claudeCode"]["options"]["disallowedTools"]
+                .as_array()
+                .expect("first denied tools")
+                .contains(&serde_json::json!("Read"))
+        );
+        assert!(
+            second_meta["claudeCode"]["options"]["disallowedTools"]
+                .as_array()
+                .expect("second denied tools")
+                .contains(&serde_json::json!("Read"))
+        );
+        let first_settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(first_path).expect("first settings")).expect("json");
+        let second_settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(second_path).expect("second settings")).expect("json");
+        assert!(
+            first_settings["permissions"]["allow"]
+                .as_array()
+                .expect("allow")
+                .contains(&serde_json::json!("Read"))
+        );
+        assert!(
+            second_settings["permissions"]["deny"]
+                .as_array()
+                .expect("deny")
+                .contains(&serde_json::json!("Read"))
+        );
+        assert!(PLUGIN.materializes_session_config());
+        assert!(
+            PLUGIN
+                .materialize_session_config(directory.path(), &[], &config(Effect::Deny))
+                .expect("no root config")
+                .is_empty()
+        );
+        assert!(!directory.path().join(".claude/settings.json").exists());
+        assert!(!directory.path().join(".mcp.json").exists());
+    }
 
     #[test]
     fn each_effect_maps_every_operation_group() {

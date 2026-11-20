@@ -16,8 +16,8 @@ use super::storage::{
     upsert_custom_team, upsert_discuss_team_installation,
 };
 use super::types::{
-    AgentThemeColor, CustomMcpScope, DiscussError, DiscussMemberOverrides, TeamCatalogEntry, TeamCatalogMember,
-    TeamDefinitionKind,
+    AgentThemeColor, CustomMcpScope, DiscussError, DiscussMemberOverrides, SessionLaunchConfig, TeamCatalogEntry,
+    TeamCatalogMember, TeamDefinitionKind,
 };
 
 impl Actor {
@@ -434,6 +434,7 @@ impl Actor {
         provider_name: &str,
         root: &Path,
         leader_id: &str,
+        session_config: Option<&SessionLaunchConfig>,
     ) -> Result<(), DiscussError> {
         let conn = self.persistence.acquire_connection().await?;
         let installation = load_discuss_team_installation(&conn, leader_id).await?;
@@ -442,7 +443,31 @@ impl Actor {
             .map(|row| serde_json::from_str::<DiscussMemberOverrides>(&row.member_overrides_json))
             .transpose()?
             .unwrap_or_default();
-        let settings = plugins::member_settings_for_team(overrides)?;
+        let mut settings = plugins::member_settings_for_team(overrides)?;
+        let plugin = plugins::for_agent(provider_name);
+        let leader =
+            AgentId::try_from(leader_id.to_owned()).map_err(|error| DiscussError::WorkspaceInvalidAssetId {
+                asset_id: leader_id.to_owned(),
+                violation: error.to_string(),
+            })?;
+        let resolved = self.resolve_team(&leader).await?;
+        if let Some(config) = session_config {
+            let members: Vec<_> = match &resolved {
+                ResolvedTeam::Builtin(team) => std::iter::once(&team.leader)
+                    .chain(&team.followers)
+                    .cloned()
+                    .collect(),
+                ResolvedTeam::Custom(team) => std::iter::once(&team.leader)
+                    .chain(&team.followers)
+                    .cloned()
+                    .collect(),
+            };
+            for id in members {
+                let merged =
+                    plugin.session_member_settings(settings.get(&id).unwrap_or(&Default::default()), config)?;
+                settings.insert(id, merged);
+            }
+        }
         if let Some(team) = self
             .library
             .teams_for()
@@ -452,12 +477,7 @@ impl Actor {
                 .install_builtin_team(plugins::for_agent(provider_name), root, team, &settings)
                 .await;
         }
-        let leader =
-            AgentId::try_from(leader_id.to_owned()).map_err(|error| DiscussError::WorkspaceInvalidAssetId {
-                asset_id: leader_id.to_owned(),
-                violation: error.to_string(),
-            })?;
-        let ResolvedTeam::Custom(team) = self.resolve_team(&leader).await? else {
+        let ResolvedTeam::Custom(team) = resolved else {
             return Ok(());
         };
         self.materialize_custom_team(plugins::for_agent(provider_name), root, &team, &settings, false)

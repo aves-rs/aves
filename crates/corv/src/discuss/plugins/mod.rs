@@ -51,6 +51,8 @@ pub(super) const BILLING_TOTAL: u8 = 1 << 5;
 pub(super) struct BillingCategorySemantics {
     pub guaranteed_categories: u8,
     pub input_includes_cache: Option<bool>,
+    /// Whether reported output omits thought tokens, which are then charged at the output rate.
+    pub output_excludes_thought: bool,
 }
 
 impl BillingCategorySemantics {
@@ -377,6 +379,22 @@ pub fn for_agent(agent_name: &str) -> &'static dyn DiscussAgentPlugin {
     }
 }
 
+/// Identify the primary-agent option without exposing plugin selection details.
+pub(super) fn agent_config_option_id(plugin: &dyn DiscussAgentPlugin) -> Option<String> {
+    let id = AgentId::new("agent").ok()?;
+    let agent = AgentSelectionView {
+        id: &id,
+        description: "",
+        body: "",
+    };
+    match plugin.primary_agent_selection(&agent) {
+        PrimaryAgentSelection::ConfigOption(id) => Some(id.to_owned()),
+        PrimaryAgentSelection::SystemPrompt
+        | PrimaryAgentSelection::SessionMeta(_)
+        | PrimaryAgentSelection::LaunchArguments(_) => None,
+    }
+}
+
 /// Resolve the optional built-in copy source beside the canonical Provider keys.
 pub(super) fn default_workspace_copy_source(provider_name: &str) -> Option<&'static str> {
     match provider_name {
@@ -404,6 +422,11 @@ pub trait DiscussAgentPlugin: Sync {
     /// Return the provider's exact models.dev identifier, if known.
     fn models_dev_provider_id(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Maps provider prefixes in reported model IDs to models.dev provider IDs.
+    fn models_dev_provider_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
     /// Declares the Provider's connection ownership model.
     ///

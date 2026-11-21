@@ -23,8 +23,8 @@ use super::storage::{
 };
 use super::types::{
     CleanupWarning, ConfigSettings, DiscussConfigOption, DiscussElicitationAnswer, DiscussError,
-    DiscussMemberOverrides, DiscussModelUsageEntry, DiscussSubagentRecord, DiscussTurnRecord, DiscussUtilityPayload,
-    LaunchLimitation, RetainedTeamAssetsByScope,
+    DiscussMemberOverrides, DiscussModelUsageEntry, DiscussSubagentRecord, DiscussTurnRecord, DiscussTurnUsage,
+    DiscussUtilityPayload, LaunchLimitation, RetainedTeamAssetsByScope,
 };
 
 /// One ordered persistence unit for a session's serialized write queue.
@@ -88,6 +88,8 @@ pub(super) enum PersistenceJob {
     UpdateTurnUsage {
         turn: DiscussTurnRecord,
         entries: Vec<DiscussModelUsageEntry>,
+        assistant_position: Option<i64>,
+        usage: DiscussTurnUsage,
     },
 }
 
@@ -227,11 +229,27 @@ pub(super) fn spawn_persistence_queue(
                         tracing::warn!(?error, "Discuss worker: failed to persist accounting turn");
                     }
                 }
-                PersistenceJob::UpdateTurnUsage { turn, entries } => {
+                PersistenceJob::UpdateTurnUsage {
+                    turn,
+                    entries,
+                    assistant_position,
+                    usage,
+                } => {
                     if let Err(error) =
                         persist_usage_turn(&persistence, &discuss_session_id, &turn, &entries, true).await
                     {
                         tracing::warn!(?error, "Discuss worker: failed to update accounting turn");
+                    }
+                    if let Some(position) = assistant_position {
+                        let result = async {
+                            let conn = persistence.acquire_connection().await?;
+                            super::storage::update_discuss_chat_turn_usage(&conn, &discuss_session_id, position, &usage)
+                                .await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            tracing::warn!(?error, "Discuss worker: failed to update assistant turn usage");
+                        }
                     }
                 }
             }
@@ -682,14 +700,17 @@ pub async fn persist_assistant_turn(
 ) -> Result<(), DiscussError> {
     let conn = persistence.acquire_connection().await?;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let content = serde_json::json!({
+    let mut content = serde_json::json!({
         "role": "assistant",
         "text": payload.aggregated_text,
         "thought": payload.aggregated_thought,
         "parts": payload.parts,
         "stopReason": payload.stop_reason,
-    })
-    .to_string();
+    });
+    if let Some(usage) = &payload.usage {
+        content["usage"] = serde_json::to_value(usage)?;
+    }
+    let content = content.to_string();
     insert_discuss_chat_turn(
         &conn,
         DiscussChatTurnInsert {

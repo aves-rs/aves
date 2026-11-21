@@ -767,6 +767,20 @@ pub type RetainedTeamAssetsByScope = (RetainedAgentsByScope, RetainedSkillsBySco
 
 // ── DiscussStreamEvent ─────────────────────────────────────────────────────
 
+/// Normalized evidence for one accounting turn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DiscussTurnUsage {
+    pub turn_ordinal: i64,
+    pub model_id: Option<String>,
+    pub output_tokens: Option<u64>,
+    pub thought_tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub end_to_end_ms: Option<i64>,
+    pub usage_is_incomplete: bool,
+}
+
 /// The single bounded stream event from Discuss session workers to Zeus.
 ///
 /// Replaces the former three fixed channel pairs (`msg_from_agent`,
@@ -805,6 +819,9 @@ pub enum DiscussStreamEvent {
         acp_session_id: SessionId,
         /// Typed ACP protocol payload.
         payload: AcpAgentMessagePayload,
+        /// Accounting snapshot correlated to this turn, when available.
+        #[serde(default)]
+        turn_usage: Option<DiscussTurnUsage>,
     },
     /// A provider-neutral todo or subagent utility update.
     UtilityUpdate {
@@ -1423,6 +1440,9 @@ pub struct DiscussProviderConfig {
     pub options: Vec<DiscussConfigOption>,
     /// User-selected defaults applied when a session has no explicit setting.
     pub defaults: BTreeMap<String, String>,
+    /// Provider option used to select the primary agent, when available.
+    #[serde(default)]
+    pub agent_config_option_id: Option<String>,
 }
 
 /// The lifecycle state of an installed Provider runtime.

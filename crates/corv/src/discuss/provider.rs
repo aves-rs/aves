@@ -1185,7 +1185,7 @@ impl Actor {
             })?;
         let conn = self.persistence.acquire_connection().await?;
         let row = load_discuss_agent_config(&conn, provider_name).await?;
-        let config = match row {
+        let mut config = match row {
             Some(row) => DiscussProviderConfig {
                 options_discovered: row.config_options_json.is_some(),
                 options: row
@@ -1195,9 +1195,11 @@ impl Actor {
                     .transpose()?
                     .unwrap_or_default(),
                 defaults: config_settings_from_json(&row.default_config_json)?,
+                agent_config_option_id: None,
             },
             None => DiscussProviderConfig::default(),
         };
+        config.agent_config_option_id = plugins::agent_config_option_id(plugins::for_agent(provider_name));
         Ok(DiscussResponse::ProviderConfig {
             config,
             workspace_copy_sources: effective_workspace_copy_sources(provider_name, provider),

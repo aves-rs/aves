@@ -8,7 +8,7 @@ use aves::utils::database::{DatabaseError, connect_database};
 use super::types::{
     ConfigSettings, DiscussCompletionKind, DiscussConfigOption, DiscussError, DiscussHarnessCostKind,
     DiscussModelUsageEntry, DiscussSessionId, DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTurnRecord,
-    DiscussUsageEvidenceSource, LaunchLimitation, SessionLaunchConfig,
+    DiscussTurnUsage, DiscussUsageEvidenceSource, LaunchLimitation, SessionLaunchConfig,
 };
 
 pub(super) const INSERT_IDENTITY_BINDING_SQL: &str = include_str!("queries/insert_identity_binding.sql");
@@ -27,6 +27,7 @@ const DISCUSS_SESSIONS_LAUNCH_LIMITATIONS_SQL: &str = include_str!("queries/upda
 pub const DISCUSS_SESSIONS_DELETE_SQL: &str = include_str!("queries/session_delete.sql");
 pub const DISCUSS_SESSIONS_RENAME_SQL: &str = include_str!("queries/discuss_sessions_rename.sql");
 pub const DISCUSS_CHAT_TURNS_INSERT_SQL: &str = include_str!("queries/discuss_chat_turns_insert.sql");
+const DISCUSS_CHAT_TURNS_UPDATE_USAGE_SQL: &str = include_str!("queries/discuss_chat_turns_update_usage.sql");
 pub const DISCUSS_CHAT_TURNS_PRUNE_WINDOW_SQL: &str = include_str!("queries/discuss_chat_turns_prune_window.sql");
 pub const DISCUSS_CHAT_TURNS_LOAD_WINDOW_SQL: &str = include_str!("queries/discuss_chat_turns_load_window.sql");
 pub const DISCUSS_AGENT_CONFIG_LOAD_SQL: &str = include_str!("queries/discuss_agent_config_load.sql");
@@ -849,6 +850,22 @@ pub async fn insert_discuss_chat_turn(
             params.content_json.to_string(),
             params.created_at,
         ),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Correct usage on the exact retained assistant row for a finalized turn.
+pub(super) async fn update_discuss_chat_turn_usage(
+    conn: &Connection,
+    session_id: &str,
+    position: i64,
+    usage: &DiscussTurnUsage,
+) -> Result<(), DiscussError> {
+    let usage_json = serde_json::to_string(usage)?;
+    conn.execute(
+        DISCUSS_CHAT_TURNS_UPDATE_USAGE_SQL,
+        (session_id.to_string(), position, usage_json),
     )
     .await?;
     Ok(())

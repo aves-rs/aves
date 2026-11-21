@@ -27,8 +27,9 @@ use super::super::types::{
 };
 use super::files::{RenderedFile, write_rendered_files};
 use super::{
-    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig,
-    PluginCaptureState, PrimaryAgentSelection, render_skill_file, resolve_agent, resolve_skill,
+    BILLING_INPUT, BILLING_OUTPUT, BILLING_TOTAL, BillingCategorySemantics, ConfigSettings, ConnectionStrategy,
+    DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig, PluginCaptureState, PrimaryAgentSelection,
+    render_skill_file, resolve_agent, resolve_skill,
 };
 
 pub const OPENCODE_PLUGIN_NAME: &str = "opencode";
@@ -107,6 +108,21 @@ struct SessionConfigOwnership {
 }
 
 impl DiscussAgentPlugin for OpenCodePlugin {
+    /// OpenCode's ACP usage reports non-cached input and visible output; cache and reasoning
+    /// counts are separate and omitted when zero (`acp/translate.ts`, `session/usage.ts`).
+    fn billing_semantics(&self) -> BillingCategorySemantics {
+        BillingCategorySemantics {
+            guaranteed_categories: BILLING_INPUT | BILLING_OUTPUT | BILLING_TOTAL,
+            input_includes_cache: Some(false),
+            output_excludes_thought: true,
+        }
+    }
+
+    /// OpenCode's Claude Agent provider runs Anthropic models and prices them from Anthropic.
+    fn models_dev_provider_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("claude-agent", "anthropic")]
+    }
+
     fn connection_strategy(&self) -> ConnectionStrategy {
         ConnectionStrategy::Shared
     }

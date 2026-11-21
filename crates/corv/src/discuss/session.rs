@@ -55,6 +55,7 @@ use super::types::{
 use super::worker::{run_connected_session, run_isolated};
 
 pub(super) const SESSION_WORKER_JWT_EXPIRATION: ChronoDuration = ChronoDuration::days(30);
+const REQUEST_PERMISSION_METHOD: &str = "session/request_permission";
 
 pub(super) struct IssuedWorkerToken {
     pub(super) token: Jwt,
@@ -449,15 +450,22 @@ impl HandleDispatchFrom<Agent> for SessionCallbackRouter {
         _cx: RawConnectionTo<Agent>,
     ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
         match message {
+            Dispatch::Request(request, responder) if request.method() == REQUEST_PERMISSION_METHOD => {
+                match serde_json::from_value::<RequestPermissionRequest>(request.params().clone()) {
+                    Ok(permission) => {
+                        if let Some(target) = self.target_for_session(&permission.session_id).await {
+                            self.route_permission(permission, target, responder.cast::<RequestPermissionResponse>())
+                                .await?;
+                        } else {
+                            responder.respond_with_internal_error("callback target is unavailable")?;
+                        }
+                    }
+                    Err(_) => responder.respond_with_internal_error("invalid permission request")?,
+                }
+                Ok(Handled::Yes)
+            }
             Dispatch::Request(request, responder) => {
                 let raw_request = request.clone();
-                if let Ok(permission) = serde_json::from_value::<RequestPermissionRequest>(request.params().clone())
-                    && let Some(target) = self.target_for_session(&permission.session_id).await
-                {
-                    self.route_permission(permission, target, responder.cast::<RequestPermissionResponse>())
-                        .await?;
-                    return Ok(Handled::Yes);
-                }
                 if let Ok(elicitation) = serde_json::from_value::<CreateElicitationRequest>(request.params().clone())
                     && let Some(session_id) = explicit_elicitation_session_id(&elicitation)
                     && let Some(target) = self.target_for_session(&session_id).await
@@ -742,7 +750,12 @@ impl HandleDispatchFrom<Agent> for SessionMessageRouter {
         _cx: RawConnectionTo<Agent>,
     ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
         let session_id: Option<SessionId> = match &message {
-            Dispatch::Request(request, _) if request.method() == "elicitation/create" => None,
+            // RPC callbacks keep their responder in the callback router, never in transcript data.
+            Dispatch::Request(request, _)
+                if matches!(request.method(), REQUEST_PERMISSION_METHOD | "elicitation/create") =>
+            {
+                None
+            }
             Dispatch::Request(request, _) | Dispatch::Notification(request) => request
                 .params()
                 .get("sessionId")
@@ -1111,6 +1124,71 @@ pub(super) fn channel_send_error(operation: &'static str, cause: impl Into<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::v1::schema::{RequestPermissionOutcome, ToolCallUpdate, ToolCallUpdateFields};
+    use agent_client_protocol::{Channel, Client};
+
+    #[tokio::test]
+    async fn permission_bypasses_the_transcript_router_even_when_it_runs_first() {
+        let session_id = SessionId::from("provider-session".to_owned());
+        let target = CallbackRouteTarget::Chat {
+            discuss_session_id: DiscussSessionId::new(),
+        };
+        let router = Arc::new(Mutex::new(CallbackRouter::default()));
+        assert!(
+            router
+                .lock()
+                .await
+                .register_session(session_id.clone(), target.clone())
+        );
+        let (callback_tx, mut callbacks) = mpsc::channel(1);
+        let mut routes = CallbackRouteRegistry::new(router.clone());
+        assert!(routes.register_queue(target.clone(), callback_tx));
+        let (update_tx, mut updates) = mpsc::unbounded_channel();
+        let (client_side, agent_side) = Channel::duplex();
+        let (response_received, received) = oneshot::channel();
+        let request = RequestPermissionRequest::new(
+            session_id.clone(),
+            ToolCallUpdate::new("tool-call".to_owned(), ToolCallUpdateFields::new()),
+            Vec::new(),
+        );
+        let agent = tokio::spawn(
+            Agent
+                .v1()
+                .connect_with(agent_side, async move |connection| {
+                    let response = connection.send_request(request).block_task().await?;
+                    assert!(matches!(response.outcome, RequestPermissionOutcome::Cancelled));
+                    let _ = response_received.send(());
+                    Ok(())
+                }),
+        );
+        // Builder handlers run in declaration order, unlike dynamic handlers.
+        let client = Client
+            .v1()
+            .with_handler(SessionMessageRouter::new(
+                session_id.clone(),
+                target,
+                Some(router),
+                update_tx,
+            ))
+            .with_handler(SessionCallbackRouter::new(Arc::new(Mutex::new(routes))))
+            .connect_with(client_side, async move |_| {
+                let CallbackEvent::Permission { request, responder, .. } =
+                    callbacks.recv().await.expect("permission callback")
+                else {
+                    panic!("expected a permission callback");
+                };
+                assert_eq!(request.session_id, session_id);
+                assert!(matches!(updates.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                responder.respond(RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled))?;
+                received.await.expect("provider received the response");
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("permission request was not routed")
+            .expect("client connection");
+        agent.await.expect("agent task").expect("agent connection");
+    }
 
     #[test]
     fn primary_agent_open_shapes_the_session_request_per_selection() {

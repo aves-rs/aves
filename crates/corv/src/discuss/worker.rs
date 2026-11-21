@@ -1024,26 +1024,7 @@ async fn cancel_turn(
             error: DiscussError::SessionCancelled { discuss_session_id },
         });
     }
-    if let Some(flush) = flush_cancelled_assistant_turn(buffer)
-        && let Err(error) = persistence_queue
-            .send(PersistenceJob::AssistantTurn {
-                assistant_position: position_allocator.next(),
-                flush,
-            })
-            .await
-    {
-        let _ = reply.send(Err(channel_send_error(
-            "shared.persist_cancelled_turn",
-            error.to_string(),
-        )));
-        return Ok(());
-    }
-    let notification = UntypedMessage::new(
-        "session/cancel",
-        serde_json::json!({"sessionId": session.session_id().to_string()}),
-    )?;
-    session.connection().send_notification(notification)?;
-    set_turn_activity(awaiting_turn, true, activity_update_tx, discuss_session_id).await?;
+    let flush = flush_cancelled_assistant_turn(buffer);
     usage
         .finish(
             DiscussCompletionKind::Cancelled,
@@ -1051,6 +1032,30 @@ async fn cancel_turn(
             persistence_queue,
         )
         .await;
+    if let Some(mut flush) = flush {
+        flush.usage = usage.finalized_snapshot();
+        let assistant_position = position_allocator.next();
+        if let Err(error) = persistence_queue
+            .send(PersistenceJob::AssistantTurn {
+                assistant_position,
+                flush,
+            })
+            .await
+        {
+            let _ = reply.send(Err(channel_send_error(
+                "shared.persist_cancelled_turn",
+                error.to_string(),
+            )));
+            return Ok(());
+        }
+        usage.bind_assistant_position(assistant_position);
+    }
+    let notification = UntypedMessage::new(
+        "session/cancel",
+        serde_json::json!({"sessionId": session.session_id().to_string()}),
+    )?;
+    session.connection().send_notification(notification)?;
+    set_turn_activity(awaiting_turn, true, activity_update_tx, discuss_session_id).await?;
     let _ = reply.send(Ok(()));
     Ok(())
 }
@@ -1492,6 +1497,7 @@ async fn attach_inspector(
                     session: child.session_id(),
                     agent_plugin,
                     capture_state: &mut capture_state,
+                    usage: None,
                 },
                 update,
                 &mut buffer,
@@ -1551,15 +1557,13 @@ async fn handle_session_update(
             session: session.session_id(),
             agent_plugin,
             capture_state,
+            usage: Some((usage, persistence_queue)),
         },
         update,
         buffer,
         *suppress_transcript,
     )
     .await?;
-    for evidence in buffer.take_usage_evidence() {
-        usage.capture(evidence, persistence_queue).await;
-    }
     if let Some(limits) = *agent_node_limits {
         let tool_calls = buffer.tool_call_count();
         if tool_calls > limits.max_tool_calls
@@ -1593,6 +1597,7 @@ async fn handle_session_update(
             enqueue_utility_persistence(persistence_queue, utility_payload).await;
         }
         AgentMessageForwardOutcome::TurnBoundary { flush, utility_payload } => {
+            let mut flush = *flush;
             usage
                 .finish(
                     if flush.stop_reason == "cancelled" {
@@ -1604,6 +1609,7 @@ async fn handle_session_update(
                     persistence_queue,
                 )
                 .await;
+            flush.usage = usage.finalized_snapshot();
             let terminal_output = serde_json::json!({
                 "text": flush.aggregated_text.clone(),
                 "thought": flush.aggregated_thought.clone(),
@@ -1614,9 +1620,10 @@ async fn handle_session_update(
             });
             enqueue_utility_persistence(persistence_queue, utility_payload).await;
             if super::database::should_persist_assistant_turn(&flush) {
+                let assistant_position = position_allocator.next();
                 persistence_queue
                     .send(PersistenceJob::AssistantTurn {
-                        assistant_position: position_allocator.next(),
+                        assistant_position,
                         flush,
                     })
                     .await
@@ -1626,6 +1633,7 @@ async fn handle_session_update(
                             error.to_string(),
                         ))
                     })?;
+                usage.bind_assistant_position(assistant_position);
             }
             *suppress_transcript = false;
             set_turn_activity(awaiting_turn, true, activity_update_tx, discuss_session_id).await?;

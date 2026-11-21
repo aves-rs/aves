@@ -901,6 +901,13 @@ impl Actor {
                 self.handle_change_working_dir(discuss_session_id, session_cwd)
                     .await
             }
+            DiscussRequestPayload::EnsureAttachedSession {
+                discuss_session_id,
+                session_cwd,
+            } => self
+                .ensure_session_working_dir(discuss_session_id, session_cwd, true)
+                .await
+                .map(|outcome| DiscussResponse::AttachedSessionEnsured { outcome }),
             DiscussRequestPayload::RenameSession {
                 discuss_session_id,
                 display_title,
@@ -1365,6 +1372,7 @@ fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
         DiscussRequestPayload::SetConfigOption { .. } => "setConfigOption",
         DiscussRequestPayload::RemoveSession { .. } => "removeSession",
         DiscussRequestPayload::ChangeSessionWorkingDir { .. } => "changeSessionWorkingDir",
+        DiscussRequestPayload::EnsureAttachedSession { .. } => "ensureAttachedSession",
         DiscussRequestPayload::RenameSession { .. } => "renameSession",
     }
 }

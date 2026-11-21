@@ -9,9 +9,12 @@ use super::database::{PersistenceJob, enqueue_persistence_job};
 use super::plugins::{BillingCategorySemantics, DiscussAgentPlugin};
 use super::pricing::{PriceIndex, PriceSnapshot};
 use super::types::{
-    DiscussCompletionKind, DiscussHarnessCostKind, DiscussModelUsageEntry, DiscussTurnRecord,
+    DiscussCompletionKind, DiscussHarnessCostKind, DiscussModelUsageEntry, DiscussTurnRecord, DiscussTurnUsage,
     DiscussUsageEvidenceSource,
 };
+
+/// A plugin's provider-prefix mapping onto models.dev provider IDs.
+type ProviderAliases = &'static [(&'static str, &'static str)];
 
 /// One model's observed per-turn token counts.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -109,8 +112,14 @@ pub(super) fn capture_standard_usage(event: &UsageCaptureEvent<'_>) -> Option<Di
 struct ActiveTurn {
     started: Instant,
     turn: DiscussTurnRecord,
+    assistant_position: Option<i64>,
     evidence: Vec<DiscussUsageEvidence>,
-    pricing: Option<(PriceSnapshot, BillingCategorySemantics, Option<&'static str>)>,
+    pricing: Option<(
+        PriceSnapshot,
+        BillingCategorySemantics,
+        Option<&'static str>,
+        ProviderAliases,
+    )>,
 }
 
 /// Worker-local turn accounting with one retained late-evidence slot.
@@ -121,10 +130,39 @@ pub(super) struct UsageTurnAccumulator {
     occupancy: (Option<u64>, Option<u64>),
     active: Option<ActiveTurn>,
     last: Option<ActiveTurn>,
-    pricing: Option<(PriceIndex, BillingCategorySemantics, Option<&'static str>)>,
+    pricing: Option<(
+        PriceIndex,
+        BillingCategorySemantics,
+        Option<&'static str>,
+        ProviderAliases,
+    )>,
 }
 
 impl UsageTurnAccumulator {
+    /// Snapshot the finalized turn retained for late evidence and persistence.
+    pub(super) fn finalized_snapshot(&self) -> Option<DiscussTurnUsage> {
+        self.last.as_ref().map(usage_snapshot)
+    }
+
+    /// Bind the finalized turn to the transcript row queued for it.
+    pub(super) fn bind_assistant_position(&mut self, position: i64) {
+        if let Some(last) = &mut self.last {
+            last.assistant_position = Some(position);
+        }
+    }
+
+    /// Snapshot only evidence accepted by the active or retained turn.
+    pub(super) fn evidence_snapshot(&self, correlatable: bool) -> Option<DiscussTurnUsage> {
+        self.active
+            .as_ref()
+            .or(if correlatable { self.last.as_ref() } else { None })
+            .filter(|turn| !turn.evidence.is_empty())
+            .map(usage_snapshot)
+    }
+
+    pub(super) fn has_active_turn(&self) -> bool {
+        self.active.is_some()
+    }
     pub(super) fn new(session_id: String, provider: String, next_ordinal: i64) -> Self {
         Self {
             session_id,
@@ -139,7 +177,12 @@ impl UsageTurnAccumulator {
 
     /// Attach the shared catalog and source-verified provider billing rules.
     pub(super) fn set_pricing(&mut self, index: PriceIndex, plugin: &dyn DiscussAgentPlugin) {
-        self.pricing = Some((index, plugin.billing_semantics(), plugin.models_dev_provider_id()));
+        self.pricing = Some((
+            index,
+            plugin.billing_semantics(),
+            plugin.models_dev_provider_id(),
+            plugin.models_dev_provider_aliases(),
+        ));
     }
 
     pub(super) fn dispatch(&mut self, model_id: Option<String>) {
@@ -170,6 +213,7 @@ impl UsageTurnAccumulator {
         self.active = Some(ActiveTurn {
             started: Instant::now(),
             turn,
+            assistant_position: None,
             evidence: Vec::new(),
             pricing: None,
         });
@@ -188,7 +232,17 @@ impl UsageTurnAccumulator {
             if let Some(last) = &mut self.last {
                 last.evidence.push(evidence);
                 let (turn, entries) = assemble(last);
-                enqueue_persistence_job(queue, PersistenceJob::UpdateTurnUsage { turn, entries }).await;
+                let usage = usage_snapshot(last);
+                enqueue_persistence_job(
+                    queue,
+                    PersistenceJob::UpdateTurnUsage {
+                        turn,
+                        entries,
+                        assistant_position: last.assistant_position,
+                        usage,
+                    },
+                )
+                .await;
             } else {
                 tracing::debug!("Dropping uncorrelated late usage evidence");
             }
@@ -214,10 +268,27 @@ impl UsageTurnAccumulator {
         active.pricing = self
             .pricing
             .as_ref()
-            .map(|(index, semantics, provider)| (index.snapshot(), *semantics, *provider));
+            .map(|(index, semantics, provider, aliases)| (index.snapshot(), *semantics, *provider, *aliases));
         let (turn, entries) = assemble(&active);
         enqueue_persistence_job(queue, PersistenceJob::UsageTurn { turn, entries }).await;
         self.last = Some(active);
+    }
+}
+
+fn usage_snapshot(active: &ActiveTurn) -> DiscussTurnUsage {
+    let (turn, entries) = assemble(active);
+    let sum = |field: fn(&DiscussModelUsageEntry) -> Option<u64>| {
+        entries.iter().filter_map(field).reduce(u64::saturating_add)
+    };
+    DiscussTurnUsage {
+        turn_ordinal: turn.turn_ordinal,
+        model_id: turn.model_id,
+        output_tokens: sum(|entry| entry.output_tokens),
+        thought_tokens: sum(|entry| entry.thought_tokens),
+        input_tokens: sum(|entry| entry.input_tokens),
+        total_tokens: sum(|entry| entry.total_tokens),
+        end_to_end_ms: turn.end_to_end_ms,
+        usage_is_incomplete: turn.usage_is_incomplete || entries.is_empty(),
     }
 }
 
@@ -292,8 +363,8 @@ fn assemble(active: &ActiveTurn) -> (DiscussTurnRecord, Vec<DiscussModelUsageEnt
                 pricing_basis: None,
                 price_snapshot_json: None,
             };
-            if let Some((snapshot, semantics, provider)) = &active.pricing {
-                snapshot.price(&mut entry, *semantics, *provider, turn.context_used_tokens);
+            if let Some((snapshot, semantics, provider, aliases)) = &active.pricing {
+                snapshot.price(&mut entry, *semantics, *provider, aliases, turn.context_used_tokens);
             }
             entry
         })

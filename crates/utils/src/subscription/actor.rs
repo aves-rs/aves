@@ -2,6 +2,7 @@
 
 use std::env::home_dir;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use quota_core::Registry;
 use quota_core::config::QuotaConfig;
@@ -20,6 +21,9 @@ use corv::{
 
 use super::messages::{SubscriptionRequest, SubscriptionRequestPayload, SubscriptionResponse};
 use super::plugins::CliCredentials;
+
+/// Minimum gap between recorded allowance snapshots; quota-core observes every few seconds.
+const RECORD_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Subscription actor owning the running allowance observation, if any.
 pub(super) struct Actor {
@@ -92,7 +96,12 @@ fn observe(context: BusRpcContext, cancel: CancellationToken) {
     });
 
     tokio::spawn(async move {
+        let mut last_recorded: Option<Instant> = None;
         while let Some(entries) = receiver.recv().await {
+            if last_recorded.is_some_and(|at| at.elapsed() < RECORD_INTERVAL) {
+                continue;
+            }
+            last_recorded = Some(Instant::now());
             let entries = entries.iter().map(projection).collect();
             match dispatch_record_allowance(&context, RecordAllowanceInput { entries }).await {
                 Ok(_) | Err(DiscussError::AccountingUnavailable) => {}

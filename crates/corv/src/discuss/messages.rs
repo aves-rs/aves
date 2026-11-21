@@ -32,6 +32,15 @@ pub struct DiscussRequest {
     pub reply_to: oneshot::Sender<Result<DiscussResponse, DiscussError>>,
 }
 
+/// Whether an existing provider attachment could be reused.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, specta::Type, schemars::JsonSchema)]
+pub enum EnsureAttachedSessionOutcome {
+    /// The existing worker was kept or a reconnect was started.
+    Ensured,
+    /// No provider attachment exists; the caller must launch the session.
+    NeedsLaunch,
+}
+
 /// Payload variants for Discuss requests.
 #[aves::bus_requests(marker = DiscussDomain, context = BusRpcContext, root_error = DiscussError, domain_error = DiscussError)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +174,15 @@ pub enum DiscussRequestPayload {
     /// Reload a session at a different working directory.
     #[privileged(reason = "Session working directory changes are internal bus-only control requests")]
     ChangeSessionWorkingDir {
+        /// Application-owned canonical session identity.
+        discuss_session_id: DiscussSessionId,
+        /// Requested session working directory.
+        session_cwd: PathBuf,
+    },
+
+    /// Ensure an already attached session without loading its transcript.
+    #[privileged(reason = "Reconnecting a session at a working directory is internal bus-only control")]
+    EnsureAttachedSession {
         /// Application-owned canonical session identity.
         discuss_session_id: DiscussSessionId,
         /// Requested session working directory.
@@ -643,6 +661,7 @@ impl DiscussRequestPayload {
                 | DiscussRequestPayload::ConnectProviderSession { .. }
                 | DiscussRequestPayload::InstallTeamAndStartSession { .. }
                 | DiscussRequestPayload::LoadSession { .. }
+                | DiscussRequestPayload::EnsureAttachedSession { .. }
                 | DiscussRequestPayload::GetConfigOptions { .. }
                 | DiscussRequestPayload::SetConfigOption { .. }
                 | DiscussRequestPayload::SendUserTurn { .. }
@@ -662,6 +681,8 @@ impl DiscussRequestPayload {
 #[aves::bus_responses]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiscussResponse {
+    /// The result of checking the existing provider attachment.
+    AttachedSessionEnsured { outcome: EnsureAttachedSessionOutcome },
     /// Session and configured agent associated with a verified identity.
     SessionIdentityResolved {
         discuss_session_id: DiscussSessionId,
@@ -790,7 +811,12 @@ pub enum DiscussResponse {
     },
 
     /// Provider-exposed config options for a live or loaded session.
-    ConfigOptions { options: Vec<DiscussConfigOption> },
+    ConfigOptions {
+        options: Vec<DiscussConfigOption>,
+        /// Provider option that selects the primary agent, if supported.
+        #[serde(default)]
+        agent_config_option_id: Option<String>,
+    },
 
     /// Internal session activity broadcast.
     #[serde(skip)]

@@ -25,7 +25,7 @@ use super::database::persist_session_anchor_inner;
 use super::identity::{Binding, flow_node_subject, persist_binding};
 use super::library::{AgentId, ResolvedAgent, ResolvedTeam};
 use super::mcp::composed_launch_config;
-use super::messages::DiscussResponse;
+use super::messages::{DiscussResponse, EnsureAttachedSessionOutcome};
 use super::plugins::{self, ConnectionStrategy, DiscussAgentPlugin, LaunchContext, PrimaryAgentSelection};
 use super::session::{
     PendingElicitationCancel, SESSION_WORKER_JWT_EXPIRATION, SessionWorkerFailure, WorkerSessionParams,
@@ -1108,11 +1108,30 @@ impl Actor {
         discuss_session_id: DiscussSessionId,
         session_cwd: PathBuf,
     ) -> Result<DiscussResponse, DiscussError> {
+        self.ensure_session_working_dir(discuss_session_id, session_cwd, false)
+            .await?;
+        Ok(DiscussResponse::Success)
+    }
+
+    /// Check the stored attachment and apply the requested directory without loading chat history.
+    pub(super) async fn ensure_session_working_dir(
+        &mut self,
+        discuss_session_id: DiscussSessionId,
+        session_cwd: PathBuf,
+        attached_only: bool,
+    ) -> Result<EnsureAttachedSessionOutcome, DiscussError> {
         let conn = self.persistence.acquire_connection().await?;
         let session_id = discuss_session_id.to_string();
-        let row = load_discuss_session(&conn, &session_id)
-            .await?
-            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
+        let Some(row) = load_discuss_session(&conn, &session_id).await? else {
+            return if attached_only {
+                Ok(EnsureAttachedSessionOutcome::NeedsLaunch)
+            } else {
+                Err(DiscussError::SessionNotFound { discuss_session_id })
+            };
+        };
+        if attached_only && present_acp_session_id(row.acp_session_id.as_deref()).is_none() {
+            return Ok(EnsureAttachedSessionOutcome::NeedsLaunch);
+        }
         let stored_cwd = row
             .session_cwd_json
             .as_deref()
@@ -1124,7 +1143,7 @@ impl Actor {
             .filter(|entry| !entry.join_handle.is_finished() && !entry.command_tx.is_closed());
         let cwd_changed = stored_cwd.as_ref() != Some(&session_cwd);
         if !cwd_changed && live_worker.is_some() {
-            return Ok(DiscussResponse::Success);
+            return Ok(EnsureAttachedSessionOutcome::Ensured);
         }
         if cwd_changed && live_worker.is_some_and(|entry| entry.active_turn) {
             return Err(DiscussError::SessionBusy { discuss_session_id });
@@ -1176,7 +1195,8 @@ impl Actor {
                 flow_mcp_endpoints: None,
             },
         )
-        .await
+        .await?;
+        Ok(EnsureAttachedSessionOutcome::Ensured)
     }
 
     /// Remove a local Discuss chat session anchor and clean live worker state.
@@ -1429,7 +1449,11 @@ impl Actor {
                 .unwrap_or_default(),
         };
 
-        Ok(DiscussResponse::ConfigOptions { options })
+        let agent_config_option_id = plugins::agent_config_option_id(plugins::for_agent(&row.agent_name));
+        Ok(DiscussResponse::ConfigOptions {
+            options,
+            agent_config_option_id,
+        })
     }
 
     /// Set a provider-exposed config option on an active session.

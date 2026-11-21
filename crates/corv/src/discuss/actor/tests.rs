@@ -4019,7 +4019,7 @@ async fn session_config_read_falls_back_to_database_agent_menu() {
         .handle_get_config_options(discuss_session_id)
         .await
         .expect("read database menu");
-    assert!(matches!(response, DiscussResponse::ConfigOptions { options: actual } if actual == options));
+    assert!(matches!(response, DiscussResponse::ConfigOptions { options: actual, .. } if actual == options));
 }
 
 #[tokio::test]
@@ -4149,7 +4149,7 @@ async fn persisted_config_options_round_trip_through_no_live_worker_fallback() {
         .await
         .expect("get config options succeeds");
     match response {
-        DiscussResponse::ConfigOptions { options } => {
+        DiscussResponse::ConfigOptions { options, .. } => {
             assert_eq!(
                 options.len(),
                 1,
@@ -4272,7 +4272,7 @@ async fn set_config_option_success_persists_post_response_options_for_no_worker_
         .await
         .expect("get config options succeeds");
     match response {
-        DiscussResponse::ConfigOptions { options } => {
+        DiscussResponse::ConfigOptions { options, .. } => {
             assert_eq!(
                 options.len(),
                 1,
@@ -4353,7 +4353,7 @@ async fn set_config_option_success_persists_explicit_empty_options() {
         .await
         .expect("get config options succeeds");
     match response {
-        DiscussResponse::ConfigOptions { options } => {
+        DiscussResponse::ConfigOptions { options, .. } => {
             assert!(
                 options.is_empty(),
                 "no-live-worker fallback returns the explicit empty post-response set",
@@ -4396,7 +4396,7 @@ async fn set_config_option_failure_does_not_mutate_persisted_options() {
         .await
         .expect("get config options succeeds");
     match response {
-        DiscussResponse::ConfigOptions { options } => {
+        DiscussResponse::ConfigOptions { options, .. } => {
             assert_eq!(options.len(), 1, "seeded options survive a failed set (no persistence)");
             assert_eq!(
                 options[0].value, "gpt-4",
@@ -4730,6 +4730,7 @@ async fn persistence_queue_drains_assistant_turn_on_shutdown() {
                 aggregated_thought: String::new(),
                 parts: vec![serde_json::json!({"kind": "text", "text": "assistant text"})],
                 stop_reason: "end_turn".to_string(),
+                usage: None,
             },
         },
     )
@@ -4764,6 +4765,7 @@ async fn restored_session_turns_continue_after_persisted_maximum_position() {
             aggregated_thought: String::new(),
             parts: vec![serde_json::json!({"kind": "text", "text": "first assistant"})],
             stop_reason: "end_turn".to_string(),
+            usage: None,
         },
     )
     .await
@@ -4786,6 +4788,7 @@ async fn restored_session_turns_continue_after_persisted_maximum_position() {
             aggregated_thought: String::new(),
             parts: vec![serde_json::json!({"kind": "text", "text": "next assistant"})],
             stop_reason: "end_turn".to_string(),
+            usage: None,
         },
     )
     .await
@@ -4826,6 +4829,7 @@ async fn mixed_elicitation_and_ordinary_turns_load_and_prune_chronologically() {
             aggregated_thought: String::new(),
             parts: vec![serde_json::json!({"kind": "text", "text": "first assistant"})],
             stop_reason: "end_turn".to_string(),
+            usage: None,
         },
     )
     .await
@@ -4862,6 +4866,7 @@ async fn mixed_elicitation_and_ordinary_turns_load_and_prune_chronologically() {
                     aggregated_thought: String::new(),
                     parts: vec![serde_json::json!({"kind": "text", "text": "next assistant"})],
                     stop_reason: "end_turn".to_string(),
+                    usage: None,
                 },
             )
             .await
@@ -6908,6 +6913,7 @@ fn stream_event_agent_message_serde_roundtrip() {
             session_id: "acp-1".to_string(),
             stop_reason: StopReason::EndTurn,
         },
+        turn_usage: None,
     };
 
     let json = serde_json::to_value(&event).expect("serialize");

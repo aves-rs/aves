@@ -75,6 +75,7 @@ impl DiscussAgentPlugin for ClaudePlugin {
         BillingCategorySemantics {
             guaranteed_categories: BILLING_INPUT | BILLING_OUTPUT | BILLING_TOTAL,
             input_includes_cache: Some(false),
+            output_excludes_thought: false,
         }
     }
 

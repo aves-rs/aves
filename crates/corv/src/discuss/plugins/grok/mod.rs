@@ -84,6 +84,7 @@ impl DiscussAgentPlugin for GrokPlugin {
                 | BILLING_CACHED_WRITE
                 | BILLING_TOTAL,
             input_includes_cache: Some(true),
+            output_excludes_thought: false,
         }
     }
 

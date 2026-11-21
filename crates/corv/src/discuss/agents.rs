@@ -15,14 +15,16 @@ use agent_client_protocol::{Dispatch, Error as AcpCrateError, Responder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use super::database::PersistenceJob;
 use super::elicitation::classify_elicitation_schema;
 use super::plugins::{DiscussAgentPlugin, PluginCaptureState};
 use super::types::{
-    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussElicitationAnswer, DiscussError,
-    DiscussPermissionOption, DiscussSessionId, DiscussStreamEvent, DiscussUtilityPayload, DiscussUtilityUpdate,
-    ElicitationRequestId, PendingElicitation, PermissionRequestId,
+    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussCompletionKind,
+    DiscussElicitationAnswer, DiscussError, DiscussPermissionOption, DiscussSessionId, DiscussStreamEvent,
+    DiscussTurnUsage, DiscussUtilityPayload, DiscussUtilityUpdate, ElicitationRequestId, PendingElicitation,
+    PermissionRequestId,
 };
-use super::usage::{DiscussUsageEvidence, UsageCaptureEvent};
+use super::usage::{UsageCaptureEvent, UsageTurnAccumulator};
 
 /// Handles an incoming permission request from the agent.
 ///
@@ -186,6 +188,7 @@ pub(super) struct FlushPayload {
     /// update objects so the client can apply its existing stable-id merge.
     pub(super) parts: Vec<serde_json::Value>,
     pub(super) stop_reason: String,
+    pub(super) usage: Option<DiscussTurnUsage>,
 }
 
 /// Per-session assistant-turn accumulator split by ACP semantic part type.
@@ -195,13 +198,9 @@ pub(super) struct AssistantTurnBuffer {
     accumulated_thought: String,
     parts: Vec<serde_json::Value>,
     metadata_updates: Vec<serde_json::Value>,
-    usage_evidence: Vec<DiscussUsageEvidence>,
 }
 
 impl AssistantTurnBuffer {
-    pub(super) fn take_usage_evidence(&mut self) -> Vec<DiscussUsageEvidence> {
-        std::mem::take(&mut self.usage_evidence)
-    }
     pub(super) fn append_text(&mut self, text: &str) {
         self.accumulated_text.push_str(text);
         self.parts
@@ -246,6 +245,7 @@ impl AssistantTurnBuffer {
             aggregated_thought,
             parts,
             stop_reason,
+            usage: None,
         }
     }
 
@@ -270,7 +270,7 @@ pub(super) enum AgentMessageForwardOutcome {
     /// A `StopReason` was forwarded and the assistant-turn buffer was flushed.
     /// The worker must enter its between-turns path.
     TurnBoundary {
-        flush: FlushPayload,
+        flush: Box<FlushPayload>,
         utility_payload: Option<DiscussUtilityPayload>,
     },
 }
@@ -281,6 +281,7 @@ pub(super) struct AgentMessageForwardContext<'a> {
     pub(super) session: &'a SessionId,
     pub(super) agent_plugin: &'a dyn DiscussAgentPlugin,
     pub(super) capture_state: &'a mut PluginCaptureState,
+    pub(super) usage: Option<(&'a mut UsageTurnAccumulator, &'a mpsc::Sender<PersistenceJob>)>,
 }
 
 /// Handles an incoming ACP message from the agent.
@@ -300,7 +301,9 @@ pub(super) async fn send_message_to_user(
         session,
         agent_plugin,
         capture_state,
+        mut usage,
     } = context;
+    let mut turn_usage = None;
     let stop_reason = match &message {
         SessionMessage::PromptResponse(Ok(response)) => Some(response.stop_reason),
         _ => None,
@@ -314,8 +317,11 @@ pub(super) async fn send_message_to_user(
                 if let Some(evidence) = agent_plugin.capture_usage_evidence(&UsageCaptureEvent::Notification {
                     method: &method,
                     params: &params,
-                }) {
-                    buffer.usage_evidence.push(evidence);
+                }) && let Some((accumulator, queue)) = usage.as_mut()
+                {
+                    let correlatable = evidence.turn_correlatable;
+                    accumulator.capture(evidence, queue).await;
+                    turn_usage = accumulator.evidence_snapshot(correlatable);
                 }
             }
             AcpAgentMessagePayload::Dispatch {
@@ -325,8 +331,22 @@ pub(super) async fn send_message_to_user(
         }
         SessionMessage::PromptResponse(result) => {
             let response = result?;
-            if let Some(evidence) = agent_plugin.capture_usage_evidence(&UsageCaptureEvent::PromptResponse(&response)) {
-                buffer.usage_evidence.push(evidence);
+            if let Some(evidence) = agent_plugin.capture_usage_evidence(&UsageCaptureEvent::PromptResponse(&response))
+                && let Some((accumulator, queue)) = usage.as_mut()
+            {
+                accumulator.capture(evidence, queue).await;
+            }
+            if let Some((accumulator, queue)) = usage.as_mut() {
+                if accumulator.has_active_turn() {
+                    let reason = stop_reason_to_string(response.stop_reason);
+                    let kind = if reason == "cancelled" {
+                        DiscussCompletionKind::Cancelled
+                    } else {
+                        DiscussCompletionKind::Completed
+                    };
+                    accumulator.finish(kind, Some(reason), queue).await;
+                }
+                turn_usage = accumulator.finalized_snapshot();
             }
             AcpAgentMessagePayload::StopReason {
                 session_id: session.to_string(),
@@ -354,6 +374,7 @@ pub(super) async fn send_message_to_user(
             discuss_session_id,
             acp_session_id: session.clone(),
             payload,
+            turn_usage,
         })
         .await
         .map_err(|error| stream_send_error("send_message_to_user.stream", error))?;
@@ -380,7 +401,7 @@ pub(super) async fn send_message_to_user(
         Some(reason) => {
             let flush_payload = buffer.flush(stop_reason_to_string(reason));
             Ok(AgentMessageForwardOutcome::TurnBoundary {
-                flush: flush_payload,
+                flush: Box::new(flush_payload),
                 utility_payload: utility_payload_for_persistence,
             })
         }
@@ -1121,6 +1142,7 @@ mod tests {
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
+                usage: None,
             },
             SessionMessage::PromptResponse(Ok(PromptResponse::new(StopReason::EndTurn))),
             &mut buffer,
@@ -1147,6 +1169,7 @@ mod tests {
                 discuss_session_id,
                 acp_session_id,
                 payload,
+                ..
             } => {
                 assert_eq!(discuss_session_id, discuss_id);
                 assert_eq!(acp_session_id, session);
@@ -1183,6 +1206,7 @@ mod tests {
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
+                usage: None,
             },
             SessionMessage::PromptResponse(Ok(PromptResponse::new(StopReason::EndTurn))),
             &mut buffer,
@@ -1233,6 +1257,7 @@ mod tests {
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
+                usage: None,
             },
             SessionMessage::Message(agent_client_protocol::Dispatch::Notification(replayed_dispatch)),
             &mut buffer,
@@ -1249,6 +1274,7 @@ mod tests {
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
+                usage: None,
             },
             SessionMessage::PromptResponse(Ok(PromptResponse::new(StopReason::EndTurn))),
             &mut buffer,
@@ -1290,6 +1316,7 @@ mod tests {
                 session: &session,
                 agent_plugin: super::super::plugins::for_agent("custom-agent"),
                 capture_state: &mut capture_state,
+                usage: None,
             },
             SessionMessage::Message(dispatch),
             &mut AssistantTurnBuffer::default(),

@@ -55,6 +55,7 @@ impl DiscussAgentPlugin for CodexPlugin {
                 | BILLING_CACHED_WRITE
                 | BILLING_TOTAL,
             input_includes_cache: Some(false),
+            output_excludes_thought: false,
         }
     }
 

@@ -34,6 +34,7 @@ struct ProviderData {
 struct ModelData {
     cost: Option<RawCost>,
     experimental: Option<Box<RawValue>>,
+    release_date: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +94,8 @@ struct ModelCost {
     base: Rates,
     tiers: Vec<ContextTier>,
     mode: Option<String>,
+    /// models.dev release date (ISO), used to resolve a family alias to its newest model.
+    release_date: Option<String>,
 }
 
 impl ModelCost {
@@ -149,7 +152,7 @@ fn parse_rates(
     })
 }
 
-fn parse_cost(cost: &RawCost, mode: Option<&str>) -> Option<ModelCost> {
+fn parse_cost(cost: &RawCost, mode: Option<&str>, release_date: Option<&str>) -> Option<ModelCost> {
     let base = parse_rates(
         &cost.input,
         &cost.output,
@@ -180,6 +183,7 @@ fn parse_cost(cost: &RawCost, mode: Option<&str>) -> Option<ModelCost> {
         base,
         tiers,
         mode: mode.map(str::to_owned),
+        release_date: release_date.map(str::to_owned),
     })
 }
 
@@ -191,7 +195,7 @@ fn parse_catalog(body: &str) -> Result<Catalog, serde_json::Error> {
     for (provider, data) in providers {
         for (model, data) in data.models {
             if let Some(cost) = &data.cost {
-                match parse_cost(cost, None) {
+                match parse_cost(cost, None, data.release_date.as_deref()) {
                     Some(cost) => {
                         catalog.insert((provider.clone(), model.clone()), cost);
                     }
@@ -209,7 +213,7 @@ fn parse_catalog(body: &str) -> Result<Catalog, serde_json::Error> {
                 if let Some(cost) = raw
                     .cost
                     .as_ref()
-                    .and_then(|cost| parse_cost(cost, Some(&mode)))
+                    .and_then(|cost| parse_cost(cost, Some(&mode), data.release_date.as_deref()))
                 {
                     modes.push(((provider.clone(), format!("{model}-{mode}")), cost));
                 }
@@ -251,11 +255,14 @@ impl PriceIndex {
 
 impl PriceSnapshot {
     /// Price one model from its exact provider/model entry, or a `<model>-<mode>` mode entry, at the turn's context tier.
+    /// A provider prefix is first mapped through `aliases`; a bare family alias such as `opus` resolves to the
+    /// provider's newest released model carrying that name.
     pub(super) fn price(
         &self,
         entry: &mut DiscussModelUsageEntry,
         semantics: BillingCategorySemantics,
         provider: Option<&str>,
+        aliases: &[(&str, &str)],
         context_tokens: Option<u64>,
     ) {
         let missing = missing_categories(entry, semantics);
@@ -272,21 +279,33 @@ impl PriceSnapshot {
         let Some((provider, model)) = pair.filter(|(provider, model)| !provider.is_empty() && !model.is_empty()) else {
             return;
         };
+        let provider = aliases
+            .iter()
+            .find(|(from, _)| *from == provider)
+            .map_or(provider, |(_, to)| *to);
         let Some(catalog) = self.0.as_ref() else {
             return;
         };
-        let Some(cost) = catalog
+        let (model, cost, alias) = match catalog
             .catalog
             .get(&(provider.to_owned(), model.to_owned()))
-        else {
-            return;
+        {
+            Some(cost) => (model, cost, None),
+            None => match resolve_family_alias(&catalog.catalog, provider, model) {
+                Some((resolved, cost)) => (resolved, cost, Some(model)),
+                None => return,
+            },
         };
         let (rates, tier) = cost.rates_for(context_tokens);
         let (amount, missing) = calculate_cost(entry, semantics, rates);
         entry.incomplete_categories |= i64::from(missing);
         if let Some(amount) = amount {
             entry.calculated_cost_usd = Some(amount.to_string());
-            entry.pricing_basis = Some(cost.basis(tier, context_tokens));
+            let mut basis = cost.basis(tier, context_tokens);
+            if let Some(alias) = alias {
+                basis.push_str(&format!("; alias {alias} resolved to newest {model}"));
+            }
+            entry.pricing_basis = Some(basis);
             entry.price_snapshot_json = Some(
                 serde_json::json!({
                     "provider": provider, "model": model, "fetched_at_ms": catalog.fetched_at_ms,
@@ -299,6 +318,20 @@ impl PriceSnapshot {
             );
         }
     }
+}
+
+/// Resolve a single-word family alias (`opus`) to the provider's newest standard-rate model whose ID contains it.
+fn resolve_family_alias<'a>(catalog: &'a Catalog, provider: &str, alias: &str) -> Option<(&'a str, &'a ModelCost)> {
+    if alias.is_empty() || alias.contains('-') {
+        return None;
+    }
+    catalog
+        .iter()
+        .filter(|((owner, id), cost)| {
+            owner == provider && cost.mode.is_none() && id.split('-').any(|part| part == alias)
+        })
+        .max_by(|((_, a_id), a), ((_, b_id), b)| (&a.release_date, a_id).cmp(&(&b.release_date, b_id)))
+        .map(|((_, id), cost)| (id.as_str(), cost))
 }
 
 fn missing_categories(entry: &DiscussModelUsageEntry, semantics: BillingCategorySemantics) -> u8 {
@@ -349,7 +382,11 @@ fn calculate_cost(
             .saturating_sub(entry.cached_write_tokens.unwrap_or_default());
     }
     let total = (|| {
-        let mut value = charge(input, &cost.input)?.checked_add(charge(entry.output_tokens?, &cost.output)?)?;
+        let mut output = entry.output_tokens?;
+        if semantics.output_excludes_thought {
+            output = output.checked_add(entry.thought_tokens.unwrap_or_default())?;
+        }
+        let mut value = charge(input, &cost.input)?.checked_add(charge(output, &cost.output)?)?;
         if let Some(price) = &cost.cache_read {
             value = value.checked_add(charge(entry.cached_read_tokens.unwrap_or_default(), price)?)?;
         }

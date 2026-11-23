@@ -45,10 +45,10 @@ pub(crate) fn resolve_shell_timeout(timeout_secs: u64) -> Duration {
 }
 
 /// Input to the infallible runner entry in shell.rs:
-/// `pub(crate) async fn run_shell(spec: ShellRunSpec, terminate: tokio::sync::oneshot::Receiver<()>) -> ShellTerminal`.
+/// `pub async fn run_shell(spec: ShellRunSpec, terminate: tokio::sync::oneshot::Receiver<()>) -> ShellTerminal`.
 /// Every path yields exactly one terminal cause.
 #[derive(Debug, Clone)]
-pub(crate) struct ShellRunSpec {
+pub struct ShellRunSpec {
     pub interpreter: String,
     pub script: String,
     pub cwd: PathBuf,

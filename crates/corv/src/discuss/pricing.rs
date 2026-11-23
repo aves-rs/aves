@@ -16,8 +16,8 @@ use super::plugins::{
     BILLING_CACHED_READ, BILLING_CACHED_WRITE, BILLING_INPUT, BILLING_OUTPUT, BILLING_THOUGHT, BILLING_TOTAL,
     BillingCategorySemantics,
 };
+use super::report_types::DiscussModelUsageEntry;
 use super::storage::{DiscussModelsCatalog, DiscussPersistence, load_models_catalog};
-use super::types::DiscussModelUsageEntry;
 
 const DAY: Duration = Duration::from_secs(86_400);
 const CATALOG_URL: &str = "https://models.dev/api.json";

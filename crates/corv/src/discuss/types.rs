@@ -1,24 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::path::PathBuf;
+use std::str::FromStr;
 
 use agent_client_protocol::v1::schema::{
-    CreateElicitationRequest, McpServer, PermissionOptionId, RequestPermissionRequest, SessionId, StopReason,
+    AuthState, AuthStatusResponse, CreateElicitationRequest, McpServer, PermissionOptionId, RequestPermissionRequest,
+    SessionId, SessionModeState, StopReason,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use specta::{DataType, Generics, Type, TypeCollection, datatype::reference::Reference};
-use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use aves::auth::{AvesAuthError, Jwt};
-use aves::bus::{BusControlError, BusMcpEndpoint, DispatchContextError};
-use aves::flow::AgentNodeConfig;
-use aves::flow::NodeExecutionId;
-use aves::runtime::GeneratedCallError;
-use aves::utils::errors::SharedInfraError;
 use aves::utils::uuid::SpectaUuid;
 
+use super::agent_nodes::{AgentNodeSessionLimits, AgentNodeTerminalResult};
+use super::error::DiscussError;
+use super::launch_types::LaunchLimitation;
 use super::library::{AgentId, SkillId};
 
 /// An ACP MCP descriptor containing secrets; never log its contents.
@@ -26,15 +26,15 @@ use super::library::{AgentId, SkillId};
 #[serde(transparent)]
 pub struct SensitiveMcpDescriptor(pub McpServer);
 
-impl std::fmt::Debug for SensitiveMcpDescriptor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for SensitiveMcpDescriptor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str("SensitiveMcpDescriptor([REDACTED])")
     }
 }
 
 impl Type for SensitiveMcpDescriptor {
     fn inline(type_map: &mut TypeCollection, generics: Generics<'_>) -> DataType {
-        serde_json::Value::inline(type_map, generics)
+        Value::inline(type_map, generics)
     }
 }
 
@@ -65,406 +65,21 @@ pub struct DiscussImageAttachment {
     pub data: String,
 }
 
-/// A broad operation understood by permission translators.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Operation {
-    Read,
-    Write,
-    Execute,
-}
-
-/// Permission effects in increasing order of restriction.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Effect {
-    Allow,
-    Ask,
-    Deny,
-}
-
-/// A whole-operation rule.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ::schemars::JsonSchema)]
-pub struct Rule {
-    pub operation: Operation,
-    pub effect: Effect,
-}
-
-/// One resolved source of operation rules.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ::schemars::JsonSchema)]
-pub struct RuleSet {
-    pub rules: Vec<Rule>,
-}
-
-/// Explicit command-line tool identity, without credentials or process arguments.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ::schemars::JsonSchema)]
-pub struct SessionCliTool {
-    /// Executable name or path selected by the user.
-    pub command: PathBuf,
-    /// Whether this session requires a separately provisioned login.
-    pub login: SessionCliLogin,
-}
-
-/// Authentication requirement; credential material is never part of the launch configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionCliLogin {
-    /// No per-session login is requested.
-    None,
-    /// A per-session login must be provisioned securely.
-    Required,
-}
-
-/// Session-specific inputs for a future provider launch.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, ::schemars::JsonSchema)]
-pub struct SessionLaunchConfig {
-    #[serde(default)]
-    pub rule_sources: Vec<RuleSet>,
-    #[serde(default)]
-    pub mcp_servers: Vec<McpServer>,
-    #[serde(default)]
-    pub plugin_references: Vec<String>,
-    /// Explicit CLI tool requests; empty unless supplied by the caller.
-    #[serde(default)]
-    pub cli_tools: Vec<SessionCliTool>,
-}
-
-impl SessionLaunchConfig {
-    /// Set the typed launch configuration on a Flow AgentNode definition.
-    pub fn set_on_agent_node(&self, node: &mut AgentNodeConfig) -> Result<(), serde_json::Error> {
-        node.launch_config = Some(serde_json::to_value(self)?);
-        Ok(())
-    }
-}
-
-impl Type for SessionLaunchConfig {
-    fn inline(type_map: &mut TypeCollection, generics: Generics<'_>) -> DataType {
-        serde_json::Value::inline(type_map, generics)
-    }
-}
-
-/// A limitation encountered when applying a session's launch configuration.
+/// A resource link sent with an interactive user turn.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct LaunchLimitation {
-    /// The requested setting affected by the limitation.
-    pub subject: LaunchLimitationSubject,
-    /// Why the setting could not be applied exactly.
-    pub reason: LaunchLimitationReason,
-}
-
-/// The setting affected by a launch limitation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum LaunchLimitationSubject {
-    /// A requested permission and the native outcome.
-    Permission {
-        /// The affected operation.
-        operation: Operation,
-        /// The requested permission effect.
-        requested: Effect,
-        /// The native or inherited outcome.
-        actual: LaunchPermissionOutcome,
-    },
-    /// Session-only configuration isolation is unavailable.
-    ConfigurationIsolation,
-    /// An affected MCP server, identified by its requested name.
-    McpServer {
-        /// The requested server name.
-        name: String,
-    },
-    /// An affected plugin reference, identified by its request index.
-    PluginReference {
-        /// Index into `SessionLaunchConfig::plugin_references`.
-        index: usize,
-    },
-}
-
-/// The native permission outcome, or unverified inherited settings.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum LaunchPermissionOutcome {
-    /// A native permission effect.
-    Effect(Effect),
-    /// A native mode identifier.
-    Mode(String),
-    /// Inherited settings whose effect has not been verified.
-    Inherited,
-}
-
-/// The reason a requested launch setting could not be applied exactly.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum LaunchLimitationReason {
-    /// The native harness lacks the requested control.
-    UnsupportedNativeControl,
-    /// Native mode selection couples multiple permissions.
-    ModeCoupling,
-    /// Inherited configuration remains unverified.
-    InheritedUnverifiedConfiguration,
-    /// The required option was not advertised.
-    UnavailableAdvertisedOption,
-    /// The requested transport is unsupported.
-    UnsupportedTransport,
-    /// The requested plugin reference is unsupported.
-    UnsupportedPluginReference,
+pub struct DiscussResourceLink {
+    /// Resource URI.
+    pub uri: String,
+    /// Display name.
+    pub name: String,
+    /// Optional resource MIME type.
+    pub mime_type: Option<String>,
 }
 
 pub(super) use super::elicitation::{
     DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload,
 };
-
-/// Persisted launch specification and session defaults for an installed ACP Provider.
-#[derive(Debug, Clone, Serialize, Deserialize, ::schemars::JsonSchema)]
-pub struct AcpProvider {
-    #[serde(flatten)]
-    server: McpServer,
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    default_session_config: serde_json::Value,
-    #[serde(default, alias = "sluice_mcp_enabled")]
-    application_mcp_enabled: bool,
-    /// Editable paths relative to the agents workspace; None uses provider defaults.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workspace_copy_sources: Option<Vec<String>>,
-    /// Provider-owned managed configuration document, if customized.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    managed_document: Option<String>,
-}
-
-impl AcpProvider {
-    pub(crate) fn managed_document(&self) -> Option<&str> {
-        self.managed_document.as_deref()
-    }
-
-    pub(crate) fn set_managed_document(&mut self, document: Option<String>) {
-        self.managed_document = document;
-    }
-    pub fn server(&self) -> &McpServer {
-        &self.server
-    }
-
-    pub fn application_mcp_enabled(&self) -> bool {
-        self.application_mcp_enabled
-    }
-
-    pub fn default_session_config(&self) -> &serde_json::Value {
-        &self.default_session_config
-    }
-
-    pub fn replace_default_session_config(&mut self, value: serde_json::Value) {
-        self.default_session_config = value;
-    }
-
-    pub(crate) fn workspace_copy_sources(&self) -> Option<&[String]> {
-        self.workspace_copy_sources.as_deref()
-    }
-
-    pub(crate) fn validate_workspace_copy_sources(&self) -> Result<(), DiscussError> {
-        for source in self.workspace_copy_sources.as_deref().unwrap_or_default() {
-            let path = Path::new(source);
-            let windows_drive = source.as_bytes().get(1) == Some(&b':')
-                && source
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphabetic);
-            let invalid = if source.is_empty() || source.contains('\\') || source.contains('\0') || windows_drive {
-                Some("must be a nonempty portable relative path")
-            } else if path.is_absolute() {
-                Some("must be relative to the agents workspace")
-            } else if path.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            }) {
-                Some("must not contain parent or root components")
-            } else if !path
-                .components()
-                .any(|component| matches!(component, Component::Normal(_)))
-            {
-                Some("must not select the whole agents workspace")
-            } else if path
-                .components()
-                .filter(|component| matches!(component, Component::Normal(_)))
-                .count()
-                == 1
-                && path
-                    .components()
-                    .any(|component| component.as_os_str() == ".agents")
-            {
-                Some(".agents is always copied and cannot be edited")
-            } else {
-                None
-            };
-            if let Some(violation) = invalid {
-                return Err(DiscussError::InvalidWorkspaceCopySource {
-                    path: source.clone(),
-                    violation: violation.to_string(),
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Type for AcpProvider {
-    fn inline(type_map: &mut TypeCollection, generics: Generics<'_>) -> DataType {
-        serde_json::Value::inline(type_map, generics)
-    }
-}
-
-impl From<AcpProvider> for McpServer {
-    fn from(val: AcpProvider) -> Self {
-        val.server
-    }
-}
-
-impl From<McpServer> for AcpProvider {
-    fn from(server: McpServer) -> Self {
-        Self {
-            server,
-            default_session_config: serde_json::Value::Null,
-            application_mcp_enabled: false,
-            workspace_copy_sources: None,
-            managed_document: None,
-        }
-    }
-}
-
-/// Bounds for a non-interactive AgentNode session, resolved by Discuss.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentNodeSessionLimits {
-    pub max_turns: u64,
-    pub max_tool_calls: u64,
-    pub max_duration_secs: u64,
-}
-
-/// ACP work for a Flow AgentNode after its execution limits have been validated.
-pub(super) struct TaskSessionStart {
-    pub(super) node_execution_id: NodeExecutionId,
-    pub(super) launch_config: Option<SessionLaunchConfig>,
-    pub(super) provider_name: String,
-    pub(super) agent_name: String,
-    pub(super) session_name: Option<String>,
-    pub(super) config_overrides: DiscussConfigValues,
-    pub(super) application_mcp_enabled: bool,
-    pub(super) prompt: String,
-    pub(super) session_cwd: PathBuf,
-    pub(super) limits: AgentNodeSessionLimits,
-    pub(super) node_token: Jwt,
-    pub(super) flow_mcp_endpoints: Option<Vec<BusMcpEndpoint>>,
-}
-
-/// Real ACP terminal result for a non-interactive task session.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase", tag = "status")]
-pub(super) enum AgentNodeTerminalResult {
-    Succeeded { output: serde_json::Value },
-    Failed { error: DiscussError },
-}
-
-/// Immediate tick result while a task session runs or completes.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase", tag = "status")]
-pub enum AgentNodeTickResult {
-    Running,
-    Succeeded { output: serde_json::Value },
-    Failed { error: DiscussError },
-}
-
-impl From<AgentNodeTerminalResult> for AgentNodeTickResult {
-    fn from(terminal: AgentNodeTerminalResult) -> Self {
-        match terminal {
-            AgentNodeTerminalResult::Succeeded { output } => Self::Succeeded { output },
-            AgentNodeTerminalResult::Failed { error } => Self::Failed { error },
-        }
-    }
-}
-
-pub(super) fn resolve_agent_node_limits(
-    max_turns: Option<i64>,
-    max_tool_calls: Option<i64>,
-    max_duration_secs: Option<i64>,
-) -> Result<AgentNodeSessionLimits, DiscussError> {
-    const DEFAULT_MAX_TURNS: u64 = 1;
-    const DEFAULT_MAX_TOOL_CALLS: u64 = 100;
-    const DEFAULT_MAX_DURATION_SECS: u64 = 1_800;
-    const MAX_TURNS: u64 = 100;
-    const MAX_TOOL_CALLS: u64 = 1_000;
-    const MAX_DURATION_SECS: u64 = 1_800;
-
-    fn resolve(name: &'static str, value: Option<i64>, default: u64, maximum: u64) -> Result<u64, DiscussError> {
-        let Some(value) = value else {
-            return Ok(default);
-        };
-        let resolved = u64::try_from(value).map_err(|_| DiscussError::AgentNodeLimitInvalid {
-            limit: name.to_owned(),
-            value,
-            maximum,
-        })?;
-        if resolved == 0 || resolved > maximum {
-            return Err(DiscussError::AgentNodeLimitInvalid {
-                limit: name.to_owned(),
-                value,
-                maximum,
-            });
-        }
-        Ok(resolved)
-    }
-
-    Ok(AgentNodeSessionLimits {
-        max_turns: resolve("maxTurns", max_turns, DEFAULT_MAX_TURNS, MAX_TURNS)?,
-        max_tool_calls: resolve("maxToolCalls", max_tool_calls, DEFAULT_MAX_TOOL_CALLS, MAX_TOOL_CALLS)?,
-        max_duration_secs: resolve(
-            "maxDuration",
-            max_duration_secs,
-            DEFAULT_MAX_DURATION_SECS,
-            MAX_DURATION_SECS,
-        )?,
-    })
-}
-
-/// Actor-resolved copy selections for all Providers referenced by a Flow graph.
-#[derive(Clone)]
-pub(super) struct WorkspaceCopySources {
-    pub(super) agents_workspace: PathBuf,
-    pub(super) sources_by_provider: BTreeMap<String, Vec<String>>,
-}
-
-pub(super) struct WorkspaceCopySourceRequest {
-    pub(super) provider_names: BTreeSet<String>,
-    pub(super) reply_to: oneshot::Sender<Result<WorkspaceCopySources, DiscussError>>,
-}
-
-pub(super) struct ActorInboundPorts {
-    pub(super) workspace_copy_source_rx: mpsc::Receiver<WorkspaceCopySourceRequest>,
-}
-
-/// Discuss-owned, actor-serialized source selection for fresh Flow workspaces.
-pub(super) struct WorkspaceCopySourcePort {
-    sender: mpsc::Sender<WorkspaceCopySourceRequest>,
-}
-
-impl WorkspaceCopySourcePort {
-    pub(super) fn channel(capacity: usize) -> (Arc<Self>, mpsc::Receiver<WorkspaceCopySourceRequest>) {
-        let (sender, receiver) = mpsc::channel(capacity);
-        (Arc::new(Self { sender }), receiver)
-    }
-
-    /// Resolve effective relative paths without reading or mutating the workspace.
-    pub(super) async fn resolve(&self, provider_names: BTreeSet<String>) -> Result<WorkspaceCopySources, DiscussError> {
-        let (reply_to, reply_rx) = oneshot::channel();
-        self.sender
-            .send(WorkspaceCopySourceRequest {
-                provider_names,
-                reply_to,
-            })
-            .await
-            .map_err(|_| DiscussError::ShuttingDown)?;
-        reply_rx.await.map_err(|_| DiscussError::ShuttingDown)?
-    }
-}
 
 // ── Desktop-facing DTOs ────────────────────────────────────────────────────
 //
@@ -538,13 +153,13 @@ impl Default for DiscussSessionId {
     }
 }
 
-impl std::fmt::Display for DiscussSessionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for DiscussSessionId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }
 
-impl std::str::FromStr for DiscussSessionId {
+impl FromStr for DiscussSessionId {
     type Err = uuid::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -589,8 +204,8 @@ impl Default for PermissionRequestId {
     }
 }
 
-impl std::fmt::Display for PermissionRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for PermissionRequestId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }
@@ -627,8 +242,8 @@ impl Default for ElicitationRequestId {
     }
 }
 
-impl std::fmt::Display for ElicitationRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ElicitationRequestId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }
@@ -710,7 +325,7 @@ pub struct DiscussTodoSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscussSubagentSurfaceState {
-    /// The child session is being created.
+    /// The child session is being created or its state is unconfirmed.
     Loading,
     /// The child session is live and running.
     Live,
@@ -724,7 +339,7 @@ pub enum DiscussSubagentSurfaceState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscussSubagentRecord {
-    /// Stable capture identity sourced from the provider tool call id.
+    /// Stable provider work or tool-call identity.
     pub capture_id: String,
     /// Child harness session identity, unavailable until the provider commits it.
     pub child_session_id: Option<String>,
@@ -738,6 +353,56 @@ pub struct DiscussSubagentRecord {
     pub surface_state: DiscussSubagentSurfaceState,
     /// Unix timestamp in milliseconds of the latest provider update.
     pub last_updated_at: i64,
+}
+
+/// Provider-reported background work associated with a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussBackgroundWork {
+    /// Provider identity for this work.
+    pub id: String,
+    /// Kind of work.
+    pub kind: DiscussBackgroundWorkKind,
+    /// Observed lifecycle state.
+    pub status: DiscussBackgroundWorkStatus,
+    /// Optional provider description.
+    pub description: Option<String>,
+    /// Start time in milliseconds since the Unix epoch.
+    pub started_at: i64,
+    /// Completion time in milliseconds since the Unix epoch, if known.
+    pub completed_at: Option<i64>,
+    /// Provider child session, when applicable.
+    pub child_session_id: Option<String>,
+}
+
+/// Kind of provider background work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussBackgroundWorkKind {
+    /// Child agent session.
+    Subagent,
+    /// Shell command.
+    Shell,
+    /// Image generation.
+    Image,
+    /// Code mode execution.
+    CodeMode,
+}
+
+/// Observed state of provider background work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussBackgroundWorkStatus {
+    /// Work is active.
+    Running,
+    /// Work completed successfully.
+    Completed,
+    /// Work failed.
+    Failed,
+    /// Work was cancelled.
+    Cancelled,
+    /// Its state cannot currently be established.
+    Unknown,
 }
 
 /// Provider-neutral utility update associated with a parent session.
@@ -758,6 +423,11 @@ pub enum DiscussUtilityPayload {
     TodoSnapshot { snapshot: DiscussTodoSnapshot },
     /// Current record for one child subagent.
     Subagent { subagent: DiscussSubagentRecord },
+    /// Replacement snapshot of observed background work.
+    BackgroundWork {
+        work: Vec<DiscussBackgroundWork>,
+        available: bool,
+    },
 }
 
 pub type ConfigSettings = BTreeMap<String, String>;
@@ -906,7 +576,7 @@ pub(crate) struct WorkerEntry {
     pub(crate) command_tx: mpsc::Sender<WorkerCommand>,
     /// Join handle for the spawned worker task, used by `StopServer` to
     /// await termination.
-    pub(crate) join_handle: tokio::task::JoinHandle<()>,
+    pub(crate) join_handle: JoinHandle<()>,
     /// Latest worker-reported turn activity.
     pub(crate) active_turn: bool,
     /// Provider ACP session id once the worker has completed setup.
@@ -945,7 +615,8 @@ pub(crate) enum WorkerCommand {
     AttachInspector {
         viewer_session_id: DiscussSessionId,
         child_session_id: SessionId,
-        reply: oneshot::Sender<Result<(), DiscussError>>,
+        /// Replies with the child session's config options, empty when the viewer was already attached.
+        reply: oneshot::Sender<Result<Vec<DiscussConfigOption>, DiscussError>>,
     },
     /// Dispose a viewer attached to this worker without cancelling its ACP session.
     DisposeInspector {
@@ -956,7 +627,30 @@ pub(crate) enum WorkerCommand {
     SendUserTurn {
         text: String,
         images: Vec<DiscussImageAttachment>,
+        resource_links: Vec<DiscussResourceLink>,
         reply: oneshot::Sender<Result<(), DiscussError>>,
+    },
+    /// Read the worker's current session modes.
+    GetSessionModes {
+        reply: oneshot::Sender<Option<DiscussSessionModes>>,
+    },
+    /// Select an advertised session mode.
+    SetSessionMode {
+        mode_id: String,
+        reply: oneshot::Sender<Result<(), DiscussError>>,
+    },
+    /// Archive or unarchive the provider session when supported.
+    SetArchived {
+        archived: bool,
+        reply: oneshot::Sender<Result<(), DiscussError>>,
+    },
+    /// Delete the provider session when supported.
+    DeleteSession {
+        reply: oneshot::Sender<Result<(), DiscussError>>,
+    },
+    /// Query authentication state on the worker's provider connection.
+    GetAuthStatus {
+        reply: oneshot::Sender<Result<(DiscussAuthState, Vec<DiscussAuthAccount>), DiscussError>>,
     },
     /// Send the single non-interactive AgentNode turn and report its real ACP boundary.
     RunAgentNodeTurn {
@@ -1049,330 +743,6 @@ pub struct DiscussSessionInfo {
     pub last_interaction_at: Option<i64>,
 }
 
-/// Terminal outcome of an accounted turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscussCompletionKind {
-    /// The turn completed normally.
-    Completed,
-    /// The turn was cancelled.
-    Cancelled,
-    /// The turn failed.
-    Failed,
-}
-
-/// Scope of a cost amount reported by a harness.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscussHarnessCostKind {
-    /// Cost for this turn alone.
-    PerTurn,
-    /// Cumulative session cost.
-    SessionCumulative,
-}
-
-/// Source of the captured usage projection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscussUsageEvidenceSource {
-    /// Standard prompt response.
-    #[serde(rename = "prompt_response")]
-    Response,
-    /// Usage metadata on a prompt response.
-    #[serde(rename = "prompt_response_meta")]
-    ResponseMeta,
-    /// Provider prompt-complete notification.
-    #[serde(rename = "prompt_complete")]
-    Complete,
-}
-
-/// One terminal turn's timing, occupancy, and harness cost evidence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussTurnRecord {
-    pub discuss_session_id: String,
-    pub turn_ordinal: i64,
-    pub provider_name: String,
-    pub model_id: Option<String>,
-    pub turn_started_at_ms: i64,
-    pub turn_completed_at_ms: Option<i64>,
-    pub end_to_end_ms: Option<i64>,
-    pub completion_kind: DiscussCompletionKind,
-    pub stop_reason: Option<String>,
-    pub context_used_tokens: Option<u64>,
-    pub context_window_tokens: Option<u64>,
-    pub harness_cost_amount: Option<String>,
-    pub harness_cost_currency: Option<String>,
-    pub harness_cost_kind: Option<DiscussHarnessCostKind>,
-    pub usage_is_incomplete: bool,
-    pub cost_is_partial: bool,
-    pub evidence_source: DiscussUsageEvidenceSource,
-    /// Bounded usage-only projection, never arbitrary provider metadata.
-    pub evidence_json: Option<String>,
-    pub created_at_ms: i64,
-}
-
-/// Token evidence and exact calculated cost attributed to one model, if known.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussModelUsageEntry {
-    pub discuss_session_id: String,
-    pub turn_ordinal: i64,
-    pub provider_name: String,
-    pub turn_started_at_ms: i64,
-    pub model_id: Option<String>,
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub thought_tokens: Option<u64>,
-    pub cached_read_tokens: Option<u64>,
-    pub cached_write_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-    pub calculated_cost_usd: Option<String>,
-    pub incomplete_categories: i64,
-    pub usage_is_incomplete: bool,
-    pub cost_is_partial: bool,
-    pub pricing_basis: Option<String>,
-    pub price_snapshot_json: Option<String>,
-}
-
-/// Dimensions available to usage and spend reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscussUsageGroupBy {
-    Session,
-    Provider,
-    Model,
-    UtcHour,
-    UtcDay,
-    UtcWeek,
-    UtcMonth,
-}
-
-/// Dimensions available to allowance reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscussAllowanceGroupBy {
-    Provider,
-    Account,
-    UtcHour,
-    UtcDay,
-    UtcWeek,
-    UtcMonth,
-}
-
-/// Report group identity; absent fields are not grouping dimensions.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussReportKey {
-    pub session_id: Option<String>,
-    pub provider: Option<String>,
-    pub model_id: Option<String>,
-    pub account: Option<String>,
-    pub bucket_start_ms: Option<i64>,
-}
-
-/// Persisted evidence coverage for a report group.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussReportCoverage {
-    pub turns_total: u64,
-    pub turns_with_token_evidence: u64,
-    pub turns_with_calculated_cost: u64,
-    pub turns_with_throughput: u64,
-    pub turns_usage_incomplete: u64,
-    pub turns_harness_cost_partial: u64,
-    pub turns_excluded_multi_model: u64,
-}
-
-/// Nullable token sums and weighted end-to-end throughput.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussTokenSums {
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub thought_tokens: Option<u64>,
-    pub cached_read_tokens: Option<u64>,
-    pub cached_write_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-    pub throughput_output_tokens: u64,
-    pub throughput_end_to_end_ms: u64,
-    pub end_to_end_turn_tokens_per_second: Option<String>,
-}
-
-/// A cumulative harness cost observation, never summed with per-turn costs.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussHarnessCost {
-    pub amount: String,
-    pub currency: String,
-    pub is_partial: bool,
-}
-
-/// A usage or spend report group.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussUsageReportRow {
-    pub key: DiscussReportKey,
-    pub coverage: DiscussReportCoverage,
-    pub tokens: DiscussTokenSums,
-    pub calculated_cost_usd: Option<String>,
-    pub harness_per_turn_cost: std::collections::BTreeMap<String, String>,
-    pub harness_session_cost_latest: Option<DiscussHarnessCost>,
-    pub harness_session_cost_reason: Option<String>,
-}
-
-/// Bounded deterministic report output.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussUsageReport {
-    pub rows: Vec<DiscussUsageReportRow>,
-    pub truncated: bool,
-}
-
-/// An upstream allowance window, retaining its original units.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceWindow {
-    pub used_percent: f64,
-    pub raw_used_percent: Option<f64>,
-    pub resets_at: Option<String>,
-    pub window_minutes: Option<i64>,
-    pub window_kind: Option<String>,
-    pub used_count: Option<f64>,
-    pub total_count: Option<f64>,
-}
-
-/// A named or unnamed additional allowance window.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceExtraWindow {
-    pub title: Option<String>,
-    pub id: Option<String>,
-    pub window: Option<DiscussAllowanceWindow>,
-}
-
-/// Account-wide and extra allowance windows.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceWindows {
-    pub primary: Option<DiscussAllowanceWindow>,
-    pub secondary: Option<DiscussAllowanceWindow>,
-    pub tertiary: Option<DiscussAllowanceWindow>,
-    pub extra_rate_windows: Option<Vec<DiscussAllowanceExtraWindow>>,
-}
-
-/// A pool amount in the upstream minor units and exponent.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceAmount {
-    pub minor: i64,
-    pub exponent: u8,
-    pub unit: String,
-}
-
-/// An upstream balance or credit pool.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowancePool {
-    pub id: String,
-    pub label: String,
-    pub funding: String,
-    pub basis: String,
-    pub remaining: Option<DiscussAllowanceAmount>,
-    pub total: Option<DiscussAllowanceAmount>,
-    pub spendable: Option<bool>,
-    pub resets_at: Option<String>,
-    pub expires_at: Option<String>,
-    pub unlimited: Option<bool>,
-}
-
-/// One kind of saved reset credit.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceResetKind {
-    pub kind: String,
-    pub available_count: u32,
-    pub soonest_expires_at: Option<String>,
-}
-
-/// Saved reset inventory and upstream credit expiry timestamps.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceSavedResets {
-    pub available_count: u32,
-    pub soonest_expires_at: Option<String>,
-    pub credit_expiries: Vec<String>,
-    pub kinds: Vec<DiscussAllowanceResetKind>,
-}
-
-/// Provider-supplied account display metadata.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceAccountInfo {
-    pub email: Option<String>,
-    pub org_name: Option<String>,
-    pub plan_type: Option<String>,
-    pub subscription_renews_at: Option<String>,
-    pub subscription_ends_at: Option<String>,
-}
-
-/// Reason and start time of a stale allowance reading.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceStale {
-    pub since: String,
-    pub class: Option<String>,
-}
-
-/// Normalized provider observation shared by historical and current reads.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceProjection {
-    pub provider: String,
-    pub display_provider: String,
-    pub api_provider: Option<String>,
-    pub account: Option<String>,
-    pub account_info: Option<DiscussAllowanceAccountInfo>,
-    pub fetched_at: Option<String>,
-    pub stale: Option<DiscussAllowanceStale>,
-    pub error: Option<String>,
-    pub error_class: Option<String>,
-    pub windows: Option<DiscussAllowanceWindows>,
-    pub pools: Option<Vec<DiscussAllowancePool>>,
-    pub saved_resets: Option<DiscussAllowanceSavedResets>,
-}
-
-/// A historical allowance sample and its normalized provider projection.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceSample {
-    pub provider: String,
-    pub display_provider: String,
-    pub account: Option<String>,
-    pub observed_at_ms: i64,
-    pub fetched_at_ms: Option<i64>,
-    pub stale_since_ms: Option<i64>,
-    pub error_class: Option<String>,
-    pub projection: DiscussAllowanceProjection,
-}
-
-/// A historical allowance group with its sampled observations.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceReportRow {
-    pub key: DiscussReportKey,
-    pub observation_count: u64,
-    pub observations: Vec<DiscussAllowanceSample>,
-}
-
-/// Bounded historical allowance output.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscussAllowanceReport {
-    pub rows: Vec<DiscussAllowanceReportRow>,
-    pub truncated: bool,
-}
-
 /// One bounded transcript turn for a chat, keyed by `(discuss_session_id, position)`.
 ///
 /// The `role` is constrained by the chat turns CHECK
@@ -1394,6 +764,40 @@ pub struct DiscussChatTurnRecord {
     pub content_json: String,
     /// Unix-epoch ms when the turn was persisted.
     pub created_at: i64,
+}
+
+/// Modes advertised for a session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussSessionModes {
+    pub current_mode_id: String,
+    pub available: Vec<DiscussSessionMode>,
+}
+
+/// A provider-advertised session mode.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussSessionMode {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+impl From<SessionModeState> for DiscussSessionModes {
+    fn from(state: SessionModeState) -> Self {
+        Self {
+            current_mode_id: state.current_mode_id.to_string(),
+            available: state
+                .available_modes
+                .into_iter()
+                .map(|mode| DiscussSessionMode {
+                    id: mode.id.to_string(),
+                    name: mode.name,
+                    description: mode.description,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// One selectable value in a provider-exposed ACP session config menu.
@@ -1425,6 +829,52 @@ pub struct DiscussConfigOption {
     pub value: String,
     /// Available selectable values, flattened from any provider groups.
     pub options: Vec<DiscussConfigOptionValue>,
+}
+
+/// Provider-reported authentication state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscussAuthState {
+    Authenticated,
+    Unauthenticated,
+    NotRequired,
+    Unknown,
+}
+
+impl From<AuthState> for DiscussAuthState {
+    fn from(state: AuthState) -> Self {
+        match state {
+            AuthState::Authenticated => Self::Authenticated,
+            AuthState::Unauthenticated => Self::Unauthenticated,
+            AuthState::NotRequired => Self::NotRequired,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Display-only information about a provider account.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussAuthAccount {
+    pub label: String,
+    pub description: Option<String>,
+    pub active: bool,
+}
+
+/// Project an ACP authentication response onto the public display DTOs.
+pub(super) fn auth_status_from_response(response: AuthStatusResponse) -> (DiscussAuthState, Vec<DiscussAuthAccount>) {
+    (
+        response.state.into(),
+        response
+            .accounts
+            .into_iter()
+            .map(|account| DiscussAuthAccount {
+                label: account.label,
+                description: account.description,
+                active: account.active.unwrap_or(false),
+            })
+            .collect(),
+    )
 }
 
 /// Database-backed configuration state for one installed provider.
@@ -1537,199 +987,6 @@ pub struct CleanupWarning {
     pub message: String,
 }
 
-/// Theme-backed colors available for a Phanes Agent mark.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum AgentThemeColor {
-    /// Light shade from the primary gradient.
-    PrimaryLight,
-    /// Primary application color.
-    Primary,
-    /// Dark shade from the primary gradient.
-    PrimaryDark,
-    /// Violet identity color.
-    Violet,
-    /// Plum identity color.
-    Grape,
-    /// Orange identity color.
-    Orange,
-    /// Warning semantic color.
-    Warning,
-    /// Error semantic color.
-    Error,
-    /// Primary text color.
-    Text,
-    /// Dimmed text color.
-    Dimmed,
-}
-
-/// Public metadata for a built-in skill.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct BuiltinSkillEntry {
-    pub skill_id: String,
-    pub name: String,
-    pub description: String,
-    pub version: String,
-    /// Canonical `SKILL.md` contents from the application-supplied definition.
-    pub body: String,
-}
-
-/// Source of an installed asset claim.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum InstalledClaimBasis {
-    /// A standalone custom installation.
-    Standalone,
-    /// A team installation.
-    Team,
-}
-
-/// Recorded asset installation, not a filesystem existence check.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct InstalledAssetClaim {
-    pub provider_name: String,
-    pub asset_id: String,
-    pub basis: InstalledClaimBasis,
-    pub team_leader_id: Option<String>,
-    pub installed_version: Option<String>,
-    pub scope_key: Option<String>,
-    pub provider_installed: bool,
-    pub definition_present: bool,
-}
-
-/// An installed team whose missing definition prevents skill enumeration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct IncompleteTeamClaim {
-    pub provider_name: String,
-    pub team_leader_id: String,
-}
-
-/// Metadata and provenance for a cached custom asset.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CustomAssetMetadata {
-    pub id: String,
-    pub name: String,
-    pub job_title: Option<String>,
-    pub description: String,
-    pub version: String,
-    pub source_kind: String,
-    pub source_url: Option<String>,
-    pub last_pull_at_ms: Option<i64>,
-    pub last_pull_ok: Option<bool>,
-    pub pull_error: Option<String>,
-}
-
-/// Kind of installed asset addressed by workspace instructions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum InstalledAssetKind {
-    /// An agent file.
-    Agent,
-    /// A skill's SKILL.md file.
-    Skill,
-}
-
-/// A file in a custom skill bundle.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CustomSkillBundleFile {
-    pub relative_path: String,
-    pub contents: String,
-}
-
-/// A cached custom agent and its authored body.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CustomAgentDetail {
-    pub metadata: CustomAssetMetadata,
-    pub body: String,
-}
-
-/// A cached custom skill and its complete bundle.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CustomSkillDetail {
-    pub metadata: CustomAssetMetadata,
-    pub files: Vec<CustomSkillBundleFile>,
-}
-
-/// One canonical Phanes Team member in display order.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TeamCatalogMember {
-    /// Stable Phanes Agent identifier used for member overrides.
-    pub agent_id: String,
-    /// Human-readable Agent name.
-    pub name: String,
-    /// Human-readable Agent job title.
-    pub job_title: String,
-    /// Agent body (system prompt) from its built-in or custom definition.
-    pub body: String,
-}
-
-/// Origin of the currently available Team definition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamDefinitionKind {
-    /// An application-supplied Team definition.
-    Builtin,
-    /// A user-defined Team definition.
-    Custom,
-    /// An installation whose definition is no longer available.
-    Unavailable,
-}
-
-/// One Phanes Team and its persisted installation state.
-///
-/// Teams are identified by their stable leader id. The member and skill names
-/// are optional because a persisted installation may outlive its registry
-/// definition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TeamCatalogEntry {
-    /// Stable Phanes Team leader identifier.
-    pub leader_id: String,
-    /// Current or persisted Phanes Team version.
-    pub version: String,
-    /// Canonical Team name when its definition is available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Canonical leader role when its definition is available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub job_title: Option<String>,
-    /// Canonical Team description when its definition is available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Whether this Team has a persisted installation.
-    pub installed: bool,
-    /// Installed provider identifier, when installed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_name: Option<String>,
-    /// Team-member-specific provider config selections, when installed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub member_overrides: Option<DiscussMemberOverrides>,
-    /// User-selected theme color for the Team mark.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub theme_color: Option<AgentThemeColor>,
-    /// Whether the current Phanes registry contains this Team definition.
-    pub definition_available: bool,
-    /// Origin of the Team definition, or unavailable for an orphaned installation.
-    pub definition_kind: TeamDefinitionKind,
-    /// Canonical Team members, including stable IDs, when the definition is available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub members: Option<Vec<TeamCatalogMember>>,
-    /// Canonical skill display names when the Team definition is available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skill_names: Option<Vec<String>>,
-    /// Ordered stable skill identifiers when the Team definition is available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skill_ids: Option<Vec<String>>,
-}
-
 // ── ACP protocol payload types ─────────────────────────────────────────────
 //
 // These types describe the actual external Agent Client Protocol and retain
@@ -1757,8 +1014,8 @@ pub enum AcpAgentMessagePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum AcpDispatchPayload {
-    Request { method: String, params: serde_json::Value },
-    Notification { method: String, params: serde_json::Value },
+    Request { method: String, params: Value },
+    Notification { method: String, params: Value },
     Response { result: AcpDispatchResponsePayload },
 }
 
@@ -1766,665 +1023,6 @@ pub enum AcpDispatchPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum AcpDispatchResponsePayload {
-    Ok { value: serde_json::Value },
+    Ok { value: Value },
     Error { message: String },
-}
-
-// ── Errors ──────────────────────────────────────────────────────────────────
-
-/// Errors that can occur in the Discuss domain.
-///
-/// All variants store serializable data so Discuss errors can cross RPC and IPC
-/// boundaries without carrying raw external error types.
-#[derive(Error, Debug, Clone, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
-pub enum DiscussError {
-    /// The verified identity has no binding.
-    #[error("Session identity is unknown")]
-    SessionIdentityUnknown,
-    /// The session has no configured agent identity.
-    #[error("Session identity is unassigned")]
-    SessionIdentityUnassigned,
-    /// Multiple sessions were bound to the same verified identity.
-    #[error("Session identity is ambiguous")]
-    SessionIdentityAmbiguous,
-    /// A trusted issued token did not contain a valid issuer claim.
-    #[error("Issued worker token has an invalid issuer claim")]
-    SessionIdentityInvalidIssuer,
-    /// OpenCode cannot provision a CLI login for a single session securely.
-    #[error("OpenCode does not support secure per-session CLI tool login provisioning")]
-    SessionCliLoginUnsupported,
-    /// OpenCode cannot enforce the requested CLI tool selection for a session.
-    #[error("OpenCode does not support per-session CLI tool provisioning")]
-    SessionCliToolUnsupported,
-    /// Channel send error (actor communication).
-    #[error("Channel send error")]
-    ChannelSend,
-
-    /// Channel receive error (actor communication).
-    #[error("Channel receive error")]
-    ChannelRecv,
-
-    /// Oneshot reply channel closed.
-    #[error("Oneshot reply channel closed")]
-    OneshotReply,
-
-    /// ACP session cancelled by the user mid-turn.
-    #[error("Discuss session {discuss_session_id} cancelled")]
-    SessionCancelled {
-        /// The session id that was cancelled.
-        discuss_session_id: DiscussSessionId,
-    },
-
-    /// Protocol error.
-    #[error("Protocol error: {message}")]
-    ProtocolError {
-        /// The error message.
-        message: String,
-    },
-
-    /// The Provider requires an authenticated local session before it can start.
-    #[error("Provider authentication is required")]
-    AuthenticationRequired,
-
-    /// The Auth sudo service required to issue a delegated worker token is unavailable.
-    #[error("Auth worker-token service is unavailable")]
-    WorkerTokenServiceUnavailable,
-
-    /// Flow omitted the required scoped token for an AgentNode runtime.
-    #[error("AgentNode start requires a Flow-scoped token")]
-    AgentNodeTokenRequired,
-
-    /// Auth failed while issuing a delegated worker token.
-    #[error("Auth worker-token issuance failed: {message}")]
-    WorkerTokenIssuance {
-        /// Safe human-readable Auth failure detail.
-        message: String,
-    },
-
-    /// Config persistence error.
-    #[error("Config error: {message}")]
-    Config {
-        /// The error message.
-        message: String,
-    },
-
-    /// Bus request error.
-    #[error("Bus error: {message}")]
-    Bus {
-        /// The error message.
-        message: String,
-    },
-
-    /// Serialization error.
-    #[error("Serialization error: {message}")]
-    Serialization {
-        /// The error message.
-        message: String,
-    },
-
-    /// The generated MCP domain catalog could not be prepared for a session.
-    #[error("MCP setup error: {message}")]
-    McpSetup {
-        /// Safe structural collation failure message.
-        message: String,
-    },
-
-    /// Shared runtime plumbing failure converted at the Discuss domain boundary.
-    #[error("{kind} error for {target_domain}.{operation}: {message}")]
-    Infrastructure {
-        /// Stable infrastructure failure kind.
-        kind: String,
-        /// Domain expected to send, receive, reply, or broadcast.
-        target_domain: String,
-        /// Operation that was active when the plumbing failure occurred.
-        operation: String,
-        /// Safe human-readable failure message.
-        message: String,
-    },
-
-    /// Turso DB persistence failure. `code` is a stable low-cardinality tag
-    /// (`db_query`, `db_constraint`, `db_timeout`, `db_unavailable`) and
-    /// `message` is the safe human-readable DB error text.
-    #[error("Discuss persistence error [{code}]: {message}")]
-    Persistence {
-        /// Stable low-cardinality DB failure tag.
-        code: String,
-        /// Safe human-readable DB error text.
-        message: String,
-    },
-
-    /// A workspace filesystem operation failed for a plugin-owned destination.
-    #[error("workspace filesystem operation for {plugin} at {path} failed: {message}")]
-    WorkspaceIo {
-        /// Plugin that owns the failed destination.
-        plugin: String,
-        /// Failed plugin-owned destination.
-        path: String,
-        /// Safe filesystem error message.
-        message: String,
-    },
-
-    /// Serializing a plugin-owned workspace output format failed.
-    #[error("workspace serialization of {format} for {plugin} at {path} failed: {message}")]
-    WorkspaceSerialize {
-        /// Plugin that owns the failed destination.
-        plugin: String,
-        /// Failed plugin-owned destination.
-        path: String,
-        /// Plugin output format.
-        format: String,
-        /// Safe serializer error message.
-        message: String,
-    },
-
-    /// A workspace asset identity cannot safely name a destination segment.
-    #[error("workspace asset id {asset_id:?} is invalid: {violation}")]
-    WorkspaceInvalidAssetId {
-        /// Rejected canonical asset identity.
-        asset_id: String,
-        /// Safe explanation of the safety violation.
-        violation: String,
-    },
-
-    /// An editable Provider source is not a safe relative workspace selection.
-    #[error("invalid Provider workspace copy source {path:?}: {violation}")]
-    InvalidWorkspaceCopySource {
-        /// Rejected path.
-        path: String,
-        /// Safe explanation of the rejection.
-        violation: String,
-    },
-
-    /// Request targets a chat session that has no live worker.
-    #[error("Discuss session not found: discuss_session_id={discuss_session_id}")]
-    SessionNotFound {
-        /// Session id that had no live worker.
-        discuss_session_id: DiscussSessionId,
-    },
-
-    /// The session has an active turn that cannot be disturbed.
-    #[error("Discuss session busy: discuss_session_id={discuss_session_id}")]
-    SessionBusy {
-        /// Session id with an active turn.
-        discuss_session_id: DiscussSessionId,
-    },
-
-    /// Provider did not advertise the capability required for the operation.
-    #[error("Discuss unsupported capability: {capability}")]
-    UnsupportedCapability {
-        /// Capability name the provider did not advertise.
-        capability: String,
-    },
-
-    /// The selected Provider cannot load an ACP child session for inspection.
-    #[error("Provider {provider_name} does not support child-session inspection")]
-    InspectorUnavailable {
-        /// Exact installed Provider identifier.
-        provider_name: String,
-    },
-
-    /// An ephemeral inspector failed while loading its child ACP session.
-    #[error("Inspector failed to load child session {child_session_id}: {message}")]
-    InspectorLoadFailed {
-        /// Ephemeral viewer identity that receives the terminal stream error.
-        viewer_session_id: DiscussSessionId,
-        /// Provider ACP child-session identity.
-        child_session_id: String,
-        /// Safe typed failure detail.
-        message: String,
-    },
-
-    /// Request payload failed Discuss domain validation.
-    #[error("Discuss validation error: {message}")]
-    Validation {
-        /// Safe human-readable validation failure.
-        message: String,
-    },
-
-    /// An AgentNode exceeded one of its saved execution limits.
-    #[error("AgentNode limit reached for {limit}: {actual} (maximum {maximum})")]
-    AgentNodeLimitReached {
-        /// Stable limit name (`maxTurns`, `maxToolCalls`, or `maxDuration`).
-        limit: String,
-        /// Observed value at the terminal boundary.
-        actual: u64,
-        /// Resolved node-owned maximum.
-        maximum: u64,
-    },
-
-    /// No live terminal receiver exists for an AgentNode tick.
-    #[error("AgentNode completion not found for {node_execution_id:?}")]
-    AgentNodeCompletionNotFound { node_execution_id: NodeExecutionId },
-
-    /// A Flow supplied an AgentNode execution limit outside its finite bounds.
-    #[error("invalid AgentNode limit {limit}: {value} (maximum {maximum})")]
-    AgentNodeLimitInvalid { limit: String, value: i64, maximum: u64 },
-
-    /// A live AgentNode execution already owns this node execution identity.
-    #[error("node execution {node_execution_id} was already started with different input")]
-    AgentNodeIdempotencyConflict { node_execution_id: NodeExecutionId },
-
-    /// The ACP worker dropped its terminal responder before completion.
-    #[error("AgentNode terminal responder was dropped")]
-    AgentNodeCompletionDropped,
-
-    /// A user turn exceeded the maximum payload size accepted by Discuss.
-    #[error("Discuss user turn is too large: {actual_bytes} bytes (maximum {max_bytes} bytes)")]
-    UserTurnTooLarge {
-        /// Size of the rejected UTF-8 payload in bytes.
-        actual_bytes: u64,
-        /// Maximum accepted UTF-8 payload size in bytes.
-        max_bytes: u64,
-    },
-
-    /// Pending permission not found, already resolved, stale, or duplicate.
-    ///
-    /// Covers unknown, duplicate, stale, and already-resolved pending entries.
-    #[error(
-        "permission not found or already resolved: discuss_session_id={discuss_session_id}, permission_request_id={permission_request_id}"
-    )]
-    PermissionNotFound {
-        /// Session id of the answer target.
-        discuss_session_id: DiscussSessionId,
-        /// Permission request id of the answer.
-        permission_request_id: String,
-    },
-
-    /// Cross-session permission answer: the pending permission belongs to a
-    /// different `discuss_session_id` than the answer targets.
-    #[error("permission session mismatch: answer for {answer_session_id} but pending belongs to {pending_session_id}")]
-    SessionMismatch {
-        /// Session id the answer was sent to.
-        answer_session_id: DiscussSessionId,
-        /// Session id the pending permission belongs to.
-        pending_session_id: DiscussSessionId,
-    },
-
-    /// The selected permission option was not offered by the provider.
-    ///
-    /// The pending entry is **not** consumed on this error — it stays live so
-    /// the user can retry with a valid option.
-    #[error("invalid permission option: {option_id} was not offered")]
-    InvalidOption {
-        /// The rejected option id.
-        option_id: String,
-    },
-
-    /// The ACP elicitation request was malformed or otherwise invalid.
-    #[error("invalid elicitation request: {message}")]
-    ElicitationInvalidRequest {
-        /// Safe validation detail.
-        message: String,
-    },
-
-    /// The accepted elicitation content does not satisfy its restricted form.
-    /// The pending request remains live so the user can correct and resubmit.
-    #[error("invalid elicitation content: {message}")]
-    ElicitationInvalidContent {
-        /// Safe validation detail.
-        message: String,
-    },
-
-    /// The elicitation target session no longer exists.
-    #[error("elicitation session not found: discuss_session_id={discuss_session_id}")]
-    ElicitationSessionNotFound {
-        /// Session targeted by the request.
-        discuss_session_id: DiscussSessionId,
-    },
-
-    /// The elicitation request is no longer pending.
-    #[error(
-        "elicitation request not pending: discuss_session_id={discuss_session_id}, elicitation_request_id={elicitation_request_id}"
-    )]
-    ElicitationRequestNotPending {
-        /// Session targeted by the answer.
-        discuss_session_id: DiscussSessionId,
-        /// Elicitation request targeted by the answer.
-        elicitation_request_id: ElicitationRequestId,
-    },
-
-    /// The elicitation request has already been answered.
-    #[error(
-        "elicitation request already answered: discuss_session_id={discuss_session_id}, elicitation_request_id={elicitation_request_id}"
-    )]
-    ElicitationAlreadyAnswered {
-        /// Session targeted by the answer.
-        discuss_session_id: DiscussSessionId,
-        /// Elicitation request targeted by the answer.
-        elicitation_request_id: ElicitationRequestId,
-    },
-
-    /// Persistence drain failure during shutdown: the ordered persistence
-    /// queue could not drain accepted writes before the shutdown deadline.
-    #[error("persistence drain failed: {message}")]
-    PersistenceDrainFailed {
-        /// Safe human-readable drain failure message.
-        message: String,
-    },
-
-    /// Worker stop timeout during shutdown: a live session worker did not
-    /// terminate within the shutdown deadline.
-    #[error("worker stop timeout for discuss_session_id={discuss_session_id}")]
-    WorkerStopTimeout {
-        /// Session id of the worker that timed out.
-        discuss_session_id: DiscussSessionId,
-    },
-
-    /// Discuss server is shutting down; new session work is rejected.
-    #[error("Discuss server is shutting down")]
-    ShuttingDown,
-
-    /// A Provider runtime could not be initialized or maintained.
-    #[error("Provider runtime failure for {provider_name}: {message}")]
-    ProviderRuntime {
-        /// Exact installed Provider identifier.
-        provider_name: String,
-        /// Safe runtime failure detail.
-        message: String,
-    },
-
-    /// A Provider runtime rejected admission for new work.
-    #[error("Provider admission failure for {provider_name}: {message}")]
-    ProviderAdmission {
-        /// Exact installed Provider identifier.
-        provider_name: String,
-        /// Safe admission failure detail.
-        message: String,
-    },
-
-    /// A Provider process or connection exited unexpectedly.
-    #[error("Provider process for {provider_name} exited: {message}")]
-    ProviderProcessExit {
-        /// Exact installed Provider identifier.
-        provider_name: String,
-        /// Safe process-exit detail.
-        message: String,
-    },
-
-    /// A Provider exhausted its automatic restart budget.
-    #[error("Provider {provider_name} exhausted its automatic restart budget")]
-    ProviderRestartExhausted {
-        /// Exact installed Provider identifier.
-        provider_name: String,
-    },
-
-    /// Work was requested from a Provider that is not running.
-    #[error("Provider {provider_name} is not running")]
-    ProviderNotRunning {
-        /// Exact installed Provider identifier.
-        provider_name: String,
-    },
-
-    /// The requested agent key is not registered in the Discuss server.
-    #[error("unknown Discuss agent key `{agent_key}`; register the agent before starting a session")]
-    UnknownAgent {
-        /// The agent key that was not found.
-        agent_key: String,
-    },
-
-    /// Accounting is not currently available.
-    #[error("Accounting unavailable")]
-    AccountingUnavailable,
-    /// The requested report range is invalid.
-    #[error("Invalid report range")]
-    ReportRangeInvalid,
-    /// A report aggregation exceeded its numeric bounds.
-    #[error("Report aggregation overflow")]
-    ReportAggregationOverflow,
-    /// The custom asset does not exist.
-    #[error("Unknown custom asset")]
-    UnknownCustomAsset,
-    /// The custom asset is still referenced by the listed providers or teams.
-    #[error("Custom asset is referenced: {references:?}")]
-    CustomAssetReferenced { references: Vec<String> },
-    /// The custom asset identifier collides with another asset.
-    #[error("Custom asset id collision")]
-    CustomAssetIdCollision,
-    /// The requested custom agent is not installed.
-    #[error("Custom agent is not installed")]
-    CustomAgentNotInstalled,
-    /// The team leader already identifies another team.
-    #[error("Team leader is in use")]
-    TeamLeaderInUse,
-    /// An asset import failed at a named stage.
-    #[error("Asset import failed at {stage}: {cause}")]
-    AssetImport { stage: String, cause: String },
-    /// An MCP server name appears more than once.
-    #[error("Duplicate MCP server name")]
-    DuplicateMcpServerName,
-    /// An MCP server name is reserved.
-    #[error("Reserved MCP server name")]
-    ReservedMcpName,
-    /// Provider-managed configuration failed validation.
-    #[error("Managed config for {plugin} is invalid: {reason}")]
-    ManagedConfigValidation { plugin: String, reason: String },
-    /// A usage value exceeded its supported range.
-    #[error("Usage value out of range")]
-    UsageValueOutOfRange,
-    /// Import destination address was blocked.
-    #[error("Import address blocked")]
-    ImportAddressBlocked,
-
-    /// Legacy IPC boundary fallback for errors that do not yet have a structured variant.
-    #[error("{0}")]
-    Other(
-        /// Safe human-readable fallback error message.
-        String,
-    ),
-}
-
-impl DiscussError {
-    /// Stable client-facing error code for the Discuss domain.
-    pub fn rpc_code(&self) -> &'static str {
-        match self {
-            DiscussError::SessionIdentityUnknown => "SessionIdentityUnknown",
-            DiscussError::SessionIdentityUnassigned => "SessionIdentityUnassigned",
-            DiscussError::SessionIdentityAmbiguous => "SessionIdentityAmbiguous",
-            DiscussError::SessionIdentityInvalidIssuer => "SessionIdentityInvalidIssuer",
-            DiscussError::SessionCliLoginUnsupported => "SessionCliLoginUnsupported",
-            DiscussError::SessionCliToolUnsupported => "SessionCliToolUnsupported",
-            DiscussError::ChannelSend => "ChannelSend",
-            DiscussError::ChannelRecv => "ChannelRecv",
-            DiscussError::OneshotReply => "OneshotReply",
-            DiscussError::SessionCancelled { .. } => "SessionCancelled",
-            DiscussError::ProtocolError { .. } => "ProtocolError",
-            DiscussError::AuthenticationRequired => "AuthenticationRequired",
-            DiscussError::WorkerTokenServiceUnavailable => "WorkerTokenServiceUnavailable",
-            DiscussError::AgentNodeTokenRequired => "AgentNodeTokenRequired",
-            DiscussError::WorkerTokenIssuance { .. } => "WorkerTokenIssuance",
-            DiscussError::Config { .. } => "Config",
-            DiscussError::Bus { .. } => "Bus",
-            DiscussError::Serialization { .. } => "Serialization",
-            DiscussError::McpSetup { .. } => "McpSetup",
-            DiscussError::Infrastructure { .. } => "Infrastructure",
-            DiscussError::Persistence { .. } => "Persistence",
-            DiscussError::WorkspaceIo { .. } => "WorkspaceIo",
-            DiscussError::WorkspaceSerialize { .. } => "WorkspaceSerialize",
-            DiscussError::WorkspaceInvalidAssetId { .. } => "WorkspaceInvalidAssetId",
-            DiscussError::InvalidWorkspaceCopySource { .. } => "InvalidWorkspaceCopySource",
-            DiscussError::SessionNotFound { .. } => "SessionNotFound",
-            DiscussError::SessionBusy { .. } => "SessionBusy",
-            DiscussError::UnsupportedCapability { .. } => "UnsupportedCapability",
-            DiscussError::InspectorUnavailable { .. } => "InspectorUnavailable",
-            DiscussError::InspectorLoadFailed { .. } => "InspectorLoadFailed",
-            DiscussError::Validation { .. } => "Validation",
-            DiscussError::AgentNodeLimitReached { .. } => "AgentNodeLimitReached",
-            DiscussError::AgentNodeCompletionNotFound { .. } => "AgentNodeCompletionNotFound",
-            DiscussError::AgentNodeLimitInvalid { .. } => "AgentNodeLimitInvalid",
-            DiscussError::AgentNodeIdempotencyConflict { .. } => "AgentNodeIdempotencyConflict",
-            DiscussError::AgentNodeCompletionDropped => "AgentNodeCompletionDropped",
-            DiscussError::UserTurnTooLarge { .. } => "UserTurnTooLarge",
-            DiscussError::PermissionNotFound { .. } => "PermissionNotFound",
-            DiscussError::SessionMismatch { .. } => "SessionMismatch",
-            DiscussError::InvalidOption { .. } => "InvalidOption",
-            DiscussError::ElicitationInvalidRequest { .. } => "InvalidRequest",
-            DiscussError::ElicitationInvalidContent { .. } => "InvalidContent",
-            DiscussError::ElicitationSessionNotFound { .. } => "SessionNotFound",
-            DiscussError::ElicitationRequestNotPending { .. } => "RequestNotPending",
-            DiscussError::ElicitationAlreadyAnswered { .. } => "AlreadyAnswered",
-            DiscussError::PersistenceDrainFailed { .. } => "PersistenceDrainFailed",
-            DiscussError::WorkerStopTimeout { .. } => "WorkerStopTimeout",
-            DiscussError::ShuttingDown => "ShuttingDown",
-            DiscussError::ProviderRuntime { .. } => "ProviderRuntime",
-            DiscussError::ProviderAdmission { .. } => "ProviderAdmission",
-            DiscussError::ProviderProcessExit { .. } => "ProviderProcessExit",
-            DiscussError::ProviderRestartExhausted { .. } => "ProviderRestartExhausted",
-            DiscussError::ProviderNotRunning { .. } => "ProviderNotRunning",
-            DiscussError::UnknownAgent { .. } => "UnknownAgent",
-            DiscussError::AccountingUnavailable => "AccountingUnavailable",
-            DiscussError::ReportRangeInvalid => "ReportRangeInvalid",
-            DiscussError::ReportAggregationOverflow => "ReportAggregationOverflow",
-            DiscussError::UnknownCustomAsset => "UnknownCustomAsset",
-            DiscussError::CustomAssetReferenced { .. } => "CustomAssetReferenced",
-            DiscussError::CustomAssetIdCollision => "CustomAssetIdCollision",
-            DiscussError::CustomAgentNotInstalled => "CustomAgentNotInstalled",
-            DiscussError::TeamLeaderInUse => "TeamLeaderInUse",
-            DiscussError::AssetImport { .. } => "AssetImport",
-            DiscussError::DuplicateMcpServerName => "DuplicateMcpServerName",
-            DiscussError::ReservedMcpName => "ReservedMcpName",
-            DiscussError::ManagedConfigValidation { .. } => "ManagedConfigValidation",
-            DiscussError::UsageValueOutOfRange => "UsageValueOutOfRange",
-            DiscussError::ImportAddressBlocked => "ImportAddressBlocked",
-            DiscussError::Other(_) => "Other",
-        }
-    }
-}
-
-impl From<SharedInfraError> for DiscussError {
-    fn from(error: SharedInfraError) -> Self {
-        let (kind, target_domain, operation, message) = match error {
-            SharedInfraError::ChannelSend {
-                target_domain,
-                operation,
-                cause,
-            } => ("channel_send", target_domain, operation, cause),
-            SharedInfraError::ChannelRecv {
-                target_domain,
-                operation,
-                cause,
-            } => ("channel_recv", target_domain, operation, cause),
-            SharedInfraError::OneshotReplyTimeout {
-                target_domain,
-                operation,
-                timeout,
-            } => ("oneshot_reply_timeout", target_domain, operation, timeout),
-            SharedInfraError::OneshotReplyMissing {
-                target_domain,
-                operation,
-                cause,
-            } => ("oneshot_reply_missing", target_domain, operation, cause),
-        };
-        Self::Infrastructure {
-            kind: kind.to_owned(),
-            target_domain,
-            operation,
-            message,
-        }
-    }
-}
-
-impl From<GeneratedCallError<DiscussError>> for DiscussError {
-    fn from(error: GeneratedCallError<DiscussError>) -> Self {
-        match error {
-            GeneratedCallError::DomainError(error) => error,
-            GeneratedCallError::Authentication(error) => Self::Bus {
-                message: error.to_string(),
-            },
-            GeneratedCallError::InputClosed => Self::ChannelSend,
-            GeneratedCallError::ReplyDropped => Self::OneshotReply,
-            GeneratedCallError::UnexpectedResponse { expected, actual } => Self::Bus {
-                message: format!("expected {expected}, got {actual}"),
-            },
-        }
-    }
-}
-
-impl From<DispatchContextError> for DiscussError {
-    fn from(error: DispatchContextError) -> Self {
-        Self::Bus {
-            message: error.to_string(),
-        }
-    }
-}
-
-impl rspc::Error for DiscussError {
-    fn into_procedure_error(self) -> rspc::ProcedureError {
-        let safe_error = serde_json::json!({
-            "DomainError": {
-                "domain": "discuss",
-                "code": self.rpc_code(),
-                "message": self.to_string(),
-                "details": {},
-            }
-        });
-        rspc::ProcedureError::Resolver(rspc::ResolverError::new(safe_error, None::<Self>))
-    }
-}
-
-impl From<AvesAuthError> for DiscussError {
-    fn from(error: AvesAuthError) -> Self {
-        DiscussError::WorkerTokenIssuance {
-            message: error.to_string(),
-        }
-    }
-}
-
-impl From<agent_client_protocol::Error> for DiscussError {
-    fn from(err: agent_client_protocol::Error) -> Self {
-        if err.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED {
-            DiscussError::AuthenticationRequired
-        } else {
-            DiscussError::ProtocolError { message: err.message }
-        }
-    }
-}
-
-impl From<BusControlError> for DiscussError {
-    fn from(error: BusControlError) -> Self {
-        DiscussError::McpSetup {
-            message: error.to_string(),
-        }
-    }
-}
-
-/// Map typed Turso failure variants to stable, low-cardinality DB codes.
-fn turso_error_code(err: &turso::Error) -> &'static str {
-    match err {
-        turso::Error::Constraint(_) => "db_constraint",
-        turso::Error::Busy(_) | turso::Error::BusySnapshot(_) | turso::Error::Interrupt(_) => "db_timeout",
-        turso::Error::Readonly(_)
-        | turso::Error::DatabaseFull(_)
-        | turso::Error::NotAdb(_)
-        | turso::Error::Corrupt(_) => "db_unavailable",
-        _ => "db_query",
-    }
-}
-
-impl From<turso::Error> for DiscussError {
-    fn from(err: turso::Error) -> Self {
-        let code = turso_error_code(&err);
-        DiscussError::Persistence {
-            code: code.to_string(),
-            message: err.to_string(),
-        }
-    }
-}
-
-impl From<serde_json::Error> for DiscussError {
-    fn from(err: serde_json::Error) -> Self {
-        DiscussError::Serialization {
-            message: err.to_string(),
-        }
-    }
-}
-
-impl From<super::library::Error> for DiscussError {
-    fn from(error: super::library::Error) -> Self {
-        match error {
-            super::library::Error::InvalidAssetId { asset_id, violation } => DiscussError::WorkspaceInvalidAssetId {
-                asset_id,
-                violation: violation.to_string(),
-            },
-        }
-    }
 }

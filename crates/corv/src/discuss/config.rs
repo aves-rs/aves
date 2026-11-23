@@ -1,5 +1,6 @@
+use super::error::DiscussError;
 use super::plugins::ConfigSettings;
-use super::types::{DiscussConfigOption, DiscussError};
+use super::types::DiscussConfigOption;
 
 /// Serialize provider-refreshed config options into the persisted JSON blob for
 /// a load refresh (R3), returning `None` when the provider response carried no

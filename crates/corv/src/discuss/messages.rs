@@ -11,15 +11,23 @@ use aves::bus::{BusMcpEndpoint, BusRpcContext};
 use aves::flow::{LifecycleCorrelation, NodeExecutionId};
 
 use super::DiscussDomain;
+use super::agent_nodes::{AgentNodeSessionLimits, AgentNodeTickResult};
+use super::catalog_types::{
+    AgentThemeColor, BuiltinSkillEntry, CustomAgentDetail, CustomAssetMetadata, CustomSkillBundleFile,
+    CustomSkillDetail, IncompleteTeamClaim, InstalledAssetClaim, InstalledAssetKind, TeamCatalogEntry,
+};
+use super::error::DiscussError;
+use super::launch_types::{AcpProvider, SessionLaunchConfig};
+use super::report_types::{
+    DiscussAllowanceGroupBy, DiscussAllowanceProjection, DiscussAllowanceReport, DiscussUsageGroupBy,
+    DiscussUsageReport,
+};
 use super::types::{
-    AcpProvider, AgentNodeSessionLimits, AgentNodeTickResult, AgentThemeColor, BuiltinSkillEntry, CleanupWarning,
-    CustomAgentDetail, CustomAssetMetadata, CustomMcpEntry, CustomMcpScope, CustomSkillBundleFile, CustomSkillDetail,
-    DiscussAllowanceGroupBy, DiscussAllowanceProjection, DiscussAllowanceReport, DiscussChatTurnRecord,
-    DiscussConfigOption, DiscussConfigValues, DiscussElicitationAnswer, DiscussError, DiscussImageAttachment,
-    DiscussMcpStatus, DiscussMemberOverrides, DiscussPermissionOption, DiscussProviderConfig, DiscussSessionId,
-    DiscussSessionInfo, DiscussSessionSetup, DiscussSubagentRecord, DiscussUsageGroupBy, DiscussUsageReport,
-    ElicitationRequestId, IncompleteTeamClaim, InspectorBinding, InstalledAssetClaim, InstalledAssetKind,
-    PermissionRequestId, ProviderRuntimeState, SensitiveMcpDescriptor, SessionLaunchConfig, TeamCatalogEntry,
+    CleanupWarning, CustomMcpEntry, CustomMcpScope, DiscussAuthAccount, DiscussAuthState, DiscussChatTurnRecord,
+    DiscussConfigOption, DiscussConfigValues, DiscussElicitationAnswer, DiscussImageAttachment, DiscussMcpStatus,
+    DiscussMemberOverrides, DiscussPermissionOption, DiscussProviderConfig, DiscussResourceLink, DiscussSessionId,
+    DiscussSessionInfo, DiscussSessionModes, DiscussSessionSetup, DiscussSubagentRecord, ElicitationRequestId,
+    InspectorBinding, PermissionRequestId, ProviderRuntimeState, SensitiveMcpDescriptor,
 };
 
 /// Discuss domain request wrapper.
@@ -108,6 +116,10 @@ pub enum DiscussRequestPayload {
         provider_name: String,
     },
 
+    /// Read a provider's authentication status when advertised.
+    #[operation(name = "getProviderAuthStatus", kind = "query", response = ProviderAuthStatusOutput, response_variant = "ProviderAuthStatus")]
+    GetProviderAuthStatus { provider_name: String },
+
     /// Send a user turn (prompt text) to a live session worker.
 
     #[privileged(reason = "User turns are internal bus-only control requests, not public RPC")]
@@ -119,6 +131,9 @@ pub enum DiscussRequestPayload {
         /// Images sent to the provider without durable storage.
         #[serde(default)]
         images: Vec<DiscussImageAttachment>,
+        /// Resource links sent to the provider.
+        #[serde(default)]
+        resource_links: Vec<DiscussResourceLink>,
     },
 
     /// Answer a pending permission request.
@@ -609,6 +624,17 @@ pub enum DiscussRequestPayload {
         discuss_session_id: DiscussSessionId,
     },
 
+    /// Read the modes reported for a live session.
+    #[operation(name = "getSessionModes", kind = "query", response = SessionModesOutput, response_variant = "SessionModes")]
+    GetSessionModes { discuss_session_id: DiscussSessionId },
+
+    /// Set the current mode on a live session.
+    #[operation(name = "setSessionMode", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    SetSessionMode {
+        discuss_session_id: DiscussSessionId,
+        mode_id: String,
+    },
+
     /// Set a provider-exposed config option on an active session.
     ///
     /// Mutation; subject to the bus safety gate.
@@ -646,6 +672,14 @@ pub enum DiscussRequestPayload {
         /// Application-owned canonical session identity.
         discuss_session_id: DiscussSessionId,
     },
+
+    /// Archive the provider session when supported.
+    #[operation(name = "archiveSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    ArchiveSession { discuss_session_id: DiscussSessionId },
+
+    /// Unarchive the provider session when supported.
+    #[operation(name = "unarchiveSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
+    UnarchiveSession { discuss_session_id: DiscussSessionId },
 }
 
 impl DiscussRequestPayload {
@@ -664,6 +698,10 @@ impl DiscussRequestPayload {
                 | DiscussRequestPayload::EnsureAttachedSession { .. }
                 | DiscussRequestPayload::GetConfigOptions { .. }
                 | DiscussRequestPayload::SetConfigOption { .. }
+                | DiscussRequestPayload::GetSessionModes { .. }
+                | DiscussRequestPayload::SetSessionMode { .. }
+                | DiscussRequestPayload::ArchiveSession { .. }
+                | DiscussRequestPayload::UnarchiveSession { .. }
                 | DiscussRequestPayload::SendUserTurn { .. }
                 | DiscussRequestPayload::AnswerPermission { .. }
                 | DiscussRequestPayload::AnswerElicitation { .. }
@@ -674,6 +712,94 @@ impl DiscussRequestPayload {
                 | DiscussRequestPayload::StartInspector { .. }
                 | DiscussRequestPayload::DisposeInspector { .. }
         )
+    }
+}
+
+/// Stable operation label for tracing without recording request contents.
+pub(super) fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
+    match payload {
+        DiscussRequestPayload::ResolveSessionIdentity { .. } => "resolveSessionIdentity",
+        DiscussRequestPayload::GetTokenUsageReport { .. } => "getTokenUsageReport",
+        DiscussRequestPayload::GetSpendReport { .. } => "getSpendReport",
+        DiscussRequestPayload::GetAllowanceReport { .. } => "getAllowanceReport",
+        DiscussRequestPayload::GetCurrentAllowance => "getCurrentAllowance",
+        DiscussRequestPayload::RecordAllowance { .. } => "recordAllowance",
+        DiscussRequestPayload::StartAgent { .. } => "startAgent",
+        DiscussRequestPayload::TickAgent { .. } => "tickAgent",
+        DiscussRequestPayload::CancelAgentExecution { .. } => "cancelAgentExecution",
+        DiscussRequestPayload::StartServer => "startServer",
+        DiscussRequestPayload::StopServer => "stopServer",
+        DiscussRequestPayload::GetServerStatus => "getServerStatus",
+        DiscussRequestPayload::StartProvider { .. } => "startProvider",
+        DiscussRequestPayload::StopProvider { .. } => "stopProvider",
+        DiscussRequestPayload::SendUserTurn { .. } => "sendUserTurn",
+        DiscussRequestPayload::AnswerPermission { .. } => "answerPermission",
+        DiscussRequestPayload::AnswerElicitation { .. } => "answerElicitation",
+        DiscussRequestPayload::CancelElicitation { .. } => "cancelElicitation",
+        DiscussRequestPayload::CancelTurn { .. } => "cancelTurn",
+        DiscussRequestPayload::CancelSession { .. } => "cancelSession",
+        DiscussRequestPayload::ReserveInspector { .. } => "reserveInspector",
+        DiscussRequestPayload::StartInspector { .. } => "startInspector",
+        DiscussRequestPayload::DisposeInspector { .. } => "disposeInspector",
+        DiscussRequestPayload::AddProvider { .. } => "addProvider",
+        DiscussRequestPayload::ListProviders => "listProviders",
+        DiscussRequestPayload::GetProviderConfig { .. } => "getProviderConfig",
+        DiscussRequestPayload::GetProviderManagedConfig { .. } => "getProviderManagedConfig",
+        DiscussRequestPayload::SetProviderManagedConfig { .. } => "setProviderManagedConfig",
+        DiscussRequestPayload::RefreshProviderConfig { .. } => "refreshProviderConfig",
+        DiscussRequestPayload::RemoveProvider { .. } => "removeProvider",
+        DiscussRequestPayload::InstallProviderConfig { .. } => "installProviderConfig",
+        DiscussRequestPayload::RemoveProviderConfig { .. } => "removeProviderConfig",
+        DiscussRequestPayload::ListCustomMcps => "listCustomMcps",
+        DiscussRequestPayload::CreateCustomMcp { .. } => "createCustomMcp",
+        DiscussRequestPayload::UpdateCustomMcp { .. } => "updateCustomMcp",
+        DiscussRequestPayload::DeleteCustomMcp { .. } => "deleteCustomMcp",
+        DiscussRequestPayload::AssignMcp { .. } => "assignMcp",
+        DiscussRequestPayload::UnassignMcp { .. } => "unassignMcp",
+        DiscussRequestPayload::ListBuiltinSkills => "listBuiltinSkills",
+        DiscussRequestPayload::ListProviderInstalledAssets => "listProviderInstalledAssets",
+        DiscussRequestPayload::ListProviderMcpAssignments { .. } => "listProviderMcpAssignments",
+        DiscussRequestPayload::ListCustomAgents => "listCustomAgents",
+        DiscussRequestPayload::ListCustomSkills => "listCustomSkills",
+        DiscussRequestPayload::GetCustomAgent { .. } => "getCustomAgent",
+        DiscussRequestPayload::GetCustomSkill { .. } => "getCustomSkill",
+        DiscussRequestPayload::ImportCustomAgentFromUrl { .. } => "importCustomAgentFromUrl",
+        DiscussRequestPayload::ImportCustomSkillFromUrl { .. } => "importCustomSkillFromUrl",
+        DiscussRequestPayload::SetInstalledAssetInstructions { .. } => "setInstalledAssetInstructions",
+        DiscussRequestPayload::GetInstalledAssetInstructions { .. } => "getInstalledAssetInstructions",
+        DiscussRequestPayload::CreateCustomAgent { .. } => "createCustomAgent",
+        DiscussRequestPayload::CreateCustomSkill { .. } => "createCustomSkill",
+        DiscussRequestPayload::UpdateCustomAgent { .. } => "updateCustomAgent",
+        DiscussRequestPayload::UpdateCustomSkill { .. } => "updateCustomSkill",
+        DiscussRequestPayload::DeleteCustomAgent { .. } => "deleteCustomAgent",
+        DiscussRequestPayload::DeleteCustomSkill { .. } => "deleteCustomSkill",
+        DiscussRequestPayload::InstallCustomAgent { .. } => "installCustomAgent",
+        DiscussRequestPayload::UninstallCustomAgent { .. } => "uninstallCustomAgent",
+        DiscussRequestPayload::InstallCustomSkill { .. } => "installCustomSkill",
+        DiscussRequestPayload::UninstallCustomSkill { .. } => "uninstallCustomSkill",
+        DiscussRequestPayload::CreateCustomTeam { .. } => "createCustomTeam",
+        DiscussRequestPayload::UpdateCustomTeam { .. } => "updateCustomTeam",
+        DiscussRequestPayload::DeleteCustomTeam { .. } => "deleteCustomTeam",
+        DiscussRequestPayload::ListTeamCatalog => "listTeamCatalog",
+        DiscussRequestPayload::InstallTeam { .. } => "installTeam",
+        DiscussRequestPayload::InstallTeamAndStartSession { .. } => "installTeamAndStartSession",
+        DiscussRequestPayload::EditTeam { .. } => "editTeam",
+        DiscussRequestPayload::UninstallTeam { .. } => "uninstallTeam",
+        DiscussRequestPayload::NewSession { .. } => "newSession",
+        DiscussRequestPayload::ConnectProviderSession { .. } => "connectProviderSession",
+        DiscussRequestPayload::ListSessions => "listSessions",
+        DiscussRequestPayload::LoadSession { .. } => "loadSession",
+        DiscussRequestPayload::GetConfigOptions { .. } => "getConfigOptions",
+        DiscussRequestPayload::GetSessionModes { .. } => "getSessionModes",
+        DiscussRequestPayload::GetProviderAuthStatus { .. } => "getProviderAuthStatus",
+        DiscussRequestPayload::SetSessionMode { .. } => "setSessionMode",
+        DiscussRequestPayload::ArchiveSession { .. } => "archiveSession",
+        DiscussRequestPayload::UnarchiveSession { .. } => "unarchiveSession",
+        DiscussRequestPayload::SetConfigOption { .. } => "setConfigOption",
+        DiscussRequestPayload::RemoveSession { .. } => "removeSession",
+        DiscussRequestPayload::ChangeSessionWorkingDir { .. } => "changeSessionWorkingDir",
+        DiscussRequestPayload::EnsureAttachedSession { .. } => "ensureAttachedSession",
+        DiscussRequestPayload::RenameSession { .. } => "renameSession",
     }
 }
 
@@ -816,6 +942,15 @@ pub enum DiscussResponse {
         /// Provider option that selects the primary agent, if supported.
         #[serde(default)]
         agent_config_option_id: Option<String>,
+    },
+
+    /// Current modes for a session, if reported by its provider.
+    SessionModes { modes: Option<DiscussSessionModes> },
+
+    /// Provider-reported authentication status and display accounts.
+    ProviderAuthStatus {
+        status: DiscussAuthState,
+        accounts: Vec<DiscussAuthAccount>,
     },
 
     /// Internal session activity broadcast.

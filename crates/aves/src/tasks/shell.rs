@@ -84,7 +84,7 @@ async fn terminate_child(child: &mut Child, cause: ShellTerminalCause) -> ShellT
 
 /// Runs one interpreter; only that child is terminated, never its descendants.
 /// Reaping after termination is bounded to 2s, followed by one shared 5s pipe drain.
-pub(crate) async fn run_shell(spec: ShellRunSpec, mut terminate: oneshot::Receiver<()>) -> ShellTerminal {
+pub async fn run_shell(spec: ShellRunSpec, mut terminate: oneshot::Receiver<()>) -> ShellTerminal {
     let deadline = Instant::now() + spec.timeout;
     let mut child = match Command::new(&spec.interpreter)
         .arg("-c")

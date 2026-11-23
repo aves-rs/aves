@@ -1,6 +1,8 @@
+use std::cmp::Reverse;
 use std::time::Instant;
 
-use agent_client_protocol::v1::schema::PromptResponse;
+use agent_client_protocol::v1::schema::{PromptResponse, SessionUpdate};
+use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -8,10 +10,11 @@ use tokio::sync::mpsc;
 use super::database::{PersistenceJob, enqueue_persistence_job};
 use super::plugins::{BillingCategorySemantics, DiscussAgentPlugin};
 use super::pricing::{PriceIndex, PriceSnapshot};
-use super::types::{
-    DiscussCompletionKind, DiscussHarnessCostKind, DiscussModelUsageEntry, DiscussTurnRecord, DiscussTurnUsage,
+use super::report_types::{
+    DiscussCompletionKind, DiscussHarnessCostKind, DiscussModelUsageEntry, DiscussTurnRecord,
     DiscussUsageEvidenceSource,
 };
+use super::types::DiscussTurnUsage;
 
 /// A plugin's provider-prefix mapping onto models.dev provider IDs.
 type ProviderAliases = &'static [(&'static str, &'static str)];
@@ -41,9 +44,10 @@ pub(super) struct DiscussUsageEvidence {
     pub turn_correlatable: bool,
 }
 
-/// The raw notification or typed prompt response supplied to a plugin.
+/// The typed session update, extension notification, or prompt response supplied to a plugin.
 pub(super) enum UsageCaptureEvent<'a> {
     Notification { method: &'a str, params: &'a Value },
+    Update(&'a SessionUpdate),
     PromptResponse(&'a PromptResponse),
 }
 
@@ -73,38 +77,18 @@ pub(super) fn capture_standard_usage(event: &UsageCaptureEvent<'_>) -> Option<Di
             });
             evidence.turn_correlatable = true;
         }
-        UsageCaptureEvent::Notification { method, params } => {
-            if *method != "session/update" {
-                return None;
-            }
-            let update = params.get("update")?;
-            if update.get("sessionUpdate")?.as_str()? != "usage_update" {
-                return None;
-            }
-            let (Some(used), Some(size)) = (
-                update.get("used").and_then(Value::as_u64),
-                update.get("size").and_then(Value::as_u64),
-            ) else {
-                tracing::debug!("Malformed ACP usage occupancy");
-                return None;
-            };
-            evidence.context_used_tokens = Some(used);
-            evidence.context_window_tokens = Some(size);
-            if let Some(cost) = update.get("cost").filter(|cost| !cost.is_null()) {
-                if let (Some(amount), Some(currency)) = (
-                    cost.get("amount").and_then(Value::as_number),
-                    cost.get("currency").and_then(Value::as_str),
-                ) {
-                    evidence.cost = Some((
-                        amount.to_string(),
-                        currency.to_owned(),
-                        DiscussHarnessCostKind::SessionCumulative,
-                    ));
-                } else {
-                    tracing::debug!("Malformed ACP usage cost");
-                }
+        UsageCaptureEvent::Update(SessionUpdate::UsageUpdate(update)) => {
+            evidence.context_used_tokens = Some(update.used);
+            evidence.context_window_tokens = Some(update.size);
+            if let Some(cost) = &update.cost {
+                evidence.cost = Some((
+                    cost.amount.to_string(),
+                    cost.currency.clone(),
+                    DiscussHarnessCostKind::SessionCumulative,
+                ));
             }
         }
+        _ => return None,
     }
     Some(evidence)
 }
@@ -187,7 +171,7 @@ impl UsageTurnAccumulator {
 
     pub(super) fn dispatch(&mut self, model_id: Option<String>) {
         self.last = None;
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = Utc::now().timestamp_millis();
         let turn = DiscussTurnRecord {
             discuss_session_id: self.session_id.clone(),
             turn_ordinal: self.next_ordinal,
@@ -258,7 +242,7 @@ impl UsageTurnAccumulator {
         let Some(mut active) = self.active.take() else {
             return;
         };
-        active.turn.turn_completed_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        active.turn.turn_completed_at_ms = Some(Utc::now().timestamp_millis());
         active.turn.end_to_end_ms = (kind == DiscussCompletionKind::Completed)
             .then(|| i64::try_from(active.started.elapsed().as_millis()).unwrap_or(i64::MAX));
         active.turn.completion_kind = kind;
@@ -303,7 +287,7 @@ fn priority(source: DiscussUsageEvidenceSource) -> u8 {
 fn assemble(active: &ActiveTurn) -> (DiscussTurnRecord, Vec<DiscussModelUsageEntry>) {
     let mut turn = active.turn.clone();
     let mut sources: Vec<_> = active.evidence.iter().rev().collect();
-    sources.sort_by_key(|item| std::cmp::Reverse(priority(item.source)));
+    sources.sort_by_key(|item| Reverse(priority(item.source)));
     if let Some(first) = sources.first() {
         turn.evidence_source = first.source;
     }

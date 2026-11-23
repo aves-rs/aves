@@ -5,10 +5,15 @@ use turso::{Connection, Database};
 
 use aves::utils::database::{DatabaseError, connect_database};
 
+use super::error::DiscussError;
+use super::launch_types::{LaunchLimitation, SessionLaunchConfig};
+use super::report_types::{
+    DiscussCompletionKind, DiscussHarnessCostKind, DiscussModelUsageEntry, DiscussTurnRecord,
+    DiscussUsageEvidenceSource,
+};
 use super::types::{
-    ConfigSettings, DiscussCompletionKind, DiscussConfigOption, DiscussError, DiscussHarnessCostKind,
-    DiscussModelUsageEntry, DiscussSessionId, DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTurnRecord,
-    DiscussTurnUsage, DiscussUsageEvidenceSource, LaunchLimitation, SessionLaunchConfig,
+    ConfigSettings, DiscussConfigOption, DiscussSessionId, DiscussSessionModes, DiscussSubagentRecord,
+    DiscussSubagentSurfaceState, DiscussTurnUsage,
 };
 
 pub(super) const INSERT_IDENTITY_BINDING_SQL: &str = include_str!("queries/insert_identity_binding.sql");
@@ -24,6 +29,8 @@ const DISCUSS_SESSIONS_SETUP_KIND_SQL: &str = include_str!("queries/discuss_sess
 const DISCUSS_SESSIONS_LAUNCH_CONTEXT_SQL: &str = include_str!("queries/discuss_sessions_launch_context.sql");
 const DISCUSS_SESSIONS_LAUNCH_CONFIG_SQL: &str = include_str!("queries/discuss_sessions_launch_config.sql");
 const DISCUSS_SESSIONS_LAUNCH_LIMITATIONS_SQL: &str = include_str!("queries/update_session_launch_limitations.sql");
+const DISCUSS_SESSIONS_MODES_LOAD_SQL: &str = include_str!("queries/discuss_sessions_modes_load.sql");
+const DISCUSS_SESSIONS_MODES_UPDATE_SQL: &str = include_str!("queries/discuss_sessions_modes_update.sql");
 pub const DISCUSS_SESSIONS_DELETE_SQL: &str = include_str!("queries/session_delete.sql");
 pub const DISCUSS_SESSIONS_RENAME_SQL: &str = include_str!("queries/discuss_sessions_rename.sql");
 pub const DISCUSS_CHAT_TURNS_INSERT_SQL: &str = include_str!("queries/discuss_chat_turns_insert.sql");
@@ -571,6 +578,35 @@ pub(super) async fn update_session_launch_limitations(
             message: "session anchor missing while persisting launch limitations".to_string(),
         });
     }
+    Ok(())
+}
+
+/// Load the last session modes recorded on an anchor; `None` when the anchor or modes are absent.
+pub(super) async fn load_session_modes(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<DiscussSessionModes>, DiscussError> {
+    let mut rows = conn
+        .query(DISCUSS_SESSIONS_MODES_LOAD_SQL, (session_id.to_owned(),))
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    row_get_optional_string(&row, 0, "discuss_sessions.session_modes_json")?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(DiscussError::from)
+}
+
+/// Record the session modes a live worker reported, so they outlast the worker.
+pub(super) async fn update_session_modes(
+    conn: &Connection,
+    session_id: &str,
+    modes: &DiscussSessionModes,
+) -> Result<(), DiscussError> {
+    let json = serde_json::to_string(modes)?;
+    conn.execute(DISCUSS_SESSIONS_MODES_UPDATE_SQL, (session_id.to_owned(), json))
+        .await?;
     Ok(())
 }
 

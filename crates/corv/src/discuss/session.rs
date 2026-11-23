@@ -2,33 +2,43 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    fmt::Debug,
+    future::Future,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
-    AuthCapabilities, AuthMethod, ClientCapabilities, ContentBlock, CreateElicitationRequest,
-    CreateElicitationResponse, ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities,
-    ElicitationScope, ImageContent, InitializeRequest, LoadSessionRequest, McpServer, Meta, NewSessionRequest,
-    NewSessionResponse, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOptionValue, SessionId,
-    SessionInfo, SetSessionConfigOptionRequest, SystemPrompt, TextContent,
+    AgentCapabilities, ArchiveSessionRequest, AuthCapabilities, AuthMethod, AuthStatusRequest, CancelNotification,
+    ClientCapabilities, CloseSessionRequest, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
+    DeleteSessionRequest, ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities, ElicitationScope,
+    ImageContent, InitializeRequest, LoadSessionRequest, McpServer, Meta, NewSessionRequest, NewSessionResponse,
+    PromptRequest, RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SessionConfigOptionValue,
+    SessionId, SessionInfo, SessionOptionsRequest, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    SubagentCapabilities, SystemPrompt, TextContent, UnarchiveSessionRequest,
 };
+// The protocol version is crate-level; v1::schema does not re-export it.
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
 use agent_client_protocol::{
-    AcpAgent, Agent, ConnectionTo as RawConnectionTo, Dispatch, DynamicHandlerGuard, HandleDispatchFrom, Handled,
-    UntypedMessage, V1,
+    AcpAgent, Agent, ConnectionTo as RawConnectionTo, Dispatch, DynamicHandlerGuard, Error as AcpError,
+    HandleDispatchFrom, Handled, Responder, UntypedMessage, V1,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Deserialize;
+use serde_json::{Map, Value, from_value, to_value};
 use tokio::{
+    fs::create_dir_all,
+    select,
     sync::{Mutex, mpsc, oneshot},
-    task::JoinHandle,
+    task::{JoinHandle, spawn},
+    time::timeout,
 };
 use uuid::Uuid;
 
-use super::types::{AgentNodeTerminalResult, DiscussImageAttachment};
+use super::agent_nodes::AgentNodeTerminalResult;
+use super::types::{DiscussImageAttachment, DiscussResourceLink, DiscussSessionModes};
 use aves::auth::messages::{IssueJwtInput, RevokeJtiInput};
 use aves::auth::{AuthCapability, AuthSudoService, Jwt};
 use aves::bus::{BusMcpEndpoint, BusRpcContext, BusSudoService};
@@ -37,6 +47,9 @@ use aves::runtime::ServiceReader;
 use super::agents::{AssistantTurnBuffer, FlushPayload};
 use super::boot::DiscussMcpDomain;
 use super::config::{ConfigPreferenceReconciler, primary_agent_option_selection};
+use super::database::should_persist_assistant_turn;
+use super::error::DiscussError;
+use super::launch_types::{LaunchLimitation, SessionLaunchConfig};
 use super::library::{AgentSelectionView, ResolvedAgent};
 use super::messages::DiscussResponse;
 use super::plugins::PrimaryAgentSelection;
@@ -48,9 +61,9 @@ use super::supervisor::{
     SharedMcpRegistrations,
 };
 use super::types::{
-    DiscussConfigOption, DiscussError, DiscussMcpStatus, DiscussSessionId, DiscussStreamEvent, ElicitationRequestId,
-    LaunchLimitation, PendingElicitation, PendingPermission, PermissionRequestId, ProviderSessionInfo,
-    SessionLaunchConfig, WorkerCommand,
+    DiscussAuthAccount, DiscussAuthState, DiscussConfigOption, DiscussMcpStatus, DiscussSessionId, DiscussStreamEvent,
+    DiscussTerminalAuthMethod, ElicitationRequestId, PendingElicitation, PendingPermission, PermissionRequestId,
+    ProviderSessionInfo, WorkerCommand, auth_status_from_response,
 };
 use super::worker::{run_connected_session, run_isolated};
 
@@ -74,7 +87,7 @@ impl AgentNodeTerminalState {
         limit: &'static str,
         actual: u64,
         maximum: u64,
-    ) -> Result<Option<UntypedMessage>, agent_client_protocol::Error> {
+    ) -> Result<Option<CancelNotification>, AcpError> {
         if self.limit_error.is_some() {
             return Ok(None);
         }
@@ -83,13 +96,10 @@ impl AgentNodeTerminalState {
             actual,
             maximum,
         });
-        Ok(Some(UntypedMessage::new(
-            "session/cancel",
-            serde_json::json!({"sessionId": session_id}),
-        )?))
+        Ok(Some(CancelNotification::new(session_id.to_string())))
     }
 
-    pub(super) fn finish(&mut self, output: serde_json::Value) -> AgentNodeTerminalResult {
+    pub(super) fn finish(&mut self, output: Value) -> AgentNodeTerminalResult {
         self.limit_error
             .take()
             .map_or(AgentNodeTerminalResult::Succeeded { output }, |error| {
@@ -139,6 +149,7 @@ pub(super) struct WorkerSessionParams {
     pub(super) callback_router: Arc<Mutex<CallbackRouter>>,
     pub(super) callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
     pub(super) shared_connection: Option<ConnectionTo<Agent>>,
+    pub(super) agent_capabilities: Option<AgentCapabilities>,
     pub(super) shared_mcp_capabilities: Option<(bool, bool)>,
     /// Whether the Provider advertises `sessionCapabilities.systemPrompt`.
     pub(super) system_prompt_supported: bool,
@@ -219,6 +230,13 @@ pub(super) fn load_session_request(
     }
 }
 
+pub(super) async fn reply_unless_closed<T>(mut reply: oneshot::Sender<T>, request: impl Future<Output = T>) -> bool {
+    select! {
+        result = request => { let _ = reply.send(result); true }
+        _ = reply.closed() => false,
+    }
+}
+
 pub(super) async fn issue_worker_jwt(
     auth_service: Option<&ServiceReader<dyn AuthSudoService>>,
     discuss_session_id: DiscussSessionId,
@@ -267,10 +285,10 @@ fn explicit_elicitation_session_id(request: &CreateElicitationRequest) -> Option
 }
 
 fn elicitation_correlation_id(request: &CreateElicitationRequest) -> Option<ElicitationCorrelationId> {
-    serde_json::to_value(request)
+    to_value(request)
         .ok()?
         .get("elicitationId")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .map(ElicitationCorrelationId::new)
 }
 
@@ -325,7 +343,7 @@ impl SessionCallbackRouter {
             .map_err(|send_error| Box::new(send_error.0))
     }
 
-    async fn fail_closed(event: CallbackEvent) -> Result<(), agent_client_protocol::Error> {
+    async fn fail_closed(event: CallbackEvent) -> Result<(), AcpError> {
         match event {
             CallbackEvent::Permission { responder, .. } => {
                 responder.respond_with_internal_error("callback target is unavailable")?;
@@ -342,8 +360,8 @@ impl SessionCallbackRouter {
         &self,
         request: RequestPermissionRequest,
         target: CallbackRouteTarget,
-        responder: agent_client_protocol::Responder<RequestPermissionResponse>,
-    ) -> Result<(), agent_client_protocol::Error> {
+        responder: Responder<RequestPermissionResponse>,
+    ) -> Result<(), AcpError> {
         let event = CallbackEvent::Permission {
             request,
             responder,
@@ -361,8 +379,8 @@ impl SessionCallbackRouter {
         raw_request: UntypedMessage,
         session_id: SessionId,
         target: CallbackRouteTarget,
-        responder: agent_client_protocol::Responder<serde_json::Value>,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
+        responder: Responder<Value>,
+    ) -> Result<Handled<Dispatch>, AcpError> {
         let correlation_id = elicitation_correlation_id(&request);
         if let Some(correlation_id) = &correlation_id
             && !self
@@ -400,14 +418,11 @@ impl SessionCallbackRouter {
         Ok(Handled::Yes)
     }
 
-    async fn route_elicitation_complete(
-        &self,
-        notification: UntypedMessage,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
+    async fn route_elicitation_complete(&self, notification: UntypedMessage) -> Result<Handled<Dispatch>, AcpError> {
         let Some(correlation_id) = notification
             .params()
             .get("elicitationId")
-            .and_then(serde_json::Value::as_str)
+            .and_then(Value::as_str)
             .map(ElicitationCorrelationId::new)
         else {
             return Ok(Handled::No {
@@ -448,10 +463,10 @@ impl HandleDispatchFrom<Agent> for SessionCallbackRouter {
         &mut self,
         message: Dispatch,
         _cx: RawConnectionTo<Agent>,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
+    ) -> Result<Handled<Dispatch>, AcpError> {
         match message {
             Dispatch::Request(request, responder) if request.method() == REQUEST_PERMISSION_METHOD => {
-                match serde_json::from_value::<RequestPermissionRequest>(request.params().clone()) {
+                match from_value::<RequestPermissionRequest>(request.params().clone()) {
                     Ok(permission) => {
                         if let Some(target) = self.target_for_session(&permission.session_id).await {
                             self.route_permission(permission, target, responder.cast::<RequestPermissionResponse>())
@@ -466,7 +481,7 @@ impl HandleDispatchFrom<Agent> for SessionCallbackRouter {
             }
             Dispatch::Request(request, responder) => {
                 let raw_request = request.clone();
-                if let Ok(elicitation) = serde_json::from_value::<CreateElicitationRequest>(request.params().clone())
+                if let Ok(elicitation) = from_value::<CreateElicitationRequest>(request.params().clone())
                     && let Some(session_id) = explicit_elicitation_session_id(&elicitation)
                     && let Some(target) = self.target_for_session(&session_id).await
                 {
@@ -486,20 +501,20 @@ impl HandleDispatchFrom<Agent> for SessionCallbackRouter {
         }
     }
 
-    fn describe_chain(&self) -> impl std::fmt::Debug {
+    fn describe_chain(&self) -> impl Debug {
         "SessionCallbackRouter"
     }
 }
 
 pub(super) async fn spawn_inspector_reader_reap(reader: JoinHandle<()>) {
     reader.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(1), reader).await;
+    let _ = timeout(Duration::from_secs(1), reader).await;
 }
 
 impl Drop for AttachedInspectorReaders {
     fn drop(&mut self) {
         for (_, reader) in self.0.drain() {
-            tokio::spawn(spawn_inspector_reader_reap(reader));
+            spawn(spawn_inspector_reader_reap(reader));
         }
     }
 }
@@ -517,19 +532,20 @@ struct TerminalAuthExtension {
 }
 
 pub fn initialize_request() -> InitializeRequest {
-    let mut meta = serde_json::Map::new();
-    meta.insert("terminal-auth".to_string(), serde_json::Value::Bool(true));
+    let mut meta = Map::new();
+    meta.insert("terminal-auth".to_string(), Value::Bool(true));
+    // OpenCode's own subagent lifecycle channel (`opencode/session/child_update`); it does not
+    // implement the ACP subagents capability declared below.
+    meta.insert("opencode/child-session-updates".to_string(), Value::Bool(true));
     let capabilities = ClientCapabilities::new()
         .auth(AuthCapabilities::new().terminal(true))
         .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+        .subagents(SubagentCapabilities::new())
         .meta(meta);
     InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities)
 }
 
-pub fn terminal_auth_methods(
-    methods: &[AuthMethod],
-    launch_server: &McpServer,
-) -> Vec<super::types::DiscussTerminalAuthMethod> {
+pub fn terminal_auth_methods(methods: &[AuthMethod], launch_server: &McpServer) -> Vec<DiscussTerminalAuthMethod> {
     methods
         .iter()
         .filter_map(|method| {
@@ -540,7 +556,7 @@ pub fn terminal_auth_methods(
                 .meta
                 .as_ref()
                 .and_then(|meta| meta.get("terminal-auth"))
-                .and_then(|value| serde_json::from_value::<TerminalAuthExtension>(value.clone()).ok())
+                .and_then(|value| from_value::<TerminalAuthExtension>(value.clone()).ok())
                 .filter(|extension| !extension.command.as_os_str().is_empty());
             let (command, args, mut env, label) = if let Some(extension) = extension {
                 (
@@ -563,7 +579,7 @@ pub fn terminal_auth_methods(
                 (server.command.clone(), args, env, terminal.name.clone())
             };
             env.extend(terminal.env.clone());
-            Some(super::types::DiscussTerminalAuthMethod {
+            Some(DiscussTerminalAuthMethod {
                 id: terminal.id.to_string(),
                 name: terminal.name.clone(),
                 description: terminal.description.clone(),
@@ -621,10 +637,7 @@ pub(super) struct SessionCapabilitiesCache {
 }
 
 impl SessionCapabilitiesCache {
-    pub(super) fn from_agent_capabilities(
-        plugin: &dyn plugins::DiscussAgentPlugin,
-        caps: &agent_client_protocol::v1::schema::AgentCapabilities,
-    ) -> Self {
+    pub(super) fn from_agent_capabilities(plugin: &dyn plugins::DiscussAgentPlugin, caps: &AgentCapabilities) -> Self {
         Self {
             list: plugin.supports_session_list(caps.session_capabilities.list.is_some()),
             load: caps.load_session,
@@ -636,7 +649,7 @@ impl SessionCapabilitiesCache {
 pub(super) struct SessionWorkerFailure {
     /// Boxed so the worker's `Err` variant stays small.
     pub(super) error: Box<DiscussError>,
-    pub(super) terminal_auth_methods: Vec<super::types::DiscussTerminalAuthMethod>,
+    pub(super) terminal_auth_methods: Vec<DiscussTerminalAuthMethod>,
 }
 
 pub async fn run(agent: AcpAgent, params: WorkerSessionParams) -> Result<(), SessionWorkerFailure> {
@@ -651,8 +664,8 @@ pub async fn run(agent: AcpAgent, params: WorkerSessionParams) -> Result<(), Ses
     }
 }
 
-pub(super) async fn ensure_agents_workspace_dir(path: &std::path::Path) {
-    if let Err(error) = tokio::fs::create_dir_all(path).await {
+pub(super) async fn ensure_agents_workspace_dir(path: &Path) {
+    if let Err(error) = create_dir_all(path).await {
         panic!(
             "ACP agents workspace directory does not exist and could not be created at `{}`: {error}",
             path.display()
@@ -662,7 +675,7 @@ pub(super) async fn ensure_agents_workspace_dir(path: &std::path::Path) {
 
 pub(super) fn flush_cancelled_assistant_turn(buffer: &mut AssistantTurnBuffer) -> Option<FlushPayload> {
     let flush = buffer.flush("cancelled".to_string());
-    super::database::should_persist_assistant_turn(&flush).then_some(flush)
+    should_persist_assistant_turn(&flush).then_some(flush)
 }
 
 #[derive(Default)]
@@ -674,7 +687,7 @@ impl McpAcpCapabilityWarningState {
     pub(super) async fn publish_once(
         &mut self,
         broadcast_tx: &mpsc::Sender<DiscussResponse>,
-        discuss_session_id: super::types::DiscussSessionId,
+        discuss_session_id: DiscussSessionId,
         provider_session_id: &SessionId,
         agent_name: &str,
     ) -> Result<(), DiscussError> {
@@ -705,7 +718,7 @@ impl McpAcpCapabilityWarningState {
 
 pub(super) async fn publish_mcp_status(
     broadcast_tx: &mpsc::Sender<DiscussResponse>,
-    discuss_session_id: super::types::DiscussSessionId,
+    discuss_session_id: DiscussSessionId,
     provider_session_id: &SessionId,
     status: DiscussMcpStatus,
 ) -> Result<(), DiscussError> {
@@ -748,7 +761,7 @@ impl HandleDispatchFrom<Agent> for SessionMessageRouter {
         &mut self,
         message: Dispatch,
         _cx: RawConnectionTo<Agent>,
-    ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
+    ) -> Result<Handled<Dispatch>, AcpError> {
         let session_id: Option<SessionId> = match &message {
             // RPC callbacks keep their responder in the callback router, never in transcript data.
             Dispatch::Request(request, _)
@@ -756,10 +769,17 @@ impl HandleDispatchFrom<Agent> for SessionMessageRouter {
             {
                 None
             }
-            Dispatch::Request(request, _) | Dispatch::Notification(request) => request
+            Dispatch::Request(request, _) => request
                 .params()
                 .get("sessionId")
-                .map(|value| serde_json::from_value(value.clone()))
+                .map(|value| from_value(value.clone()))
+                .transpose()?,
+            // OpenCode's `child_update` names its owning session `rootSessionId`.
+            Dispatch::Notification(notification) => notification
+                .params()
+                .get("sessionId")
+                .or_else(|| notification.params().get("rootSessionId"))
+                .map(|value| from_value(value.clone()))
                 .transpose()?,
             Dispatch::Response(_, _) => None,
         };
@@ -776,19 +796,20 @@ impl HandleDispatchFrom<Agent> for SessionMessageRouter {
         if route_matches {
             self.update_tx
                 .send(SessionMessage::Message(message.into_protocol::<V1>()?))
-                .map_err(|_| agent_client_protocol::Error::internal_error())?;
+                .map_err(|_| AcpError::internal_error())?;
             return Ok(Handled::Yes);
         }
         Ok(Handled::No { message, retry: false })
     }
 
-    fn describe_chain(&self) -> impl std::fmt::Debug {
+    fn describe_chain(&self) -> impl Debug {
         format!("SessionMessageRouter({})", self.session_id)
     }
 }
 
 pub struct WorkerSession {
     session_id: SessionId,
+    pub(super) modes: Option<DiscussSessionModes>,
     route_target: CallbackRouteTarget,
     connection: ConnectionTo<Agent>,
     update_tx: mpsc::UnboundedSender<SessionMessage>,
@@ -806,8 +827,8 @@ impl WorkerSession {
         callback_router: Arc<Mutex<CallbackRouter>>,
         callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
         callback_tx: Option<mpsc::Sender<CallbackEvent>>,
-    ) -> Result<Self, agent_client_protocol::Error> {
-        let NewSessionResponse { session_id, .. } = response;
+    ) -> Result<Self, AcpError> {
+        let NewSessionResponse { session_id, modes, .. } = response;
         let (update_tx, update_rx) = mpsc::unbounded_channel();
         let handler_registration = connection.add_dynamic_handler(SessionMessageRouter::new(
             session_id.clone(),
@@ -818,21 +839,22 @@ impl WorkerSession {
         if let (Some(routes), Some(callback_tx)) = (&callback_routes, callback_tx) {
             let registered = routes
                 .try_lock()
-                .map_err(|_| agent_client_protocol::Error::internal_error())?
+                .map_err(|_| AcpError::internal_error())?
                 .register_queue(route_target.clone(), callback_tx);
             if !registered {
-                return Err(agent_client_protocol::Error::internal_error());
+                return Err(AcpError::internal_error());
             }
         }
         if !callback_router
             .try_lock()
-            .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .map_err(|_| AcpError::internal_error())?
             .register_session(session_id.clone(), route_target.clone())
         {
-            return Err(agent_client_protocol::Error::internal_error());
+            return Err(AcpError::internal_error());
         }
         Ok(Self {
             session_id,
+            modes: modes.map(Into::into),
             route_target,
             connection,
             update_tx,
@@ -851,7 +873,89 @@ impl WorkerSession {
         &self.connection
     }
 
-    pub fn send_prompt(&mut self, prompt: impl ToString) -> Result<(), agent_client_protocol::Error> {
+    /// Best-effort `session/close` when the agent advertises it; a failure is only logged.
+    pub(super) async fn close(&self, close_supported: bool) {
+        if close_supported {
+            let request = self
+                .connection
+                .send_request(CloseSessionRequest::new(self.session_id.clone()));
+            if let result @ (Err(_) | Ok(Err(_))) = timeout(Duration::from_secs(5), request.block_task()).await {
+                tracing::warn!(route = ?self.route_target, ?result, "ACP session close failed");
+            }
+        }
+    }
+
+    pub(super) fn cancel(&self, notification: CancelNotification) -> Result<(), AcpError> {
+        self.connection.send_notification(notification)
+    }
+
+    pub(super) async fn set_mode(&mut self, mode_id: String) -> Result<(), DiscussError> {
+        if self.modes.is_none() {
+            return Err(DiscussError::UnsupportedCapability {
+                capability: "session_modes".to_string(),
+            });
+        }
+        self.connection
+            .send_request(SetSessionModeRequest::new(self.session_id.clone(), mode_id.clone()))
+            .block_task()
+            .await
+            .map_err(DiscussError::from)?;
+        if let Some(modes) = &mut self.modes {
+            modes.current_mode_id = mode_id;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn set_archived(&self, supported: bool, archived: bool) -> Result<(), DiscussError> {
+        if !supported {
+            return Ok(());
+        }
+        if archived {
+            self.connection
+                .send_request(ArchiveSessionRequest::new(self.session_id.clone()))
+                .block_task()
+                .await
+                .map(|_| ())
+                .map_err(DiscussError::from)
+        } else {
+            self.connection
+                .send_request(UnarchiveSessionRequest::new(self.session_id.clone()))
+                .block_task()
+                .await
+                .map(|_| ())
+                .map_err(DiscussError::from)
+        }
+    }
+
+    pub(super) async fn delete(&self, supported: bool) -> Result<(), DiscussError> {
+        if !supported {
+            return Ok(());
+        }
+        let request = self
+            .connection
+            .send_request(DeleteSessionRequest::new(self.session_id.clone()));
+        match timeout(Duration::from_secs(5), request.block_task()).await {
+            Ok(result) => result.map(|_| ()).map_err(DiscussError::from),
+            Err(error) => Err(channel_send_error("delete_session.timeout", error.to_string())),
+        }
+    }
+
+    pub(super) async fn auth_status(
+        &self,
+        supported: bool,
+    ) -> Result<(DiscussAuthState, Vec<DiscussAuthAccount>), DiscussError> {
+        if !supported {
+            return Ok((DiscussAuthState::Unknown, Vec::new()));
+        }
+        self.connection
+            .send_request(AuthStatusRequest::new())
+            .block_task()
+            .await
+            .map(auth_status_from_response)
+            .map_err(DiscussError::from)
+    }
+
+    pub fn send_prompt(&mut self, prompt: impl ToString) -> Result<(), AcpError> {
         self.send_blocks(vec![prompt.to_string().into()])
     }
 
@@ -859,42 +963,98 @@ impl WorkerSession {
         &mut self,
         text: String,
         images: Vec<DiscussImageAttachment>,
-    ) -> Result<(), agent_client_protocol::Error> {
-        let mut blocks = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
-        if !text.is_empty() {
-            blocks.push(ContentBlock::Text(TextContent::new(text)));
-        }
-        blocks.extend(
-            images
-                .into_iter()
-                .map(|image| ContentBlock::Image(ImageContent::new(image.data, image.mime_type))),
-        );
-        self.send_blocks(blocks)
+        resource_links: Vec<DiscussResourceLink>,
+    ) -> Result<(), AcpError> {
+        self.send_blocks(user_turn_blocks(text, images, resource_links))
     }
 
-    fn send_blocks(&mut self, blocks: Vec<ContentBlock>) -> Result<(), agent_client_protocol::Error> {
+    fn send_blocks(&mut self, blocks: Vec<ContentBlock>) -> Result<(), AcpError> {
         self.connection
-            .send_request_to(
-                Agent,
-                agent_client_protocol::v1::schema::PromptRequest::new(self.session_id.clone(), blocks),
-            )
+            .send_request_to(Agent, PromptRequest::new(self.session_id.clone(), blocks))
             .on_receiving_result({
                 let update_tx = self.update_tx.clone();
                 async move |result| {
                     let response = result?;
                     update_tx
                         .send(SessionMessage::PromptResponse(Ok(response)))
-                        .map_err(|_| agent_client_protocol::Error::internal_error())?;
+                        .map_err(|_| AcpError::internal_error())?;
                     Ok(())
                 }
             })
     }
 
-    pub async fn read_update(&mut self) -> Result<SessionMessage, agent_client_protocol::Error> {
+    pub async fn read_update(&mut self) -> Result<SessionMessage, AcpError> {
         self.update_rx
             .recv()
             .await
-            .ok_or_else(agent_client_protocol::Error::internal_error)
+            .ok_or_else(AcpError::internal_error)
+    }
+}
+
+fn user_turn_blocks(
+    text: String,
+    images: Vec<DiscussImageAttachment>,
+    resource_links: Vec<DiscussResourceLink>,
+) -> Vec<ContentBlock> {
+    let mut blocks = Vec::with_capacity(images.len() + resource_links.len() + usize::from(!text.is_empty()));
+    if !text.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(text)));
+    }
+    blocks.extend(
+        resource_links
+            .into_iter()
+            .map(|link| ContentBlock::ResourceLink(ResourceLink::new(link.name, link.uri).mime_type(link.mime_type))),
+    );
+    blocks.extend(
+        images
+            .into_iter()
+            .map(|image| ContentBlock::Image(ImageContent::new(image.data, image.mime_type))),
+    );
+    blocks
+}
+
+#[cfg(test)]
+mod user_turn_tests {
+    use super::*;
+    use crate::discuss::types::DiscussAuthState;
+    use agent_client_protocol::v1::schema::AuthState;
+
+    #[test]
+    fn authentication_states_map_unknown_extensions() {
+        assert_eq!(
+            DiscussAuthState::from(AuthState::Authenticated),
+            DiscussAuthState::Authenticated
+        );
+        assert_eq!(
+            DiscussAuthState::from(AuthState::Unauthenticated),
+            DiscussAuthState::Unauthenticated
+        );
+        assert_eq!(
+            DiscussAuthState::from(AuthState::NotRequired),
+            DiscussAuthState::NotRequired
+        );
+        assert_eq!(DiscussAuthState::from(AuthState::Unknown), DiscussAuthState::Unknown);
+        assert_eq!(
+            DiscussAuthState::from(AuthState::Other("_future".into())),
+            DiscussAuthState::Unknown
+        );
+    }
+
+    #[test]
+    fn resource_links_follow_text() {
+        let blocks = user_turn_blocks(
+            "hello".to_string(),
+            Vec::new(),
+            vec![DiscussResourceLink {
+                uri: "file:///example".to_string(),
+                name: "example".to_string(),
+                mime_type: Some("text/plain".to_string()),
+            }],
+        );
+        assert!(matches!(&blocks[0], ContentBlock::Text(text) if text.text == "hello"));
+        assert!(
+            matches!(&blocks[1], ContentBlock::ResourceLink(link) if link.uri == "file:///example" && link.mime_type.as_deref() == Some("text/plain"))
+        );
     }
 }
 
@@ -916,9 +1076,12 @@ pub(super) struct OpenConfiguredSessionOptions {
     pub(super) launch_config: Option<SessionLaunchConfig>,
     pub(super) reconnect_session_id: Option<SessionId>,
     pub(super) cwd: PathBuf,
+    pub(super) options_supported: bool,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) primary_agent: Option<ResolvedAgent>,
     pub(super) system_prompt_supported: bool,
+    /// The agent advertises `session/close`, so a session that fails setup is closed again.
+    pub(super) close_supported: bool,
     pub(super) resolved_config: ConfigSettings,
     pub(super) persisted_config_options: Vec<DiscussConfigOption>,
 }
@@ -983,10 +1146,11 @@ pub(super) async fn open_configured_session(
     });
     let mut open = PrimaryAgentOpen::for_selection(primary_agent.as_ref(), options.system_prompt_supported)?;
     open.meta = plugins::merge_metadata(open.meta, options.launch_meta)?;
-    let (session, initial_config_options, initial_config_metadata) =
+    let options_cwd = options.cwd.clone();
+    let (session, mut initial_config_options, initial_config_metadata) =
         if let Some(session_id) = options.reconnect_session_id {
             // Attach before loading: the provider replays history as `session/update` before it answers.
-            let session = WorkerSession::attach(
+            let mut session = WorkerSession::attach(
                 connection.clone(),
                 NewSessionResponse::new(session_id.clone()),
                 callback_target,
@@ -1002,6 +1166,7 @@ pub(super) async fn open_configured_session(
                 )
                 .block_task()
                 .await?;
+            session.modes = response.modes.map(Into::into);
             (session, response.config_options, None)
         } else {
             let session_response = connection
@@ -1029,6 +1194,17 @@ pub(super) async fn open_configured_session(
             )?;
             (session, initial_config_options, initial_config_metadata)
         };
+    let close_supported = options.close_supported;
+    // A session that fails configuration is closed again rather than left open on the provider.
+    let configured = async {
+    if initial_config_options.as_ref().is_none_or(Vec::is_empty) && options.options_supported {
+        let response = session
+            .connection()
+            .send_request(SessionOptionsRequest::new(options_cwd))
+            .block_task()
+            .await?;
+        initial_config_options = response.config_options;
+    }
     tracing::debug!(provider = provider_name, acp_session_id = %session.session_id(), "ACP session open response received");
 
     let normalized_options =
@@ -1103,13 +1279,22 @@ pub(super) async fn open_configured_session(
             applied_settings.insert(config_id, value);
         }
     }
-    Ok(ConfiguredSession {
-        session,
-        config_options: provider_options,
-        applied_settings,
-        supports_config_updates,
-        launch_limitations,
-    })
+    Ok::<_, DiscussError>((provider_options, applied_settings, supports_config_updates, launch_limitations))
+    }
+    .await;
+    match configured {
+        Ok((config_options, applied_settings, supports_config_updates, launch_limitations)) => Ok(ConfiguredSession {
+            session,
+            config_options,
+            applied_settings,
+            supports_config_updates,
+            launch_limitations,
+        }),
+        Err(error) => {
+            session.close(close_supported).await;
+            Err(error)
+        }
+    }
 }
 
 pub(super) fn channel_send_error(operation: &'static str, cause: impl Into<String>) -> DiscussError {
@@ -1123,11 +1308,15 @@ pub(super) fn channel_send_error(operation: &'static str, cause: impl Into<Strin
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_library::library;
     use super::*;
     use agent_client_protocol::v1::schema::{RequestPermissionOutcome, ToolCallUpdate, ToolCallUpdateFields};
     use agent_client_protocol::{Channel, Client};
+    use serde_json::json;
+    use tokio::sync::mpsc::error::TryRecvError;
+    use tokio::test as async_test;
 
-    #[tokio::test]
+    #[async_test]
     async fn permission_bypasses_the_transcript_router_even_when_it_runs_first() {
         let session_id = SessionId::from("provider-session".to_owned());
         let target = CallbackRouteTarget::Chat {
@@ -1151,7 +1340,7 @@ mod tests {
             ToolCallUpdate::new("tool-call".to_owned(), ToolCallUpdateFields::new()),
             Vec::new(),
         );
-        let agent = tokio::spawn(
+        let agent = spawn(
             Agent
                 .v1()
                 .connect_with(agent_side, async move |connection| {
@@ -1178,12 +1367,12 @@ mod tests {
                     panic!("expected a permission callback");
                 };
                 assert_eq!(request.session_id, session_id);
-                assert!(matches!(updates.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                assert!(matches!(updates.try_recv(), Err(TryRecvError::Empty)));
                 responder.respond(RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled))?;
                 received.await.expect("provider received the response");
                 Ok(())
             });
-        tokio::time::timeout(Duration::from_secs(2), client)
+        timeout(Duration::from_secs(2), client)
             .await
             .expect("permission request was not routed")
             .expect("client connection");
@@ -1192,10 +1381,7 @@ mod tests {
 
     #[test]
     fn primary_agent_open_shapes_the_session_request_per_selection() {
-        let agent = super::super::test_library::library()
-            .agents_for()
-            .next()
-            .expect("agent");
+        let agent = library().agents_for().next().expect("agent");
 
         let open = PrimaryAgentOpen::for_selection(
             Some(&(
@@ -1218,7 +1404,7 @@ mod tests {
             Err(DiscussError::UnsupportedCapability { ref capability }) if capability == "system_prompt"
         ));
 
-        let meta = Meta::from_iter([("agentProfile".to_string(), serde_json::json!("leader"))]);
+        let meta = Meta::from_iter([("agentProfile".to_string(), json!("leader"))]);
         let open = PrimaryAgentOpen::for_selection(
             Some(&(
                 AgentSelectionView::from_builtin(agent),
@@ -1243,7 +1429,7 @@ mod tests {
 
     #[test]
     fn form_elicitation_routes_by_session_without_url_correlation() {
-        let request: CreateElicitationRequest = serde_json::from_value(serde_json::json!({
+        let request: CreateElicitationRequest = from_value(json!({
             "sessionId": "ses_opencode",
             "toolCallId": "call_question",
             "mode": "form",
@@ -1267,7 +1453,7 @@ mod tests {
 
     #[test]
     fn request_scoped_elicitation_has_no_session_route() {
-        let request: CreateElicitationRequest = serde_json::from_value(serde_json::json!({
+        let request: CreateElicitationRequest = from_value(json!({
             "requestId": 12,
             "mode": "form",
             "message": "Which package manager?",

@@ -1,14 +1,19 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
-use serde_json::{to_string, to_value};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, to_string, to_value};
+use specta::Type;
 use tokio::{
-    sync::{Mutex, oneshot::error::TryRecvError},
+    sync::{
+        Mutex, mpsc,
+        oneshot::{self, error::TryRecvError},
+    },
     time::timeout,
 };
 
@@ -24,13 +29,147 @@ use aves::runtime::ServiceReader;
 
 use super::actor::Actor;
 use super::domain::{DiscussAgentNodeLifecycleService, DiscussStreamingService};
+use super::error::DiscussError;
+use super::launch_types::SessionLaunchConfig;
 use super::messages::{
     CancelAgentExecutionInput, CancelSessionInput, DiscussResponse, StartAgentInput, TickAgentInput,
 };
-use super::types::{
-    AgentNodeTerminalResult, AgentNodeTickResult, DiscussConfigValues, DiscussError, DiscussSessionId,
-    SessionLaunchConfig, TaskSessionStart, WorkspaceCopySourcePort, resolve_agent_node_limits,
-};
+use super::types::{DiscussConfigValues, DiscussSessionId};
+
+/// Bounds for a non-interactive AgentNode session, resolved by Discuss.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNodeSessionLimits {
+    pub max_turns: u64,
+    pub max_tool_calls: u64,
+    pub max_duration_secs: u64,
+}
+
+/// ACP work for a Flow AgentNode after its execution limits have been validated.
+pub(super) struct TaskSessionStart {
+    pub(super) node_execution_id: NodeExecutionId,
+    pub(super) launch_config: Option<SessionLaunchConfig>,
+    pub(super) provider_name: String,
+    pub(super) agent_name: String,
+    pub(super) session_name: Option<String>,
+    pub(super) config_overrides: DiscussConfigValues,
+    pub(super) application_mcp_enabled: bool,
+    pub(super) prompt: String,
+    pub(super) session_cwd: PathBuf,
+    pub(super) limits: AgentNodeSessionLimits,
+    pub(super) node_token: Jwt,
+    pub(super) flow_mcp_endpoints: Option<Vec<BusMcpEndpoint>>,
+}
+
+/// Real ACP terminal result for a non-interactive task session.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub(super) enum AgentNodeTerminalResult {
+    Succeeded { output: Value },
+    Failed { error: DiscussError },
+}
+
+/// Immediate tick result while a task session runs or completes.
+#[derive(Clone, Debug, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum AgentNodeTickResult {
+    Running,
+    Succeeded { output: Value },
+    Failed { error: DiscussError },
+}
+
+impl From<AgentNodeTerminalResult> for AgentNodeTickResult {
+    fn from(terminal: AgentNodeTerminalResult) -> Self {
+        match terminal {
+            AgentNodeTerminalResult::Succeeded { output } => Self::Succeeded { output },
+            AgentNodeTerminalResult::Failed { error } => Self::Failed { error },
+        }
+    }
+}
+
+pub(super) fn resolve_agent_node_limits(
+    max_turns: Option<i64>,
+    max_tool_calls: Option<i64>,
+    max_duration_secs: Option<i64>,
+) -> Result<AgentNodeSessionLimits, DiscussError> {
+    const DEFAULT_MAX_TURNS: u64 = 1;
+    const DEFAULT_MAX_TOOL_CALLS: u64 = 100;
+    const DEFAULT_MAX_DURATION_SECS: u64 = 1_800;
+    const MAX_TURNS: u64 = 100;
+    const MAX_TOOL_CALLS: u64 = 1_000;
+    const MAX_DURATION_SECS: u64 = 1_800;
+
+    fn resolve(name: &'static str, value: Option<i64>, default: u64, maximum: u64) -> Result<u64, DiscussError> {
+        let Some(value) = value else {
+            return Ok(default);
+        };
+        let resolved = u64::try_from(value).map_err(|_| DiscussError::AgentNodeLimitInvalid {
+            limit: name.to_owned(),
+            value,
+            maximum,
+        })?;
+        if resolved == 0 || resolved > maximum {
+            return Err(DiscussError::AgentNodeLimitInvalid {
+                limit: name.to_owned(),
+                value,
+                maximum,
+            });
+        }
+        Ok(resolved)
+    }
+
+    Ok(AgentNodeSessionLimits {
+        max_turns: resolve("maxTurns", max_turns, DEFAULT_MAX_TURNS, MAX_TURNS)?,
+        max_tool_calls: resolve("maxToolCalls", max_tool_calls, DEFAULT_MAX_TOOL_CALLS, MAX_TOOL_CALLS)?,
+        max_duration_secs: resolve(
+            "maxDuration",
+            max_duration_secs,
+            DEFAULT_MAX_DURATION_SECS,
+            MAX_DURATION_SECS,
+        )?,
+    })
+}
+
+/// Actor-resolved copy selections for all Providers referenced by a Flow graph.
+#[derive(Clone)]
+pub(super) struct WorkspaceCopySources {
+    pub(super) agents_workspace: PathBuf,
+    pub(super) sources_by_provider: BTreeMap<String, Vec<String>>,
+}
+
+pub(super) struct WorkspaceCopySourceRequest {
+    pub(super) provider_names: BTreeSet<String>,
+    pub(super) reply_to: oneshot::Sender<Result<WorkspaceCopySources, DiscussError>>,
+}
+
+pub(super) struct ActorInboundPorts {
+    pub(super) workspace_copy_source_rx: mpsc::Receiver<WorkspaceCopySourceRequest>,
+}
+
+/// Discuss-owned, actor-serialized source selection for fresh Flow workspaces.
+pub(super) struct WorkspaceCopySourcePort {
+    sender: mpsc::Sender<WorkspaceCopySourceRequest>,
+}
+
+impl WorkspaceCopySourcePort {
+    pub(super) fn channel(capacity: usize) -> (Arc<Self>, mpsc::Receiver<WorkspaceCopySourceRequest>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (Arc::new(Self { sender }), receiver)
+    }
+
+    /// Resolve effective relative paths without reading or mutating the workspace.
+    pub(super) async fn resolve(&self, provider_names: BTreeSet<String>) -> Result<WorkspaceCopySources, DiscussError> {
+        let (reply_to, reply_rx) = oneshot::channel();
+        self.sender
+            .send(WorkspaceCopySourceRequest {
+                provider_names,
+                reply_to,
+            })
+            .await
+            .map_err(|_| DiscussError::ShuttingDown)?;
+        reply_rx.await.map_err(|_| DiscussError::ShuttingDown)?
+    }
+}
 
 impl Actor {
     // The argument list mirrors the wire request payload fields.

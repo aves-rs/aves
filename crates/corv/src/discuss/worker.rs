@@ -1,20 +1,23 @@
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::pending, path::Path, sync::Arc, time::Duration};
 
 use agent_client_protocol::v1::schema::{
-    CreateElicitationRequest, CreateElicitationResponse, ElicitationAction, ElicitationMode, ListSessionsRequest,
-    McpServer, NewSessionResponse, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    SessionConfigOptionValue, SessionId, SetSessionConfigOptionRequest, SetSessionTitleRequest,
+    AgentCapabilities, CancelNotification, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
+    ElicitationMode, ListSessionsRequest, McpServer, NewSessionResponse, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, SessionConfigOptionValue, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionTitleRequest,
 };
 use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
-use agent_client_protocol::{AcpAgent, Agent, Client, DynamicHandlerGuard, Responder, UntypedMessage};
+use agent_client_protocol::{AcpAgent, Agent, Client, DynamicHandlerGuard, Error as AcpError, Responder};
+use serde_json::{Value, from_value, json};
 use tokio::{
+    select,
     sync::{Mutex, mpsc, oneshot},
-    task::JoinHandle,
-    time::Instant,
+    task::{JoinHandle, spawn},
+    time::{Instant, sleep_until},
 };
 
-use super::types::DiscussCompletionKind;
-use super::types::{AgentNodeSessionLimits, AgentNodeTerminalResult};
+use super::agent_nodes::{AgentNodeSessionLimits, AgentNodeTerminalResult};
+use super::report_types::DiscussCompletionKind;
 use super::usage::UsageTurnAccumulator;
 use aves::auth::Jwt;
 use aves::bus::{BusMcpEndpoint, BusRpcContext, BusSudoService};
@@ -29,28 +32,32 @@ use super::boot::DiscussMcpDomain;
 use super::config::merged_config_preferences;
 use super::database::{
     LaunchLimitationsPersistence, PersistenceJob, enqueue_persistence_job, enqueue_utility_persistence,
-    spawn_persistence_queue,
+    should_persist_assistant_turn, spawn_persistence_queue,
 };
 use super::elicitation::content_to_sdk_answer;
+use super::error::DiscussError;
+use super::launch_types::LaunchLimitation;
 use super::mcp_direct::McpAcpShim;
 use super::mcp_relay::{McpHttpLease, descriptors_for_registration, endpoint_to_acp_descriptor};
-use super::plugins::{self, DiscussAgentPlugin, PluginCaptureState};
+use super::messages::DiscussResponse;
+use super::plugins::{self, ConfigSettings, DiscussAgentPlugin, PluginCaptureState};
 use super::session::{
     AgentNodeTerminalState, AttachedInspectorReaders, McpAcpCapabilityWarningState, McpTransportSelection,
     OpenConfiguredSessionOptions, PendingElicitationCancel, PendingElicitationRegistration, PendingPermissionCancel,
     PendingPermissionRegistration, SessionCallbackRouter, SessionCapabilitiesCache, SessionWorkerFailure, WorkerReady,
     WorkerSession, WorkerSessionParams, channel_send_error, ensure_agents_workspace_dir,
     flush_cancelled_assistant_turn, initialize_request, load_session_request, mcp_status_for_transport,
-    open_configured_session, provider_sessions_from_schema, publish_mcp_status, select_mcp_transport,
-    spawn_inspector_reader_reap, terminal_auth_methods,
+    open_configured_session, provider_sessions_from_schema, publish_mcp_status, reply_unless_closed,
+    select_mcp_transport, spawn_inspector_reader_reap, terminal_auth_methods,
 };
 use super::supervisor::{
     CallbackEvent, CallbackRouteRegistry, CallbackRouteTarget, CallbackRouter, McpRegistrationClaim,
 };
 use super::types::{
-    DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload, DiscussError,
-    DiscussImageAttachment, DiscussPermissionOption, DiscussSessionId, DiscussStreamEvent, DiscussUtilityPayload,
-    DiscussUtilityUpdate, PendingPermission, ProviderSessionInfo, WorkerCommand,
+    DiscussConfigOption, DiscussElicitationAnswer, DiscussElicitationClassification, DiscussElicitationRequestPayload,
+    DiscussImageAttachment, DiscussPermissionOption, DiscussResourceLink, DiscussSessionId, DiscussSessionModes,
+    DiscussStreamEvent, DiscussUtilityPayload, DiscussUtilityUpdate, PendingPermission, ProviderSessionInfo,
+    WorkerCommand,
 };
 
 pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -> Result<(), SessionWorkerFailure> {
@@ -77,6 +84,7 @@ pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -
                 terminal_auth_methods(&init_response.auth_methods, &auth_launch_server);
 
             let mut params = params;
+            params.agent_capabilities = Some(init_response.agent_capabilities.clone());
             params
                 .capabilities_update_tx
                 .send((
@@ -85,10 +93,7 @@ pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -
                 ))
                 .await
                 .map_err(|error| {
-                    agent_client_protocol::Error::into_internal_error(channel_send_error(
-                        "isolated.capabilities_update",
-                        error.to_string(),
-                    ))
+                    AcpError::into_internal_error(channel_send_error("isolated.capabilities_update", error.to_string()))
                 })?;
             params.callback_routes = Some(callback_routes);
             params.shared_mcp_capabilities = Some((
@@ -119,14 +124,14 @@ pub(super) async fn run_isolated(agent: AcpAgent, params: WorkerSessionParams) -
 pub(super) async fn run_connected_session(
     params: WorkerSessionParams,
     connection: ConnectionTo<Agent>,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     let setup = prepare_worker_session(&params, connection).await?;
     let WorkerSessionParams {
         launch_config: _launch_config,
         mut launch_limitations,
         stream_tx,
         discuss_session_id,
-        auth_launch_server,
+        auth_launch_server: _,
         session_name,
         agent_name,
         next_turn_position,
@@ -149,6 +154,7 @@ pub(super) async fn run_connected_session(
         transient_connectivity,
         provider_title,
         title_supported,
+        agent_capabilities,
         ..
     } = params;
     let WorkerSessionSetup {
@@ -162,6 +168,7 @@ pub(super) async fn run_connected_session(
         opened,
     } = setup;
     let mut session = opened.session;
+    let capabilities = agent_capabilities.unwrap_or_default();
     if let Some(title) = provider_title {
         push_provider_title(session.connection(), session.session_id(), title_supported, title).await;
     }
@@ -178,7 +185,7 @@ pub(super) async fn run_connected_session(
     let mut position_allocator = TranscriptPositionAllocator::new(next_turn_position);
     let agent_plugin = plugins::for_agent(&agent_name);
     launch_limitations.extend(opened.launch_limitations);
-    acknowledge_worker_ready(
+    let acknowledged = acknowledge_worker_ready(
         &persistence_queue,
         discuss_session_id,
         session.session_id(),
@@ -190,14 +197,16 @@ pub(super) async fn run_connected_session(
         opened.supports_config_updates,
         launch_limitations,
     )
-    .await?;
+    .await;
+    if let Err(error) = acknowledged {
+        session
+            .close(session_close_supported(Some(&capabilities)))
+            .await;
+        return Err(error);
+    }
 
     let mut capture_state = PluginCaptureState::for_plugin(agent_plugin);
     tracing::info!(%discuss_session_id, acp_session_id = %session.session_id(), "ACP session started and ready for a prompt");
-    let (resolved_subagent_tx, mut resolved_subagent_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
-    if let PluginCaptureState::OpenCode(state) = &mut capture_state {
-        state.configure_db_lookup(&auth_launch_server, session.session_id(), resolved_subagent_tx);
-    }
     let mut buffer = AssistantTurnBuffer::default();
     let mut usage = UsageTurnAccumulator::new(discuss_session_id.to_string(), agent_name.clone(), next_usage_ordinal);
     usage.set_pricing(price_index, agent_plugin);
@@ -213,7 +222,6 @@ pub(super) async fn run_connected_session(
     let mut state = ConnectedLoopState {
         session: &mut session,
         callback_rx: &mut callback_rx,
-        resolved_subagent_rx: &mut resolved_subagent_rx,
         worker_command_rx: &mut worker_command_rx,
         mcp_claim: &mut mcp_claim,
         capture_state: &mut capture_state,
@@ -232,6 +240,7 @@ pub(super) async fn run_connected_session(
         agent_node_deadline: &mut agent_node_deadline,
         suppress_transcript: &mut suppress_transcript,
         title_supported,
+        capabilities: &capabilities,
     };
     let result = pump_connected_session(
         &mut state,
@@ -251,6 +260,9 @@ pub(super) async fn run_connected_session(
         &callback_tx,
     )
     .await;
+    session
+        .close(session_close_supported(Some(&capabilities)))
+        .await;
     if result.is_err() {
         usage
             .finish(DiscussCompletionKind::Failed, None, &persistence_queue)
@@ -270,14 +282,13 @@ pub(super) async fn run_connected_session(
 struct ConnectedLoopState<'a> {
     session: &'a mut WorkerSession,
     callback_rx: &'a mut mpsc::Receiver<CallbackEvent>,
-    resolved_subagent_rx: &'a mut mpsc::Receiver<super::types::DiscussSubagentRecord>,
     worker_command_rx: &'a mut mpsc::Receiver<WorkerCommand>,
     mcp_claim: &'a mut Option<McpRegistrationClaim>,
     capture_state: &'a mut PluginCaptureState,
     buffer: &'a mut AssistantTurnBuffer,
     usage: &'a mut UsageTurnAccumulator,
-    latest_config_options: &'a mut Vec<super::types::DiscussConfigOption>,
-    session_settings: &'a mut super::plugins::ConfigSettings,
+    latest_config_options: &'a mut Vec<DiscussConfigOption>,
+    session_settings: &'a mut ConfigSettings,
     position_allocator: &'a mut TranscriptPositionAllocator,
     attached_readers: &'a mut AttachedInspectorReaders,
     awaiting_turn: &'a mut bool,
@@ -289,6 +300,7 @@ struct ConnectedLoopState<'a> {
     agent_node_deadline: &'a mut Option<Instant>,
     suppress_transcript: &'a mut bool,
     title_supported: bool,
+    capabilities: &'a AgentCapabilities,
 }
 
 #[expect(
@@ -311,11 +323,10 @@ async fn pump_connected_session(
     callback_router: &Arc<Mutex<CallbackRouter>>,
     callback_routes: &Option<Arc<Mutex<CallbackRouteRegistry>>>,
     callback_tx: &mpsc::Sender<CallbackEvent>,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     let ConnectedLoopState {
         session,
         callback_rx,
-        resolved_subagent_rx,
         worker_command_rx,
         mcp_claim,
         capture_state,
@@ -334,11 +345,20 @@ async fn pump_connected_session(
         agent_node_deadline,
         suppress_transcript,
         title_supported,
+        capabilities,
     } = state;
     loop {
-        tokio::select! {
+        select! {
             update = session.read_update() => {
                 let agent_node_was_active = agent_node_terminal.is_some();
+                if let Ok(update) = &update
+                    && let SessionMessage::Message(dispatch) = update
+                    && let Ok(message) = dispatch.to_untyped_message()
+                    && message.method() == "session/update"
+                    && let Ok(notification) = from_value::<SessionNotification>(message.params().clone())
+                {
+                    update_current_mode(&mut session.modes, &notification.update);
+                }
                 handle_session_update(
                     session,
                     stream_tx,
@@ -359,14 +379,19 @@ async fn pump_connected_session(
                     agent_node_terminal_state,
                     agent_node_deadline,
                 ).await?;
+                // One update can change several subagents; the capture returned the first.
+                while let Some(subagent) = capture_state.next_subagent() {
+                    forward_subagent(subagent, stream_tx, discuss_session_id, session.session_id(), persistence_queue)
+                        .await?;
+                }
                 if agent_node_was_active && agent_node_terminal.is_none() {
                     break;
                 }
             }
             _ = async {
                 match **agent_node_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
+                    Some(deadline) => sleep_until(deadline).await,
+                    None => pending().await,
                 }
             } => {
                 handle_agent_node_deadline(
@@ -376,16 +401,6 @@ async fn pump_connected_session(
                     **agent_node_limits,
                     agent_node_terminal_state,
                 )?;
-            }
-            Some(subagent) = resolved_subagent_rx.recv() => {
-                forward_resolved_subagent(
-                    subagent,
-                    stream_tx,
-                    discuss_session_id,
-                    session.session_id(),
-                    persistence_queue,
-                )
-                .await?;
             }
             Some(callback) = callback_rx.recv() => {
                 dispatch_callback(
@@ -403,7 +418,7 @@ async fn pump_connected_session(
             command = worker_command_rx.recv() => {
                 match command {
                     None | Some(WorkerCommand::Stop) => break,
-                    Some(WorkerCommand::SendUserTurn { text, images, reply }) => {
+                    Some(WorkerCommand::SendUserTurn { text, images, resource_links, reply }) => {
                         if **awaiting_turn && let Some(claim) = &mut **mcp_claim {
                             refresh_stale_mcp_registration(session, agents_workspace, mcp_descriptors, claim).await;
                         }
@@ -419,6 +434,7 @@ async fn pump_connected_session(
                             },
                             text,
                             images,
+                            resource_links,
                             persistence_queue,
                             discuss_session_id,
                             reply,
@@ -473,7 +489,7 @@ async fn pump_connected_session(
                         .await?;
                     }
                     Some(WorkerCommand::SetConfigOption { config_id, value, reply }) => {
-                        let result = persist_set_config_option(
+                        let request = persist_set_config_option(
                             session,
                             config_id,
                             value,
@@ -481,8 +497,25 @@ async fn pump_connected_session(
                             latest_config_options,
                             session_settings,
                             persistence_queue,
-                        )
-                        .await;
+                        );
+                        if !reply_unless_closed(reply, request).await { continue; }
+                    }
+                    Some(WorkerCommand::GetSessionModes { reply }) => {
+                        let _ = reply.send(session.modes.clone());
+                    }
+                    Some(WorkerCommand::SetSessionMode { mode_id, reply }) => {
+                        if !reply_unless_closed(reply, session.set_mode(mode_id)).await { continue; }
+                    }
+                    Some(WorkerCommand::SetArchived { archived, reply }) => {
+                        let result = session.set_archived(capabilities.session_capabilities.archive.is_some(), archived).await;
+                        let _ = reply.send(result);
+                    }
+                    Some(WorkerCommand::DeleteSession { reply }) => {
+                        let result = session.delete(capabilities.session_capabilities.delete.is_some()).await;
+                        let _ = reply.send(result);
+                    }
+                    Some(WorkerCommand::GetAuthStatus { reply }) => {
+                        let result = session.auth_status(capabilities.auth.status.is_some()).await;
                         let _ = reply.send(result);
                     }
                     Some(WorkerCommand::SetTitle { title }) => {
@@ -492,7 +525,7 @@ async fn pump_connected_session(
                         let _ = reply.send(list_provider_sessions(session).await);
                     }
                     Some(WorkerCommand::LoadProviderSession { acp_session_id, reply }) => {
-                        let _ = reply.send(load_provider_session(session, &acp_session_id, agents_workspace).await);
+                        if !reply_unless_closed(reply, load_provider_session(session, &acp_session_id, agents_workspace)).await { continue; }
                     }
                     Some(WorkerCommand::AttachInspector {
                         viewer_session_id,
@@ -517,7 +550,7 @@ async fn pump_connected_session(
                     }
                     Some(WorkerCommand::DisposeInspector { viewer_session_id, reply }) => {
                         if let Some(reader) = attached_readers.0.remove(&viewer_session_id) {
-                            tokio::spawn(spawn_inspector_reader_reap(reader));
+                            spawn(spawn_inspector_reader_reap(reader));
                         }
                         let _ = reply.send(Ok(()));
                     }
@@ -529,6 +562,14 @@ async fn pump_connected_session(
         }
     }
     Ok(())
+}
+
+fn update_current_mode(modes: &mut Option<DiscussSessionModes>, update: &SessionUpdate) {
+    if let SessionUpdate::CurrentModeUpdate(mode) = update
+        && let Some(modes) = modes
+    {
+        modes.current_mode_id = mode.current_mode_id.to_string();
+    }
 }
 
 async fn teardown_connected_worker(
@@ -551,7 +592,7 @@ async fn teardown_connected_worker(
 /// workspace registration points at an ended session's endpoints, or the
 /// workspace idled long enough for the Provider to have discarded it.
 async fn refresh_stale_mcp_registration(
-    session: &WorkerSession,
+    session: &mut WorkerSession,
     agents_workspace: &Path,
     mcp_descriptors: &[McpServer],
     claim: &mut McpRegistrationClaim,
@@ -567,7 +608,8 @@ async fn refresh_stale_mcp_registration(
         .block_task()
         .await
     {
-        Ok(_) => {
+        Ok(response) => {
+            session.modes = response.modes.map(Into::into);
             claim.reclaim();
             tracing::info!(target: "application_acp", acp_session_id = %session.session_id(), "re-registered stale or idle shared MCP endpoints");
         }
@@ -604,7 +646,7 @@ async fn push_provider_title(connection: &ConnectionTo<Agent>, session_id: &Sess
 async fn load_provider_session(
     session: &WorkerSession,
     acp_session_id: &SessionId,
-    agents_workspace: &std::path::Path,
+    agents_workspace: &Path,
 ) -> Result<ProviderSessionInfo, DiscussError> {
     session
         .connection()
@@ -631,70 +673,46 @@ async fn acknowledge_worker_ready(
     persistence_queue: &mpsc::Sender<PersistenceJob>,
     discuss_session_id: DiscussSessionId,
     acp_session_id: &SessionId,
-    latest_config_options: &[super::types::DiscussConfigOption],
-    session_settings: &super::plugins::ConfigSettings,
+    latest_config_options: &[DiscussConfigOption],
+    session_settings: &ConfigSettings,
     worker_ready_tx: &mpsc::Sender<WorkerReady>,
     announce_desktop_association: bool,
     transient_connectivity: bool,
     supports_config_updates: bool,
-    launch_limitations: Vec<super::types::LaunchLimitation>,
-) -> Result<(), agent_client_protocol::Error> {
+    launch_limitations: Vec<LaunchLimitation>,
+) -> Result<(), AcpError> {
     let (session_open_tx, session_open_rx) = oneshot::channel();
-    persistence_queue
-        .send(PersistenceJob::SessionOpen {
+    persist_ready_item(
+        persistence_queue,
+        PersistenceJob::SessionOpen {
             acp_session_id: acp_session_id.to_string(),
             completion_tx: Some(session_open_tx),
-        })
-        .await
-        .map_err(|error| {
-            agent_client_protocol::Error::into_internal_error(channel_send_error(
-                "shared.persist_session_open",
-                error.to_string(),
-            ))
-        })?;
-    session_open_rx
-        .await
-        .map_err(|error| {
-            agent_client_protocol::Error::into_internal_error(DiscussError::Infrastructure {
-                kind: "oneshot_reply_missing".to_string(),
-                target_domain: "discuss".to_string(),
-                operation: "persist_session_open".to_string(),
-                message: error.to_string(),
-            })
-        })?
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
+        },
+        session_open_rx,
+        "persist_session_open",
+        "shared.persist_session_open",
+    )
+    .await?;
     if !latest_config_options.is_empty() {
         let (config_tx, config_rx) = oneshot::channel();
-        persistence_queue
-            .send(PersistenceJob::ConfigOptions {
+        persist_ready_item(
+            persistence_queue,
+            PersistenceJob::ConfigOptions {
                 options: latest_config_options.to_vec(),
                 session_settings: Some(session_settings.clone()),
                 completion_tx: Some(config_tx),
-            })
-            .await
-            .map_err(|error| {
-                agent_client_protocol::Error::into_internal_error(channel_send_error(
-                    "shared.persist_config_options",
-                    error.to_string(),
-                ))
-            })?;
-        config_rx
-            .await
-            .map_err(|error| {
-                agent_client_protocol::Error::into_internal_error(DiscussError::Infrastructure {
-                    kind: "oneshot_reply_missing".to_string(),
-                    target_domain: "discuss".to_string(),
-                    operation: "persist_config_options".to_string(),
-                    message: error.to_string(),
-                })
-            })?
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            },
+            config_rx,
+            "persist_config_options",
+            "shared.persist_config_options",
+        )
+        .await?;
     }
     if !transient_connectivity {
         persistence_queue
             .persist_launch_limitations(launch_limitations)
             .await
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(AcpError::into_internal_error)?;
     }
     worker_ready_tx
         .send(WorkerReady {
@@ -706,13 +724,32 @@ async fn acknowledge_worker_ready(
             supports_config_updates,
         })
         .await
-        .map_err(|error| {
-            agent_client_protocol::Error::into_internal_error(channel_send_error(
-                "shared.worker_ready",
-                error.to_string(),
-            ))
-        })?;
+        .map_err(|error| AcpError::into_internal_error(channel_send_error("shared.worker_ready", error.to_string())))?;
     Ok(())
+}
+
+async fn persist_ready_item(
+    queue: &mpsc::Sender<PersistenceJob>,
+    job: PersistenceJob,
+    reply: oneshot::Receiver<Result<(), DiscussError>>,
+    operation: &'static str,
+    send_operation: &'static str,
+) -> Result<(), AcpError> {
+    queue
+        .send(job)
+        .await
+        .map_err(|error| AcpError::into_internal_error(channel_send_error(send_operation, error.to_string())))?;
+    reply
+        .await
+        .map_err(|error| {
+            AcpError::into_internal_error(DiscussError::Infrastructure {
+                kind: "oneshot_reply_missing".to_string(),
+                target_domain: "discuss".to_string(),
+                operation: operation.to_string(),
+                message: error.to_string(),
+            })
+        })?
+        .map_err(AcpError::into_internal_error)
 }
 
 struct WorkerSessionSetup {
@@ -729,7 +766,7 @@ struct WorkerSessionSetup {
 async fn prepare_worker_session(
     params: &WorkerSessionParams,
     connection: ConnectionTo<Agent>,
-) -> Result<WorkerSessionSetup, agent_client_protocol::Error> {
+) -> Result<WorkerSessionSetup, AcpError> {
     let (callback_tx, callback_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     tracing::debug!(%params.discuss_session_id, provider = %params.agent_name, cwd = %params.agents_workspace.display(), "Preparing ACP session transports");
     let PreparedMcpTransports {
@@ -770,7 +807,11 @@ async fn prepare_worker_session(
             launch_config: params.launch_config.clone(),
             reconnect_session_id: params.reconnect_acp_session_id.clone(),
             cwd: params.agents_workspace.clone(),
-            mcp_servers: if super::plugins::for_agent(&params.agent_name).uses_mcp_launch_env() {
+            options_supported: params
+                .agent_capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.session_capabilities.options.is_some()),
+            mcp_servers: if plugins::for_agent(&params.agent_name).uses_mcp_launch_env() {
                 mcp_descriptors.clone()
             } else {
                 mcp_descriptors
@@ -786,6 +827,7 @@ async fn prepare_worker_session(
             },
             primary_agent: params.primary_agent.clone(),
             system_prompt_supported: params.system_prompt_supported,
+            close_supported: session_close_supported(params.agent_capabilities.as_ref()),
             resolved_config: merged_config_preferences(&params.agent_defaults, &params.session_settings),
             persisted_config_options: params.persisted_config_options.clone(),
         },
@@ -806,12 +848,17 @@ async fn prepare_worker_session(
     })
 }
 
+/// Whether the agent advertised `session/close` when it initialized.
+fn session_close_supported(capabilities: Option<&AgentCapabilities>) -> bool {
+    capabilities.is_some_and(|capabilities| capabilities.session_capabilities.close.is_some())
+}
+
 struct OpenedWorkerSession {
     session: WorkerSession,
-    latest_config_options: Vec<super::types::DiscussConfigOption>,
-    session_settings: super::plugins::ConfigSettings,
+    latest_config_options: Vec<DiscussConfigOption>,
+    session_settings: ConfigSettings,
     supports_config_updates: bool,
-    launch_limitations: Vec<super::types::LaunchLimitation>,
+    launch_limitations: Vec<LaunchLimitation>,
 }
 
 #[expect(
@@ -820,20 +867,21 @@ struct OpenedWorkerSession {
 )]
 async fn open_worker_session(
     connection: ConnectionTo<Agent>,
-    agents_workspace: &std::path::Path,
+    agents_workspace: &Path,
     agent_name: &str,
     discuss_session_id: DiscussSessionId,
     callback_router: Arc<Mutex<CallbackRouter>>,
     callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
     callback_tx: &mpsc::Sender<CallbackEvent>,
-    broadcast_tx: &mpsc::Sender<super::messages::DiscussResponse>,
+    broadcast_tx: &mpsc::Sender<DiscussResponse>,
     options: OpenConfiguredSessionOptions,
     mcp_transport: McpTransportSelection,
     application_mcp_enabled: bool,
     provisioned_mcp: bool,
-) -> Result<OpenedWorkerSession, agent_client_protocol::Error> {
+) -> Result<OpenedWorkerSession, AcpError> {
     ensure_agents_workspace_dir(agents_workspace).await;
     tracing::debug!(%discuss_session_id, provider = %agent_name, cwd = %agents_workspace.display(), mcp_servers = options.mcp_servers.len(), "Opening configured ACP session");
+    let close_supported = options.close_supported;
     let configured = open_configured_session(
         connection,
         agent_name,
@@ -847,7 +895,7 @@ async fn open_worker_session(
     .map_err(|error| {
         // The ACP boundary reduces this to a bare internal error; record the typed cause here.
         tracing::warn!(%discuss_session_id, provider = %agent_name, %error, "Configured ACP session open failed");
-        agent_client_protocol::Error::into_internal_error(error)
+        AcpError::into_internal_error(error)
     })?;
     let session = configured.session;
     tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), "ACP session configuration completed");
@@ -856,20 +904,25 @@ async fn open_worker_session(
     let supports_config_updates = configured.supports_config_updates;
     let launch_limitations = configured.launch_limitations;
     let mut capability_warning = McpAcpCapabilityWarningState::default();
-    if application_mcp_enabled && mcp_transport == McpTransportSelection::None {
-        capability_warning
-            .publish_once(broadcast_tx, discuss_session_id, session.session_id(), agent_name)
-            .await
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let published = async {
+        if application_mcp_enabled && mcp_transport == McpTransportSelection::None {
+            capability_warning
+                .publish_once(broadcast_tx, discuss_session_id, session.session_id(), agent_name)
+                .await?;
+        }
+        publish_mcp_status(
+            broadcast_tx,
+            discuss_session_id,
+            session.session_id(),
+            mcp_status_for_transport(application_mcp_enabled, mcp_transport, provisioned_mcp),
+        )
+        .await
     }
-    publish_mcp_status(
-        broadcast_tx,
-        discuss_session_id,
-        session.session_id(),
-        mcp_status_for_transport(application_mcp_enabled, mcp_transport, provisioned_mcp),
-    )
-    .await
-    .map_err(agent_client_protocol::Error::into_internal_error)?;
+    .await;
+    if let Err(error) = published {
+        session.close(close_supported).await;
+        return Err(AcpError::into_internal_error(error));
+    }
     Ok(OpenedWorkerSession {
         session,
         latest_config_options,
@@ -901,7 +954,7 @@ async fn prepare_mcp_transports(
     root_context: &BusRpcContext,
     worker_jwt: &Jwt,
     bus_service: &ServiceReader<dyn BusSudoService>,
-) -> Result<PreparedMcpTransports, agent_client_protocol::Error> {
+) -> Result<PreparedMcpTransports, AcpError> {
     let mcp_transport = shared_mcp_capabilities
         .map(|(native, http)| select_mcp_transport(application_mcp_enabled, native, http))
         .unwrap_or(McpTransportSelection::None);
@@ -910,7 +963,7 @@ async fn prepare_mcp_transports(
     let mut mcp_http_lease = None;
     let mut mcp_descriptors = Vec::new();
     if mcp_transport == McpTransportSelection::NativeAcp {
-        for domain in mcp_domains().map_err(agent_client_protocol::Error::into_internal_error)? {
+        for domain in mcp_domains().map_err(AcpError::into_internal_error)? {
             let shim = McpAcpShim::new(
                 &domain,
                 discuss_session_id.to_string(),
@@ -953,17 +1006,18 @@ struct TurnState<'a> {
     activity_update_tx: &'a mpsc::Sender<(DiscussSessionId, bool)>,
     usage: &'a mut UsageTurnAccumulator,
     suppress_transcript: &'a mut bool,
-    options: &'a [super::types::DiscussConfigOption],
+    options: &'a [DiscussConfigOption],
 }
 
 async fn handle_send_user_turn(
     state: TurnState<'_>,
     text: String,
     images: Vec<DiscussImageAttachment>,
+    resource_links: Vec<DiscussResourceLink>,
     persistence_queue: &mpsc::Sender<PersistenceJob>,
     discuss_session_id: DiscussSessionId,
     reply: oneshot::Sender<Result<(), DiscussError>>,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     let TurnState {
         session,
         position_allocator,
@@ -997,7 +1051,7 @@ async fn handle_send_user_turn(
             .find(|option| option.category == "model")
             .map(|option| option.value.clone()),
     );
-    session.send_user_turn(text, images)?;
+    session.send_user_turn(text, images, resource_links)?;
     set_turn_activity(awaiting_turn, false, activity_update_tx, discuss_session_id).await?;
     let _ = reply.send(Ok(()));
     Ok(())
@@ -1010,7 +1064,7 @@ async fn cancel_turn(
     buffer: &mut AssistantTurnBuffer,
     persistence_queue: &mpsc::Sender<PersistenceJob>,
     reply: oneshot::Sender<Result<(), DiscussError>>,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     let TurnState {
         session,
         position_allocator,
@@ -1050,11 +1104,7 @@ async fn cancel_turn(
         }
         usage.bind_assistant_position(assistant_position);
     }
-    let notification = UntypedMessage::new(
-        "session/cancel",
-        serde_json::json!({"sessionId": session.session_id().to_string()}),
-    )?;
-    session.connection().send_notification(notification)?;
+    session.cancel(CancelNotification::new(session.session_id().clone()))?;
     set_turn_activity(awaiting_turn, true, activity_update_tx, discuss_session_id).await?;
     let _ = reply.send(Ok(()));
     Ok(())
@@ -1066,7 +1116,7 @@ fn handle_agent_node_deadline(
     terminal: &Option<oneshot::Sender<AgentNodeTerminalResult>>,
     limits: Option<AgentNodeSessionLimits>,
     terminal_state: &mut AgentNodeTerminalState,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     *deadline = None;
     if terminal.is_some() && terminal_state.limit_error.is_none() {
         let limits = limits.expect("AgentNode deadline requires limits");
@@ -1076,20 +1126,19 @@ fn handle_agent_node_deadline(
             limits.max_duration_secs,
             limits.max_duration_secs,
         )? {
-            session.connection().send_notification(notification)?;
+            session.cancel(notification)?;
         }
     }
     Ok(())
 }
 
-async fn forward_resolved_subagent(
-    subagent: super::types::DiscussSubagentRecord,
+async fn forward_subagent(
+    payload: DiscussUtilityPayload,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
     discuss_session_id: DiscussSessionId,
     acp_session_id: &SessionId,
     persistence_queue: &mpsc::Sender<PersistenceJob>,
-) -> Result<(), agent_client_protocol::Error> {
-    let payload = DiscussUtilityPayload::Subagent { subagent };
+) -> Result<(), AcpError> {
     stream_tx
         .send(DiscussStreamEvent::UtilityUpdate {
             discuss_session_id,
@@ -1100,12 +1149,7 @@ async fn forward_resolved_subagent(
             },
         })
         .await
-        .map_err(|error| {
-            agent_client_protocol::Error::into_internal_error(channel_send_error(
-                "shared.resolved_subagent",
-                error.to_string(),
-            ))
-        })?;
+        .map_err(|error| AcpError::into_internal_error(channel_send_error("shared.subagent", error.to_string())))?;
     enqueue_utility_persistence(persistence_queue, Some(payload)).await;
     Ok(())
 }
@@ -1126,14 +1170,14 @@ async fn handle_agent_node_turn(
     activity_update_tx: &mpsc::Sender<(DiscussSessionId, bool)>,
     suppress_transcript: &mut bool,
     usage: &mut UsageTurnAccumulator,
-    options: &[super::types::DiscussConfigOption],
+    options: &[DiscussConfigOption],
     agent_node_limits: &mut Option<AgentNodeSessionLimits>,
     agent_node_turns: &mut u64,
     agent_node_terminal_state: &mut AgentNodeTerminalState,
     agent_node_deadline: &mut Option<Instant>,
     agent_node_terminal: &mut Option<oneshot::Sender<AgentNodeTerminalResult>>,
     discuss_session_id: DiscussSessionId,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), awaiting_turn = *awaiting_turn, "Agent task prompt command received");
     if !*awaiting_turn || agent_node_terminal.is_some() {
         let _ = accepted.send(Err(DiscussError::Validation {
@@ -1176,7 +1220,7 @@ async fn handle_agent_node_turn(
             limits.max_turns,
         )?
     {
-        session.connection().send_notification(notification)?;
+        session.cancel(notification)?;
     }
     *agent_node_deadline = Some(Instant::now() + Duration::from_secs(limits.max_duration_secs));
     *agent_node_terminal = Some(terminal);
@@ -1198,7 +1242,7 @@ async fn handle_elicitation_callback(
     pending_elicitation_cancel_tx: &mpsc::Sender<PendingElicitationCancel>,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
     transient_connectivity: bool,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     let CallbackRouteTarget::Chat {
         discuss_session_id: viewer_session_id,
     } = target;
@@ -1255,7 +1299,7 @@ async fn handle_elicitation_callback(
             } else {
                 responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel))?;
             }
-            return Err(agent_client_protocol::Error::into_internal_error(error));
+            return Err(AcpError::into_internal_error(error));
         }
         Err(_) => {
             responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel))?;
@@ -1307,7 +1351,7 @@ async fn dispatch_callback(
     pending_elicitation_cancel_tx: &mpsc::Sender<PendingElicitationCancel>,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
     transient_connectivity: bool,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     match callback {
         CallbackEvent::Permission {
             request,
@@ -1357,7 +1401,7 @@ async fn handle_permission_callback(
     pending_permission_cancel_tx: &mpsc::Sender<PendingPermissionCancel>,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
     transient_connectivity: bool,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     let CallbackRouteTarget::Chat {
         discuss_session_id: viewer_session_id,
     } = target;
@@ -1391,7 +1435,7 @@ async fn handle_permission_callback(
                 .await
                 .unwrap_or(DiscussPermissionOption::Cancel);
             resolve_permission_responder(responder, option).await?;
-            return Err(agent_client_protocol::Error::into_internal_error(error));
+            return Err(AcpError::into_internal_error(error));
         }
         Err(error) => {
             let _ = responder_rx.await;
@@ -1437,7 +1481,7 @@ async fn handle_permission_callback(
 )]
 async fn attach_inspector(
     session: &WorkerSession,
-    agents_workspace: &std::path::Path,
+    agents_workspace: &Path,
     mcp_descriptors: &[McpServer],
     callback_router: &Arc<Mutex<CallbackRouter>>,
     callback_routes: &Option<Arc<Mutex<CallbackRouteRegistry>>>,
@@ -1447,9 +1491,9 @@ async fn attach_inspector(
     attached_readers: &mut AttachedInspectorReaders,
     viewer_session_id: DiscussSessionId,
     child_session_id: &SessionId,
-) -> Result<(), DiscussError> {
+) -> Result<Vec<DiscussConfigOption>, DiscussError> {
     if attached_readers.0.contains_key(&viewer_session_id) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     ensure_agents_workspace_dir(agents_workspace).await;
     let load_response = session
@@ -1461,6 +1505,9 @@ async fn attach_inspector(
         ))
         .block_task()
         .await?;
+    let child_options = agent_plugin
+        .initial_config_options(load_response.config_options.clone(), None)
+        .unwrap_or_default();
     let child_response = NewSessionResponse::new(child_session_id.clone()).config_options(load_response.config_options);
     let mut child = WorkerSession::attach(
         session.connection().clone(),
@@ -1473,22 +1520,13 @@ async fn attach_inspector(
         Some(callback_tx.clone()),
     )?;
     let stream_tx = stream_tx.clone();
-    let join_handle = tokio::spawn(async move {
+    let join_handle = spawn(async move {
         let mut buffer = AssistantTurnBuffer::default();
         let mut capture_state = PluginCaptureState::for_plugin(agent_plugin);
-        loop {
+        let error = loop {
             let update = match child.read_update().await {
                 Ok(update) => update,
-                Err(error) => {
-                    let _ = stream_tx
-                        .send(DiscussStreamEvent::SessionFailed {
-                            discuss_session_id: viewer_session_id,
-                            error: DiscussError::from(error),
-                            terminal_auth_methods: Vec::new(),
-                        })
-                        .await;
-                    break;
-                }
+                Err(error) => break error,
             };
             match send_message_to_user(
                 AgentMessageForwardContext {
@@ -1509,21 +1547,19 @@ async fn attach_inspector(
                     buffer = AssistantTurnBuffer::default();
                 }
                 Ok(AgentMessageForwardOutcome::Continue { .. }) => {}
-                Err(error) => {
-                    let _ = stream_tx
-                        .send(DiscussStreamEvent::SessionFailed {
-                            discuss_session_id: viewer_session_id,
-                            error: DiscussError::from(error),
-                            terminal_auth_methods: Vec::new(),
-                        })
-                        .await;
-                    break;
-                }
+                Err(error) => break error,
             }
-        }
+        };
+        let _ = stream_tx
+            .send(DiscussStreamEvent::SessionFailed {
+                discuss_session_id: viewer_session_id,
+                error: DiscussError::from(error),
+                terminal_auth_methods: Vec::new(),
+            })
+            .await;
     });
     attached_readers.0.insert(viewer_session_id, join_handle);
-    Ok(())
+    Ok(child_options)
 }
 
 #[expect(
@@ -1539,7 +1575,7 @@ async fn handle_session_update(
     update: SessionMessage,
     buffer: &mut AssistantTurnBuffer,
     usage: &mut UsageTurnAccumulator,
-    latest_config_options: &mut Vec<super::types::DiscussConfigOption>,
+    latest_config_options: &mut Vec<DiscussConfigOption>,
     persistence_queue: &mpsc::Sender<PersistenceJob>,
     position_allocator: &mut TranscriptPositionAllocator,
     awaiting_turn: &mut bool,
@@ -1549,7 +1585,7 @@ async fn handle_session_update(
     agent_node_limits: &mut Option<AgentNodeSessionLimits>,
     agent_node_terminal_state: &mut AgentNodeTerminalState,
     agent_node_deadline: &mut Option<Instant>,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     let outcome = send_message_to_user(
         AgentMessageForwardContext {
             stream_tx,
@@ -1574,7 +1610,7 @@ async fn handle_session_update(
                 limits.max_tool_calls,
             )?
         {
-            session.connection().send_notification(notification)?;
+            session.cancel(notification)?;
         }
     }
     let metadata_updates = buffer.take_metadata_updates();
@@ -1610,16 +1646,16 @@ async fn handle_session_update(
                 )
                 .await;
             flush.usage = usage.finalized_snapshot();
-            let terminal_output = serde_json::json!({
+            let terminal_output = json!({
                 "text": flush.aggregated_text.clone(),
                 "thought": flush.aggregated_thought.clone(),
                 "parts": flush.parts.iter().filter(|part| {
-                    part.get("kind").and_then(serde_json::Value::as_str) != Some("image")
+                    part.get("kind").and_then(Value::as_str) != Some("image")
                 }).collect::<Vec<_>>(),
                 "stopReason": flush.stop_reason.clone(),
             });
             enqueue_utility_persistence(persistence_queue, utility_payload).await;
-            if super::database::should_persist_assistant_turn(&flush) {
+            if should_persist_assistant_turn(&flush) {
                 let assistant_position = position_allocator.next();
                 persistence_queue
                     .send(PersistenceJob::AssistantTurn {
@@ -1628,7 +1664,7 @@ async fn handle_session_update(
                     })
                     .await
                     .map_err(|error| {
-                        agent_client_protocol::Error::into_internal_error(channel_send_error(
+                        AcpError::into_internal_error(channel_send_error(
                             "shared.persist_assistant_turn",
                             error.to_string(),
                         ))
@@ -1654,17 +1690,14 @@ async fn set_turn_activity(
     idle: bool,
     activity_update_tx: &mpsc::Sender<(DiscussSessionId, bool)>,
     discuss_session_id: DiscussSessionId,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AcpError> {
     if *awaiting_turn != idle {
         *awaiting_turn = idle;
         activity_update_tx
             .send((discuss_session_id, !idle))
             .await
             .map_err(|error| {
-                agent_client_protocol::Error::into_internal_error(channel_send_error(
-                    "shared.activity_update",
-                    error.to_string(),
-                ))
+                AcpError::into_internal_error(channel_send_error("shared.activity_update", error.to_string()))
             })?;
     }
     Ok(())
@@ -1675,8 +1708,8 @@ async fn persist_set_config_option(
     config_id: String,
     value: String,
     agent_plugin: &dyn plugins::DiscussAgentPlugin,
-    latest_config_options: &mut Vec<super::types::DiscussConfigOption>,
-    session_settings: &mut super::types::ConfigSettings,
+    latest_config_options: &mut Vec<DiscussConfigOption>,
+    session_settings: &mut ConfigSettings,
     persistence_queue: &mpsc::Sender<PersistenceJob>,
 ) -> Result<(), DiscussError> {
     let response = session
@@ -1718,17 +1751,37 @@ async fn persist_set_config_option(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use agent_client_protocol::v1::schema::{SessionId, SetSessionTitleRequest, SetSessionTitleResponse};
+    use agent_client_protocol::v1::schema::{
+        CurrentModeUpdate, SessionId, SessionMode, SessionModeState, SessionUpdate, SetSessionTitleRequest,
+        SetSessionTitleResponse,
+    };
     use agent_client_protocol::{Agent, Channel, Client, on_receive_request};
+    use tokio::{spawn, test as async_test};
 
-    use super::push_provider_title;
+    use super::{push_provider_title, update_current_mode};
+    use crate::discuss::types::DiscussSessionModes;
+
+    #[test]
+    fn current_mode_update_preserves_advertised_modes() {
+        let mut modes = Some(DiscussSessionModes::from(SessionModeState::new(
+            "plan",
+            vec![SessionMode::new("plan", "Plan"), SessionMode::new("code", "Code")],
+        )));
+        update_current_mode(
+            &mut modes,
+            &SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("code")),
+        );
+        let modes = modes.unwrap();
+        assert_eq!(modes.current_mode_id, "code");
+        assert_eq!(modes.available.len(), 2);
+    }
 
     /// Push one title through a real client connection to an in-process agent and report what the agent received.
     async fn titles_received_by_agent(supported: bool, agent_accepts: bool) -> Vec<(String, String)> {
         let (client_side, agent_side) = Channel::duplex();
         let received = Arc::new(Mutex::new(Vec::new()));
         let recorder = received.clone();
-        let agent = tokio::spawn(
+        let agent = spawn(
             Agent
                 .v1()
                 .on_receive_request(
@@ -1766,7 +1819,7 @@ mod tests {
         received
     }
 
-    #[tokio::test]
+    #[async_test]
     async fn supported_provider_receives_the_session_title() {
         let received = titles_received_by_agent(true, true).await;
 
@@ -1779,14 +1832,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[async_test]
     async fn unsupported_provider_receives_no_title_request() {
         let received = titles_received_by_agent(false, true).await;
 
         assert!(received.is_empty());
     }
 
-    #[tokio::test]
+    #[async_test]
     async fn provider_rejecting_the_title_does_not_fail_the_session() {
         let received = titles_received_by_agent(true, false).await;
 

@@ -1,27 +1,93 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{Error as IoError, ErrorKind},
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
+use super::super::error::DiscussError;
 use super::super::library::{
     AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
     TeamDefinition,
 };
-use super::super::types::{
-    DiscussConfigOption, DiscussConfigOptionValue, DiscussError, DiscussHarnessCostKind, DiscussUsageEvidenceSource,
-};
+use super::super::report_types::{DiscussHarnessCostKind, DiscussUsageEvidenceSource};
+use super::super::types::{DiscussConfigOption, DiscussConfigOptionValue};
+use super::super::types::{DiscussSubagentSurfaceState, DiscussUtilityPayload};
 use super::super::usage::{DiscussUsageEvidence, ModelUsage, UsageCaptureEvent, capture_standard_usage};
 use super::files::{RenderedFile, write_rendered_files};
+use super::subagents::{SubagentObservation, SubagentTracker};
 use super::{
     BILLING_CACHED_READ, BILLING_CACHED_WRITE, BILLING_INPUT, BILLING_OUTPUT, BILLING_THOUGHT, BILLING_TOTAL,
     BillingCategorySemantics, ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, ManagedConfig,
-    PrimaryAgentSelection, render_skill_file, resolve_agent, resolve_skill,
+    PluginCaptureState, PrimaryAgentSelection, markdown_metadata, render_skill_contents, render_skill_file,
+    resolve_agent, resolve_skill,
 };
 
 pub const GROK_PLUGIN_NAME: &str = "grok-build";
+
+/// Grok's subagent lifecycle on the parent session: `subagent_spawned` (with `subagent_type`,
+/// `description`, `child_session_id`), `subagent_progress` while running, and `subagent_finished`
+/// with `status` `completed` | `failed` | `cancelled`.
+#[derive(Deserialize)]
+struct GrokSubagentUpdate {
+    #[serde(rename = "sessionUpdate")]
+    kind: GrokSubagentKind,
+    subagent_id: Option<String>,
+    child_session_id: Option<String>,
+    subagent_type: Option<String>,
+    description: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GrokPromptComplete {
+    usage: Option<Value>,
+    model_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+enum GrokSubagentKind {
+    #[serde(rename = "subagent_spawned")]
+    Spawned,
+    #[serde(rename = "subagent_progress")]
+    Progress,
+    #[serde(rename = "subagent_finished")]
+    Finished,
+}
+
+fn capture_subagent_notification(params: &Value, tracker: &mut SubagentTracker) {
+    let Some(update) = params
+        .get("update")
+        .and_then(|value| serde_json::from_value::<GrokSubagentUpdate>(value.clone()).ok())
+    else {
+        return;
+    };
+    let state = match update.kind {
+        GrokSubagentKind::Spawned | GrokSubagentKind::Progress => DiscussSubagentSurfaceState::Live,
+        GrokSubagentKind::Finished => match update.status.as_deref() {
+            Some("completed") => DiscussSubagentSurfaceState::Done,
+            _ => DiscussSubagentSurfaceState::Error,
+        },
+    };
+    let Some(capture_id) = update
+        .subagent_id
+        .as_deref()
+        .or(update.child_session_id.as_deref())
+    else {
+        return;
+    };
+    tracker.observe(SubagentObservation {
+        capture_id,
+        child_session_id: update.child_session_id.as_deref(),
+        agent_name: update.subagent_type.as_deref(),
+        description: update.description.as_deref(),
+        state: Some(state),
+    });
+}
 
 const AGENTS_DIRECTORY: &str = ".grok/agents";
 const SKILLS_DIRECTORY: &str = ".grok/skills";
@@ -93,6 +159,24 @@ impl DiscussAgentPlugin for GrokPlugin {
     }
 
     fn capture_usage_evidence(&self, event: &UsageCaptureEvent<'_>) -> Option<DiscussUsageEvidence> {
+        if let UsageCaptureEvent::Notification { method, params } = event
+            && *method == "x.ai/session/prompt_complete"
+        {
+            let complete: GrokPromptComplete = serde_json::from_value((*params).clone()).ok()?;
+            let Some(usage) = complete.usage.as_ref() else {
+                tracing::debug!("Grok prompt completion has no usage");
+                return None;
+            };
+            let evidence = capture_grok_usage(
+                usage,
+                complete.model_id.as_deref(),
+                DiscussUsageEvidenceSource::Complete,
+            );
+            if evidence.is_none() {
+                tracing::debug!("Unrecognized Grok usage payload");
+            }
+            return evidence;
+        }
         let (usage, model_id, source) = match event {
             UsageCaptureEvent::PromptResponse(response) => {
                 let Some(meta) = response.meta.as_ref() else {
@@ -103,19 +187,8 @@ impl DiscussAgentPlugin for GrokPlugin {
                 };
                 (
                     usage,
-                    meta.get("modelId").and_then(serde_json::Value::as_str),
+                    meta.get("modelId").and_then(Value::as_str),
                     DiscussUsageEvidenceSource::ResponseMeta,
-                )
-            }
-            UsageCaptureEvent::Notification { method, params } if *method == "x.ai/session/prompt_complete" => {
-                let Some(usage) = params.get("usage") else {
-                    tracing::debug!("Grok prompt completion has no usage");
-                    return None;
-                };
-                (
-                    usage,
-                    params.get("modelId").and_then(serde_json::Value::as_str),
-                    DiscussUsageEvidenceSource::Complete,
                 )
             }
             _ => return capture_standard_usage(event),
@@ -131,13 +204,26 @@ impl DiscussAgentPlugin for GrokPlugin {
         ConnectionStrategy::Isolated
     }
 
-    // Source verification: the local Grok plugin and ACP protocol sources do
-    // not define a Grok-specific `todowrite` or `subagent-spawn` tool name or
-    // payload contract, nor a provider-specific child-session/load guarantee.
-    // Keep the inherited
-    // no-op capture hooks and false child-session capability.
+    // Grok Build announces subagents through its ungated `x.ai/session_notification` extension
+    // (xai-org/grok-build `extensions/notification.rs`), not through ACP `session/update`.
+    // No child-session load guarantee is verified, so child sessions are not loaded.
     fn agent_scope_key(&self) -> &'static str {
         "plugin.grok-build"
+    }
+
+    fn capture_extension_notification(
+        &self,
+        method: &str,
+        params: &Value,
+        state: &mut PluginCaptureState,
+    ) -> Option<DiscussUtilityPayload> {
+        let PluginCaptureState::Subagents(tracker) = state else {
+            return None;
+        };
+        if method.trim_start_matches('_') == "x.ai/session_notification" || method == "x.ai/session/update" {
+            capture_subagent_notification(params, tracker);
+        }
+        tracker.next()
     }
 
     fn skill_scope_key(&self) -> &'static str {
@@ -147,9 +233,9 @@ impl DiscussAgentPlugin for GrokPlugin {
     /// Grok's `_meta.agentProfile` ignores project-only agents, so the leader's instructions go
     /// through `_meta.rules`, which Grok appends to the session system prompt.
     fn primary_agent_selection(&self, agent: &AgentSelectionView<'_>) -> PrimaryAgentSelection {
-        PrimaryAgentSelection::SessionMeta(serde_json::Map::from_iter([(
+        PrimaryAgentSelection::SessionMeta(Map::from_iter([(
             RULES_META_KEY.to_string(),
-            serde_json::Value::String(agent.body.to_string()),
+            Value::String(agent.body.to_string()),
         )]))
     }
 
@@ -176,7 +262,7 @@ impl DiscussAgentPlugin for GrokPlugin {
             .join(format!("{}.md", agent_id.normalized_destination()));
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(capture_write_error(&path, error)),
         }
     }
@@ -233,11 +319,11 @@ impl DiscussAgentPlugin for GrokPlugin {
                 .join(skill.id.normalized_destination())
                 .join(&file.relative_path);
             let body = if file.relative_path == "SKILL.md" {
-                super::markdown_metadata(&file.contents)?.2
+                markdown_metadata(&file.contents)?.2
             } else {
                 &file.contents
             };
-            let contents = super::render_skill_contents(
+            let contents = render_skill_contents(
                 GROK_PLUGIN_NAME,
                 &path,
                 &skill.id,
@@ -288,10 +374,7 @@ impl DiscussAgentPlugin for GrokPlugin {
         Ok(())
     }
 
-    fn extension_config_options(
-        &self,
-        metadata: &serde_json::Map<String, serde_json::Value>,
-    ) -> Option<Vec<DiscussConfigOption>> {
+    fn extension_config_options(&self, metadata: &Map<String, Value>) -> Option<Vec<DiscussConfigOption>> {
         grok_session_config(metadata).and_then(grok_config_options)
     }
 }
@@ -317,7 +400,7 @@ fn validate_managed_config(document: &str) -> Result<(), DiscussError> {
 }
 
 fn capture_grok_usage(
-    usage: &serde_json::Value,
+    usage: &Value,
     model_id: Option<&str>,
     source: DiscussUsageEvidenceSource,
 ) -> Option<DiscussUsageEvidence> {
@@ -329,7 +412,7 @@ fn capture_grok_usage(
     let usage_is_incomplete = flag("usageIsIncomplete")?;
     let cost_is_partial = flag("costIsPartial")?;
     let cost = match object.get("costUsdTicks") {
-        None | Some(serde_json::Value::Null) => None,
+        None | Some(Value::Null) => None,
         Some(value) => {
             let ticks = value.as_i64()?;
             let magnitude = ticks.unsigned_abs();
@@ -389,7 +472,7 @@ fn capture_grok_usage(
     })
 }
 
-fn grok_model_usage(value: &serde_json::Value, model_id: Option<&str>) -> Option<ModelUsage> {
+fn grok_model_usage(value: &Value, model_id: Option<&str>) -> Option<ModelUsage> {
     let object = value.as_object()?;
     let keys = [
         "inputTokens",
@@ -450,12 +533,12 @@ fn remove_file(root: &Path, relative_path: &Path) -> Result<(), DiscussError> {
     let path = root.join(relative_path);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(capture_write_error(&path, error)),
     }
 }
 
-fn capture_write_error(path: &Path, error: std::io::Error) -> DiscussError {
+fn capture_write_error(path: &Path, error: IoError) -> DiscussError {
     DiscussError::WorkspaceIo {
         plugin: GROK_PLUGIN_NAME.to_string(),
         path: path.to_string_lossy().into_owned(),
@@ -463,16 +546,16 @@ fn capture_write_error(path: &Path, error: std::io::Error) -> DiscussError {
     }
 }
 
-fn grok_session_config(metadata: &serde_json::Map<String, serde_json::Value>) -> Option<&serde_json::Value> {
+fn grok_session_config(metadata: &Map<String, Value>) -> Option<&Value> {
     metadata.get(GROK_SESSION_CONFIG_META_KEY).or_else(|| {
         metadata
             .get("_meta")
-            .and_then(serde_json::Value::as_object)
+            .and_then(Value::as_object)
             .and_then(|meta| meta.get(GROK_SESSION_CONFIG_META_KEY))
     })
 }
 
-fn grok_config_options(value: &serde_json::Value) -> Option<Vec<DiscussConfigOption>> {
+fn grok_config_options(value: &Value) -> Option<Vec<DiscussConfigOption>> {
     let config = serde_json::from_value::<GrokSessionConfig>(value.clone()).ok()?;
     let mut categories = BTreeMap::<String, Vec<GrokFlattenedOption>>::new();
 
@@ -565,6 +648,32 @@ fn grok_config_option(field: GrokConfigField, options: Vec<GrokFlattenedOption>)
 mod tests {
     use super::super::super::test_library;
     use super::*;
+
+    #[test]
+    fn subagent_notifications_report_the_lifecycle() {
+        let mut state = PluginCaptureState::Subagents(SubagentTracker::default());
+        let mut capture = |method: &str, update: serde_json::Value| match PLUGIN.capture_extension_notification(
+            method,
+            &serde_json::json!({"sessionId": "p", "update": update}),
+            &mut state,
+        ) {
+            Some(DiscussUtilityPayload::Subagent { subagent }) => Some((subagent.agent_name, subagent.surface_state)),
+            _ => None,
+        };
+        let spawned = serde_json::json!({"sessionUpdate": "subagent_spawned", "subagent_id": "c1",
+            "child_session_id": "c1", "subagent_type": "explore", "description": "Find auth"});
+        assert_eq!(
+            capture("_x.ai/session_notification", spawned),
+            Some(("explore".to_string(), DiscussSubagentSurfaceState::Live))
+        );
+        let failed = serde_json::json!({"sessionUpdate": "subagent_finished", "subagent_id": "c1", "status": "failed"});
+        assert_eq!(
+            capture("x.ai/session_notification", failed),
+            Some(("explore".to_string(), DiscussSubagentSurfaceState::Error))
+        );
+        let other = serde_json::json!({"sessionUpdate": "subagent_spawned", "subagent_id": "c2"});
+        assert_eq!(capture("session/request_permission", other), None);
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -639,7 +748,7 @@ mod tests {
     }
 
     fn session_new_metadata(options: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-        serde_json::Map::from_iter([(
+        Map::from_iter([(
             "_meta".to_string(),
             serde_json::json!({ GROK_SESSION_CONFIG_META_KEY: options }),
         )])

@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use super::actor::{Actor, AgentVersionParseError, team_versions_match};
+use super::catalog_types::{AgentThemeColor, TeamCatalogEntry, TeamCatalogMember, TeamDefinitionKind};
 use super::database::*;
+use super::error::DiscussError;
+use super::launch_types::SessionLaunchConfig;
 use super::library::{
     AgentId, CustomTeamDefinition, ResolvedAgent, ResolvedSkill, ResolvedTeam, SkillId, TeamDefinition,
     bump_custom_version, initial_custom_version,
@@ -15,10 +18,7 @@ use super::storage::{
     load_asset_instructions, load_custom_team, load_discuss_team_installation, upsert_custom_installation,
     upsert_custom_team, upsert_discuss_team_installation,
 };
-use super::types::{
-    AgentThemeColor, CustomMcpScope, DiscussError, DiscussMemberOverrides, SessionLaunchConfig, TeamCatalogEntry,
-    TeamCatalogMember, TeamDefinitionKind,
-};
+use super::types::{CustomMcpScope, DiscussMemberOverrides};
 
 impl Actor {
     async fn validate_custom_team_members(

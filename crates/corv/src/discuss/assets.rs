@@ -14,7 +14,13 @@ use turso::Connection;
 
 use super::actor::Actor;
 use super::asset_sources::{AssetSource, fetch_asset_source};
+use super::catalog_types::InstalledAssetKind;
+use super::catalog_types::{
+    BuiltinSkillEntry, CustomAgentDetail, CustomAssetMetadata, CustomSkillBundleFile, CustomSkillDetail,
+    IncompleteTeamClaim, InstalledAssetClaim, InstalledClaimBasis,
+};
 use super::database::{retained_team_assets, with_install_compensation_context};
+use super::error::DiscussError;
 use super::library::{
     AgentId, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, CustomSkillFile, CustomTeamDefinition,
     ResolvedAgent, ResolvedSkill, ResolvedTeam, SkillId, bump_custom_version, initial_custom_version,
@@ -33,11 +39,7 @@ use super::storage::{
     load_custom_agent, load_custom_installation, load_custom_skill, load_custom_team, load_discuss_team_installation,
     upsert_custom_agent, upsert_custom_installation, upsert_custom_skill,
 };
-use super::types::InstalledAssetKind;
-use super::types::{
-    BuiltinSkillEntry, CustomAgentDetail, CustomAssetMetadata, CustomSkillBundleFile, CustomSkillDetail, DiscussError,
-    DiscussMemberOverrides, DiscussSessionSetup, IncompleteTeamClaim, InstalledAssetClaim, InstalledClaimBasis,
-};
+use super::types::{DiscussMemberOverrides, DiscussSessionSetup};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

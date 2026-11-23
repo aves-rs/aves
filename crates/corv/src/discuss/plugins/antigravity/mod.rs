@@ -1,21 +1,24 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{Error as IoError, ErrorKind},
     path::{Path, PathBuf},
 };
 
 use agent_client_protocol::v1::schema::McpServer;
 use serde::Serialize;
+use serde_json::Value;
 
+use super::super::error::DiscussError;
+use super::super::launch_types::{SessionCliLogin, SessionLaunchConfig};
 use super::super::library::{
     AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
     TeamDefinition,
 };
-use super::super::types::{DiscussError, SessionCliLogin, SessionLaunchConfig};
 use super::files::{RenderedFile, write_rendered_files};
 use super::{
-    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, ManagedConfig, PrimaryAgentSelection, render_skill_file,
-    resolve_agent, resolve_skill,
+    ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, ManagedConfig, PrimaryAgentSelection, json_object,
+    markdown_metadata, render_skill_contents, render_skill_file, resolve_agent, resolve_skill,
 };
 
 pub(super) const ANTIGRAVITY_PLUGIN_NAME: &str = "antigravity-acp";
@@ -166,11 +169,11 @@ impl DiscussAgentPlugin for AntigravityPlugin {
                 .join(skill.id.normalized_destination())
                 .join(&file.relative_path);
             let body = if file.relative_path == "SKILL.md" {
-                super::markdown_metadata(&file.contents)?.2
+                markdown_metadata(&file.contents)?.2
             } else {
                 &file.contents
             };
-            let contents = super::render_skill_contents(
+            let contents = render_skill_contents(
                 ANTIGRAVITY_PLUGIN_NAME,
                 &path,
                 &skill.id,
@@ -218,28 +221,24 @@ impl DiscussAgentPlugin for AntigravityPlugin {
 }
 
 fn validate_managed_config(document: &str) -> Result<(), DiscussError> {
-    let value = super::json_object(ANTIGRAVITY_PLUGIN_NAME, document)?;
+    let value = json_object(ANTIGRAVITY_PLUGIN_NAME, document)?;
     let valid = value
         .get("mcpServers")
-        .and_then(serde_json::Value::as_object)
+        .and_then(Value::as_object)
         .is_some_and(|servers| {
             servers.values().all(|server| {
                 let Some(server) = server.as_object() else { return false };
-                let command = server
-                    .get("command")
-                    .is_some_and(serde_json::Value::is_string);
-                let url = server
-                    .get("serverUrl")
-                    .is_some_and(serde_json::Value::is_string);
+                let command = server.get("command").is_some_and(Value::is_string);
+                let url = server.get("serverUrl").is_some_and(Value::is_string);
                 let args = server.get("args").is_none_or(|value| {
                     value
                         .as_array()
-                        .is_some_and(|args| args.iter().all(serde_json::Value::is_string))
+                        .is_some_and(|args| args.iter().all(Value::is_string))
                 });
                 let env = server.get("env").is_none_or(|value| {
                     value
                         .as_object()
-                        .is_some_and(|env| env.values().all(serde_json::Value::is_string))
+                        .is_some_and(|env| env.values().all(Value::is_string))
                 });
                 (command || url) && args && env
             })
@@ -289,12 +288,12 @@ fn remove_file(root: &Path, relative_path: &Path) -> Result<(), DiscussError> {
     let path = root.join(relative_path);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(capture_write_error(&path, error)),
     }
 }
 
-fn capture_write_error(path: &Path, error: std::io::Error) -> DiscussError {
+fn capture_write_error(path: &Path, error: IoError) -> DiscussError {
     DiscussError::WorkspaceIo {
         plugin: ANTIGRAVITY_PLUGIN_NAME.to_string(),
         path: path.to_string_lossy().into_owned(),
@@ -304,8 +303,8 @@ fn capture_write_error(path: &Path, error: std::io::Error) -> DiscussError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::launch_types::{RuleSet, SessionCliTool};
     use super::super::super::test_library;
-    use super::super::super::types::{RuleSet, SessionCliTool};
     use super::*;
     use agent_client_protocol::v1::schema::{McpServerHttp, McpServerStdio};
     use tempfile::tempdir;

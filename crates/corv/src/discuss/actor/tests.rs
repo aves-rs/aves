@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::discuss::types::DiscussAuthState;
 use agent_client_protocol::v1::schema::{
     AuthMethod, EnvVariable, McpServer, McpServerStdio, PermissionOptionId, SessionConfigOptionCategory,
     SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionInfo,
@@ -36,11 +37,17 @@ use aves::utils::database::{
 use aves::utils::test_support::{MockBus, reply_with};
 use aves::utils::uuid::SpectaUuid;
 
+use super::super::agent_nodes::AgentNodeTickResult;
 use super::super::asset_sources::AssetSource;
 use super::super::boot::{DiscussBootOptions, DiscussSettings};
+use super::super::catalog_types::{
+    AgentThemeColor, CustomSkillBundleFile, IncompleteTeamClaim, InstalledClaimBasis, TeamCatalogEntry,
+    TeamCatalogMember, TeamDefinitionKind,
+};
+use super::super::launch_types::{LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject};
 use super::super::library::AgentId;
 use super::super::migration::MIGRATIONS as DISCUSS_MIGRATIONS;
-use super::super::sessions::dedupe_session_list;
+use super::super::session_reads::dedupe_session_list;
 use super::super::test_library;
 use super::super::{agents::*, config::*, database::*, elicitation::*, messages::*, session::*, storage::*, types::*};
 use super::*;
@@ -820,6 +827,38 @@ async fn agent_node_tick_returns_live_terminal_without_persisting_a_replay_ledge
         panic!("expected successful terminal response");
     };
     assert_eq!(output, serde_json::json!({ "text": "done", "stopReason": "endTurn" }));
+}
+
+#[tokio::test]
+async fn missing_provider_connection_has_unknown_auth_status() {
+    let (bus_tx, _) = MockBus::new(1);
+    let (_request_tx, request_rx) = mpsc::channel(1);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let actor = make_actor(request_rx, HashMap::new(), bus_tx, broadcast_tx).await;
+    let response = actor
+        .handle_get_provider_auth_status("missing")
+        .await
+        .unwrap();
+    assert!(
+        matches!(response, DiscussResponse::ProviderAuthStatus { status: DiscussAuthState::Unknown, accounts } if accounts.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn archive_without_provider_attachment_is_a_noop() {
+    let (bus_tx, _) = MockBus::new(1);
+    let (_request_tx, request_rx) = mpsc::channel(1);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let mut actor = make_actor(request_rx, HashMap::new(), bus_tx, broadcast_tx).await;
+    let session = DiscussSessionId::new();
+    assert!(matches!(
+        actor.handle_set_archived(session, true).await.unwrap(),
+        DiscussResponse::Success
+    ));
+    assert!(matches!(
+        actor.handle_set_archived(session, false).await.unwrap(),
+        DiscussResponse::Success
+    ));
 }
 
 #[tokio::test]
@@ -2452,7 +2491,7 @@ async fn actor_new_loads_agents_from_config() {
     let actor_fut = tokio::spawn(async move {
         Actor::new(
             receiver,
-            super::super::types::ActorInboundPorts {
+            super::super::agent_nodes::ActorInboundPorts {
                 workspace_copy_source_rx: mpsc::channel(1).1,
             },
             BusRpcContext::authenticated(bus_requester.clone(), Jwt::from_opaque("test-token".to_string())),
@@ -2505,7 +2544,7 @@ async fn actor_new_preserves_opaque_agent_defaults_from_config() {
     let actor_fut = tokio::spawn(async move {
         Actor::new(
             receiver,
-            super::super::types::ActorInboundPorts {
+            super::super::agent_nodes::ActorInboundPorts {
                 workspace_copy_source_rx: mpsc::channel(1).1,
             },
             BusRpcContext::authenticated(bus_requester.clone(), Jwt::from_opaque("test-token".to_string())),
@@ -2566,7 +2605,7 @@ async fn actor_new_resolves_agents_workspace_from_config() {
     let actor_fut = tokio::spawn(async move {
         Actor::new(
             receiver,
-            super::super::types::ActorInboundPorts {
+            super::super::agent_nodes::ActorInboundPorts {
                 workspace_copy_source_rx: mpsc::channel(1).1,
             },
             BusRpcContext::authenticated(bus_requester.clone(), Jwt::from_opaque("test-token".to_string())),
@@ -6244,9 +6283,7 @@ fn assert_limit_breach(limit: &'static str, actual: u64, maximum: u64) {
         .expect("limit breach should build ACP cancellation")
         .expect("first limit breach should request cancellation");
 
-    let (method, params) = notification.into_parts();
-    assert_eq!(method, "session/cancel");
-    assert_eq!(params, json!({"sessionId": "acp-session-test"}));
+    assert_eq!(notification.session_id.to_string(), "acp-session-test");
     assert!(state.limit_error.is_some());
 
     let terminal = state.finish(json!({"text": "partial"}));
@@ -7064,5 +7101,126 @@ async fn rename_without_a_live_worker_is_still_saved() {
     assert_eq!(
         stored_display_title(&actor, session_id).await.as_deref(),
         Some("Sonya | yach")
+    );
+}
+
+fn test_worker_entry(command_tx: mpsc::Sender<WorkerCommand>, join_handle: tokio::task::JoinHandle<()>) -> WorkerEntry {
+    WorkerEntry {
+        active_turn: false,
+        agent_name: "agent".to_string(),
+        worker_jti: None,
+        command_tx,
+        join_handle,
+        acp_session_id: None,
+        desktop_association_requested: false,
+    }
+}
+
+/// Modes a live worker reports are recorded and still answered once the worker is gone.
+#[tokio::test]
+async fn session_modes_outlast_the_worker() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let discuss_session_id = DiscussSessionId::new();
+    persist_session_anchor_inner(
+        &actor.persistence,
+        &discuss_session_id.to_string(),
+        SessionAnchorMetadata::default(),
+    )
+    .await
+    .expect("anchor");
+    let modes = DiscussSessionModes {
+        current_mode_id: "plan".to_string(),
+        available: vec![DiscussSessionMode {
+            id: "plan".to_string(),
+            name: "Plan".to_string(),
+            description: None,
+        }],
+    };
+    let reported = modes.clone();
+    let (command_tx, mut command_rx) = mpsc::channel(1);
+    let join_handle = tokio::spawn(async move {
+        if let Some(WorkerCommand::GetSessionModes { reply }) = command_rx.recv().await {
+            let _ = reply.send(Some(reported));
+        }
+    });
+    actor
+        .worker_registry
+        .insert(discuss_session_id, test_worker_entry(command_tx, join_handle));
+
+    let live = actor
+        .handle_get_session_modes(discuss_session_id)
+        .await
+        .expect("live modes");
+    assert!(matches!(live, DiscussResponse::SessionModes { modes: Some(live) } if live == modes));
+
+    actor.worker_registry.remove(&discuss_session_id);
+    let recorded = actor
+        .handle_get_session_modes(discuss_session_id)
+        .await
+        .expect("recorded modes");
+    assert!(matches!(recorded, DiscussResponse::SessionModes { modes: Some(recorded) } if recorded == modes));
+}
+
+/// A session that never reported modes, and has no worker, has none; existing rows stay valid.
+#[tokio::test]
+async fn session_without_recorded_modes_has_none() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let discuss_session_id = DiscussSessionId::new();
+    persist_session_anchor_inner(
+        &actor.persistence,
+        &discuss_session_id.to_string(),
+        SessionAnchorMetadata::default(),
+    )
+    .await
+    .expect("anchor");
+
+    let response = actor
+        .handle_get_session_modes(discuss_session_id)
+        .await
+        .expect("modes");
+    assert!(matches!(response, DiscussResponse::SessionModes { modes: None }));
+}
+
+/// `discuss.removeSession` still removes the chat locally when the provider's delete fails.
+#[tokio::test]
+async fn remove_session_removes_locally_when_provider_delete_fails() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _temp_dir) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
+    persist_session_anchor_inner(&actor.persistence, &sid, SessionAnchorMetadata::default())
+        .await
+        .expect("anchor");
+    let (command_tx, mut command_rx) = mpsc::channel(1);
+    let join_handle = tokio::spawn(async move {
+        if let Some(WorkerCommand::DeleteSession { reply }) = command_rx.recv().await {
+            let _ = reply.send(Err(DiscussError::ShuttingDown));
+        }
+    });
+    actor
+        .worker_registry
+        .insert(discuss_session_id, test_worker_entry(command_tx, join_handle));
+
+    let response = actor
+        .handle_remove_session(discuss_session_id)
+        .await
+        .expect("remove succeeds despite the failed provider delete");
+    assert!(matches!(response, DiscussResponse::Success));
+    assert!(!actor.worker_registry.contains_key(&discuss_session_id));
+    let conn = actor
+        .persistence
+        .acquire_connection()
+        .await
+        .expect("connection");
+    assert!(
+        load_discuss_session(&conn, &sid)
+            .await
+            .expect("load")
+            .is_none()
     );
 }

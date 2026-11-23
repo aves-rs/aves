@@ -1,20 +1,21 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
-    CreateElicitationRequest, CreateElicitationResponse, RequestPermissionRequest, RequestPermissionResponse, SessionId,
+    AgentCapabilities, CreateElicitationRequest, CreateElicitationResponse, RequestPermissionRequest,
+    RequestPermissionResponse, SessionId,
 };
 use agent_client_protocol::{Agent, Responder};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
+use super::error::DiscussError;
 use super::plugins::ConnectionStrategy;
-use super::types::{
-    DiscussError, DiscussSessionId, ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus,
-};
+use super::types::{DiscussSessionId, ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus};
 
 /// Maximum number of automatic Provider runtime restart attempts per process.
 const MAX_PROVIDER_AUTO_RESTART_ATTEMPTS: u8 = 3;
@@ -184,7 +185,7 @@ impl CallbackRouter {
 
     fn register_route<K, V>(routes: &mut HashMap<K, V>, key: K, value: V) -> bool
     where
-        K: Eq + std::hash::Hash,
+        K: Eq + Hash,
         V: PartialEq,
     {
         match routes.get(&key) {
@@ -356,11 +357,8 @@ pub(super) enum ProviderSupervisorResources {
         connection: Option<ConnectionTo<Agent>>,
         connection_owner: Option<JoinHandle<()>>,
         connection_watcher: Option<JoinHandle<()>>,
-        mcp_acp: bool,
-        mcp_http: bool,
-        /// Whether the Provider advertises `sessionCapabilities.systemPrompt`.
-        system_prompt: bool,
-        title_supported: bool,
+        /// The Provider's advertised capabilities from its last `initialize`.
+        capabilities: Box<AgentCapabilities>,
         callback_router: Arc<Mutex<CallbackRouter>>,
         callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
         mcp_registrations: SharedMcpRegistrations,
@@ -388,10 +386,7 @@ impl ProviderSupervisor {
                 connection: None,
                 connection_owner: None,
                 connection_watcher: None,
-                mcp_acp: false,
-                mcp_http: false,
-                system_prompt: false,
-                title_supported: false,
+                capabilities: Box::new(AgentCapabilities::new()),
                 callback_router: Arc::new(Mutex::new(CallbackRouter::default())),
                 callback_routes: None,
                 mcp_registrations: SharedMcpRegistrations::default(),

@@ -5,8 +5,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::database::persist_allowance_observation;
+use super::report_types::{DiscussAllowanceProjection, DiscussAllowanceWindow, DiscussAllowanceWindows};
 use super::storage::{DiscussAllowanceObservation, DiscussPersistence};
-use super::types::{DiscussAllowanceProjection, DiscussAllowanceWindow, DiscussAllowanceWindows};
 
 const CAPACITY: usize = 8;
 const WINDOW_MS: i64 = 15 * 60 * 1000;

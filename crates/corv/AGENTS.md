@@ -16,13 +16,15 @@ Paths below are relative to `src/discuss/`. Discuss SQL migrations stay at crate
 | File | Owns |
 |---|---|
 | `actor.rs` | Single Actor state, construction, request/event dispatch, stop order. |
-| `agent_nodes.rs` | Flow AgentNode registration, start/tick/cancel actor methods, terminal completion handling, workspace hooks. |
+| `agent_nodes.rs` | Flow AgentNode registration, start/tick/cancel actor methods, terminal completion handling, workspace hooks; AgentNode limits/results, `TaskSessionStart`, workspace copy-source port and actor inbound port bundle. |
 | `provider.rs` | Actor-associated Provider lifecycle methods and DTOs (add/remove, runtime state, config refresh, transient validation). |
 | `teams.rs` | Actor-associated Team catalog/install/upgrade methods and DTOs (boot upgrade, retention scopes, member overrides). |
-| `sessions.rs` | Actor-associated session lifecycle methods (new/load/remove/rename, spawn, launch preparation, session info projection). |
+| `sessions.rs` | Actor-associated session lifecycle methods: task sessions, working-directory changes, remove, rename, persisted ACP id resolution and desktop association. |
+| `session_launch.rs` | Actor-associated session launch path: `spawn_session`, stored launch resolution, launch preparation and server configuration, worker auth, worker parameters and spawn. |
+| `session_reads.rs` | Actor-associated session reads: list, load with provider refresh, config options, short-lived provider options/load, session list dedupe. |
 | `session_turns.rs` | Actor-associated turn, permission, elicitation and inspector request handlers (`handle_send_user_turn`, `handle_cancel_turn`, inspector reserve/start/dispose, elicitation persistence). |
 | `session.rs` | ACP SDK connection and router: shared/isolated dispatch, SDK session new/load attachment, `SessionCallbackRouter`, callback routing, worker JWT, initialize/load requests. |
-| `worker.rs` | Single connected ACP worker event loop: `run_isolated` startup, `run_connected_session` command/event handlers, permission/elicitation/config/inspector branches. **File-length exception:** soft target 1,200 LOC; hard cap **1,750 LOC** (raised from 1,500). Current ~1,671 LOC. This exception applies ONLY to this file. |
+| `worker.rs` | Single connected ACP worker event loop: `run_isolated` startup, `run_connected_session` command/event handlers, permission/elicitation/config/inspector branches. **File-length exception:** soft target 1,200 LOC; hard cap **1,750 LOC** (raised from 1,500). Current ~1,749 production LOC. This exception applies ONLY to this file. |
 | `agents.rs` | Agent message and permission projection: turn buffer, transcript position allocation, permission/elicitation request preparation, responder resolution, message-to-user dispatch. |
 | `elicitation.rs` | Restricted-form DTO projection (`DiscussRestrictedFormField*`, `DiscussElicitationClassification`, `DiscussElicitationAnswer`) and validation (`validate_elicitation_content`, `classify_elicitation_schema`, `content_to_sdk_answer`). Reuses SDK `CreateElicitationRequest::scope` and typed `ElicitationContentValue` conversion; retains required-field/enum/pattern/numeric-bounds checks. |
 | `database.rs` | Ordered persistence queue: `PersistenceJob` variants, `enqueue_persistence_job`, `spawn_persistence_queue`, drain task, anchor merge, retention-scope helpers, cleanup warnings. |
@@ -30,7 +32,11 @@ Paths below are relative to `src/discuss/`. Discuss SQL migrations stay at crate
 | `messages.rs` | Typed request/response/broadcast contracts: `DiscussRequest`, `DiscussRequestPayload` (bus macro), `DiscussResponse`, `DiscussBroadcast`. |
 | `library.rs` | Neutral Agent/Skill/Command/Team schemas, destination-safe IDs, immutable application-supplied `AssetLibrary`, custom asset definitions, `ResolvedAgent`/`ResolvedSkill`/`ResolvedTeam`, `AgentSelectionView`. No application prompts or concrete catalog. |
 | `migration.rs` | Existing Discuss SQL migration registration; SQL files live in `../migrations/`, a peer of `src/`. Use plain `mod migration;`, never a `#[path]` import. |
-| `types.rs` | Authoritative Discuss error enum (`DiscussError`, thiserror), DTOs (identities, stream events, provider/runtime state, session info, config, team catalog, ACP payloads), AgentNode limits/results, workspace copy source port and actor inbound port bundle. |
+| `types.rs` | DTOs: identities, stream events, worker registry and commands, provider/runtime state, session info, config, ACP payloads. |
+| `error.rs` | Authoritative Discuss error enum (`DiscussError`, thiserror), RPC codes and conversions. |
+| `launch_types.rs` | Launch DTOs: permission rules (`Operation`, `Effect`, `Rule`, `RuleSet`), session CLI tools/logins, `SessionLaunchConfig`, launch limitations, `AcpProvider`. |
+| `report_types.rs` | Accounting DTOs: turn records, usage reports, allowance windows, projections and reports. |
+| `catalog_types.rs` | Catalog DTOs: Agent theme colors, built-in skills, installed claims, custom assets, Team catalog entries. |
 | `domain.rs` | Aves registration and start/stop boundary: `DiscussDomain`, `DiscussStreamingService`, `DiscussAgentNodeLifecycleService`, `DiscussKernelServices`, routing error, lifecycle callbacks, AgentNode registration supply. |
 | `handle.rs` | Message router: `new` constructor, service unpacking, actor construction and spawn, port creation/publication, generated router wiring. |
 | `boot.rs` | Boot boundaries: `DiscussBootOptions`, `DiscussConfigBridge`, `DiscussConfigSnapshot`, `DiscussMcpDomain`, `DiscussMcpService`. |
@@ -75,6 +81,7 @@ Paths below are relative to `src/discuss/`. Discuss SQL migrations stay at crate
 - **Turn usage sidecar.** `DiscussStreamEvent::AgentMessage.turn_usage` is optional and carries real provider counts only. A dispatched turn always has its ordinal, even with missing counts (`usage_is_incomplete`). `UsageTurnAccumulator::finish` finalizes once. Late evidence updates only the retained turn, and only when turn-correlatable, through its exact ordinal and bound assistant row. Elapsed time exists only for completed turns; Corv records no TTFT.
 - **Subagent reporting.** Subagent state comes from what the provider reports on the session's own connection: ACP `subagent_update`, OpenCode `opencode/session/child_update`, Grok `x.ai/session_notification`, then tool-call fallbacks. Corv never queries a provider's separate service or scans processes. A spawn's completion is not its child's completion. Subagent states never change `active_turn`. Details: [Subagent Reporting](../../docs/concepts/subagent-reporting.md).
 - **Primary agent option.** `DiscussProviderConfig.agent_config_option_id` comes only from the plugin's private `PrimaryAgentSelection::ConfigOption`. `ConfigOptionsOutput` reuses it; no lookup operation exists.
+- **ACP session controls.** The public Discuss operations include `archiveSession`, `unarchiveSession`, `getProviderAuthStatus`, `getSessionModes`, and `setSessionMode`. Archive, authentication, and session-options requests are conditioned on the provider's advertised capabilities.
 - **Custom content.** Built-in and custom assets resolve through one `AgentSelectionView`. Custom asset ids must not collide with built-in ids. Appended instructions are keyed by the physical installed path, so two Providers sharing one file share one instruction row.
 - **Accepted limits.** Settled behaviour in accounting, custom content and Teams is recorded in [Discuss Accepted Limits](../../docs/concepts/discuss-accepted-limits.md). Do not re-raise or "fix" it.
 
@@ -124,7 +131,7 @@ Decide asks one bounded typed question (`bool`, `choice`, `score`; no `box`) thr
 
 The following symbols are reexported from the Corv crate root for embedding applications:
 - `DiscussSettings` (from `boot.rs`)
-- `AcpProvider`, `ProviderRuntimeStatus`, `ProviderRuntimeFailure`, `CleanupWarning` (from `types.rs`)
+- `AcpProvider` (from `launch_types.rs`); `ProviderRuntimeStatus`, `ProviderRuntimeFailure`, `CleanupWarning` (from `types.rs`)
 - Decide: `DecideDomain`, `DecideBroadcast`, `DecideError`, `DecideCredential`, `DecideContent`, `DecideRuntimeService`, `SupplyCredentialInput`, `RemoveCredentialInput`, `SuccessOutput as DecideSuccessOutput`, `AskBoolInput`, `AskChoiceInput`, `AskScoreInput`, `BoolOutput`, `ChoiceOutput`, `ScoreOutput`, `dispatch_ask_bool`, `dispatch_ask_choice`, `dispatch_ask_score`, the question/answer types, `decide_operation_descriptors_with_root_error`, `rpc_router as decide_rpc_router`. Decide's `StartServerInput`/`StopServerInput`/`dispatch_start_server`/`dispatch_stop_server` are intentionally not exported (they collide with Discuss exports).
 - Provider operation DTOs and dispatchers: `ListProvidersInput`, `ProvidersListOutput`, `dispatch_list_providers`, `AddProviderInput`, `SuccessOutput`, `dispatch_add_provider`, `RemoveProviderInput`, `ProviderRemoveSuccessOutput`, `dispatch_remove_provider` (generated from `messages.rs` declarations)
 - Custom content: `GetCustomAgentOutput`, `GetCustomSkillOutput`, `ImportCustomAgentFromUrlInput`, `ImportCustomSkillFromUrlInput`, `InstalledAssetKind`

@@ -1,23 +1,26 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use agent_client_protocol::v1::schema::{Meta, ToolCall, ToolCallStatus, ToolCallUpdate};
+use serde::{Deserialize, Serialize};
+use serde_json::{Error as JsonError, Value};
 
+use super::super::error::DiscussError;
+use super::super::launch_types::{
+    Effect, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, Operation, SessionLaunchConfig,
+};
 use super::super::library::{
     AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
 };
 use super::super::types::DiscussUtilityPayload;
-use super::super::types::{
-    DiscussError, Effect, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, Operation,
-    SessionLaunchConfig,
-};
 use super::files::{RenderedFile, write_rendered_files};
 use super::launch;
-use super::subagents::{SubagentObservation, SubagentTracker, tool_status_state};
+use super::subagents::{SubagentObservation, tool_status_state};
 use super::{
     BILLING_INPUT, BILLING_OUTPUT, BILLING_TOTAL, BillingCategorySemantics, ConfigSettings, ConnectionStrategy,
     DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig, PluginCaptureState, PrimaryAgentSelection,
-    render_skill_file, resolve_agent,
+    json_object, markdown_metadata, remove_file, render_skill_contents, render_skill_file, resolve_agent,
 };
 
 pub const CLAUDE_PLUGIN_NAME: &str = "claude-acp";
@@ -70,7 +73,7 @@ impl DiscussAgentPlugin for ClaudePlugin {
             plugin: CLAUDE_PLUGIN_NAME,
             path: ".claude/settings.json",
             default: || Ok("{}".to_owned()),
-            validate: |document| super::json_object(CLAUDE_PLUGIN_NAME, document).map(|_| ()),
+            validate: |document| json_object(CLAUDE_PLUGIN_NAME, document).map(|_| ()),
         })
     }
     fn billing_semantics(&self) -> BillingCategorySemantics {
@@ -129,7 +132,7 @@ impl DiscussAgentPlugin for ClaudePlugin {
             .extend_from_slice(tools);
         }
         let settings_path = context.settings_root.join("settings.json");
-        let serialize_error = |error: serde_json::Error| DiscussError::WorkspaceSerialize {
+        let serialize_error = |error: JsonError| DiscussError::WorkspaceSerialize {
             plugin: CLAUDE_PLUGIN_NAME.to_owned(),
             path: settings_path.to_string_lossy().into_owned(),
             format: "json".to_owned(),
@@ -143,7 +146,7 @@ impl DiscussAgentPlugin for ClaudePlugin {
         };
         let value = serde_json::to_value(options).map_err(serialize_error)?;
         let contents = serde_json::to_string(&Settings { permissions }).map_err(serialize_error)?;
-        std::fs::create_dir_all(&context.settings_root).map_err(|error| DiscussError::WorkspaceIo {
+        fs::create_dir_all(&context.settings_root).map_err(|error| DiscussError::WorkspaceIo {
             plugin: CLAUDE_PLUGIN_NAME.to_owned(),
             path: context.settings_root.to_string_lossy().into_owned(),
             message: error.to_string(),
@@ -166,30 +169,22 @@ impl DiscussAgentPlugin for ClaudePlugin {
         "plugin.claude-acp"
     }
 
-    fn capture_tool_call_with_state(
-        &self,
-        payload: &serde_json::Value,
-        _agent_scope_key: &str,
-        state: &mut PluginCaptureState,
-    ) -> Option<DiscussUtilityPayload> {
-        let PluginCaptureState::Subagents(tracker) = state else {
-            return None;
-        };
-        // With `clientCapabilities.subagents` the adapter reports `subagent_update`s instead.
-        if tracker.reports_lifecycle() {
-            return None;
-        }
-        capture_agent_tool(payload, tracker);
-        tracker.next()
+    fn capture_tool_call(&self, call: &ToolCall, state: &mut PluginCaptureState) -> Option<DiscussUtilityPayload> {
+        self.capture_tool_call_update(&call.clone().into(), state)
     }
 
-    fn capture_tool_call_update_with_state(
+    fn capture_tool_call_update(
         &self,
-        payload: &serde_json::Value,
-        agent_scope_key: &str,
+        update: &ToolCallUpdate,
         state: &mut PluginCaptureState,
     ) -> Option<DiscussUtilityPayload> {
-        self.capture_tool_call_with_state(payload, agent_scope_key, state)
+        capture_agent_tool(
+            &update.tool_call_id.0,
+            update.meta.as_ref(),
+            update.fields.raw_input.as_ref(),
+            update.fields.status.as_ref(),
+            state,
+        )
     }
 
     fn skill_scope_key(&self) -> &'static str {
@@ -220,7 +215,7 @@ impl DiscussAgentPlugin for ClaudePlugin {
 
     fn destroy_agent(&self, root: &Path, agent_id: &AgentId) -> Result<(), DiscussError> {
         let relative_path = Path::new(AGENTS_DIRECTORY).join(format!("{}.md", agent_id.normalized_destination()));
-        super::remove_file(CLAUDE_PLUGIN_NAME, root, &relative_path)
+        remove_file(CLAUDE_PLUGIN_NAME, root, &relative_path)
     }
 
     fn installed_agent_path(&self, id: &AgentId) -> PathBuf {
@@ -250,11 +245,11 @@ impl DiscussAgentPlugin for ClaudePlugin {
                 .join(skill.id.normalized_destination())
                 .join(&file.relative_path);
             let body = if file.relative_path == "SKILL.md" {
-                super::markdown_metadata(&file.contents)?.2
+                markdown_metadata(&file.contents)?.2
             } else {
                 &file.contents
             };
-            let contents = super::render_skill_contents(
+            let contents = render_skill_contents(
                 CLAUDE_PLUGIN_NAME,
                 &path,
                 &skill.id,
@@ -275,7 +270,7 @@ impl DiscussAgentPlugin for ClaudePlugin {
             let path = Path::new(SKILLS_DIRECTORY)
                 .join(skill.id.normalized_destination())
                 .join(&file.relative_path);
-            super::remove_file(CLAUDE_PLUGIN_NAME, root, &path)?;
+            remove_file(CLAUDE_PLUGIN_NAME, root, &path)?;
         }
         Ok(())
     }
@@ -300,7 +295,7 @@ impl DiscussAgentPlugin for ClaudePlugin {
             let relative_path = Path::new(SKILLS_DIRECTORY)
                 .join(skill.id.normalized_destination())
                 .join(file.relative_path);
-            super::remove_file(CLAUDE_PLUGIN_NAME, root, &relative_path)?;
+            remove_file(CLAUDE_PLUGIN_NAME, root, &relative_path)?;
         }
         Ok(())
     }
@@ -311,31 +306,68 @@ impl DiscussAgentPlugin for ClaudePlugin {
 /// carries `subagent_type` and `description`, and the ACP status follows the subagent. Without
 /// the AIR `backgroundSubagents` capability a backgrounded subagent keeps the call in progress
 /// until it ends, so the status covers background subagents too.
-fn capture_agent_tool(update: &serde_json::Value, tracker: &mut SubagentTracker) {
-    let Some(capture_id) = update.get("toolCallId").and_then(serde_json::Value::as_str) else {
-        return;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeToolMeta {
+    tool_name: Option<String>,
+    tool_response: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeToolInput {
+    subagent_type: Option<String>,
+    description: Option<String>,
+}
+
+fn capture_agent_tool(
+    capture_id: &str,
+    meta: Option<&Meta>,
+    raw_input: Option<&Value>,
+    status: Option<&ToolCallStatus>,
+    state: &mut PluginCaptureState,
+) -> Option<DiscussUtilityPayload> {
+    let PluginCaptureState::Subagents(tracker) = state else {
+        return None;
     };
-    let claude = update.get("_meta").and_then(|meta| meta.get("claudeCode"));
-    let tool = claude
-        .and_then(|claude| claude.get("toolName"))
-        .and_then(serde_json::Value::as_str);
+    if tracker.reports_lifecycle() {
+        return None;
+    }
+    let claude = meta
+        .and_then(|meta| meta.get("claudeCode"))
+        .and_then(|value| serde_json::from_value::<ClaudeToolMeta>(value.clone()).ok())
+        .filter(|meta| {
+            meta.tool_response.as_ref().is_none_or(|response| {
+                response.as_object().is_some_and(|object| {
+                    object
+                        .get("subagent_type")
+                        .is_none_or(|value| value.is_null() || value.is_string())
+                })
+            })
+        });
+    let tool = claude.as_ref().and_then(|meta| meta.tool_name.as_deref());
     if !matches!(tool, Some("Agent" | "Task")) && !tracker.knows(capture_id) {
-        return;
+        return tracker.next();
     }
-    let input = update.get("rawInput");
-    fn text<'a>(value: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
-        value
-            .and_then(|value| value.get(key))
-            .and_then(serde_json::Value::as_str)
-    }
-    let response = claude.and_then(|claude| claude.get("toolResponse"));
+    let input = raw_input.and_then(|input| serde_json::from_value::<ClaudeToolInput>(input.clone()).ok());
     tracker.observe(SubagentObservation {
         capture_id,
         child_session_id: None,
-        agent_name: text(input, "subagent_type").or_else(|| text(response, "subagentType")),
-        description: text(input, "description"),
-        state: tool_status_state(update.get("status").and_then(serde_json::Value::as_str)),
+        agent_name: input
+            .as_ref()
+            .and_then(|input| input.subagent_type.as_deref())
+            .or_else(|| {
+                claude
+                    .as_ref()
+                    .and_then(|meta| meta.tool_response.as_ref())
+                    .and_then(|response| response.get("subagent_type"))
+                    .and_then(Value::as_str)
+            }),
+        description: input
+            .as_ref()
+            .and_then(|input| input.description.as_deref()),
+        state: tool_status_state(status),
     });
+    tracker.next()
 }
 
 fn render_agent(
@@ -369,11 +401,13 @@ fn render_markdown<T: Serialize>(path: &Path, frontmatter: &T, body: &str) -> Re
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::launch_types::{Rule, RuleSet};
     use super::super::super::test_library;
-    use super::super::super::types::{DiscussSessionId, Rule, RuleSet};
+    use super::super::super::types::{DiscussSessionId, DiscussSubagentRecord};
+    use super::super::subagents::SubagentTracker;
     use super::*;
 
-    fn subagent(payload: Option<DiscussUtilityPayload>) -> super::super::super::types::DiscussSubagentRecord {
+    fn subagent(payload: Option<DiscussUtilityPayload>) -> DiscussSubagentRecord {
         match payload {
             Some(DiscussUtilityPayload::Subagent { subagent }) => subagent,
             other => panic!("expected a subagent, got {other:?}"),
@@ -384,29 +418,33 @@ mod tests {
     fn agent_tool_calls_report_the_subagent_lifecycle() {
         use super::super::super::types::DiscussSubagentSurfaceState::{Done, Live, Loading};
         let mut state = PluginCaptureState::Subagents(SubagentTracker::default());
-        let start = serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "toolu_1", "kind": "think",
+        let start: ToolCall = serde_json::from_value(
+            serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "toolu_1", "title": "Agent", "kind": "think",
             "status": "pending", "rawInput": {"description": "Explore auth", "subagent_type": "Explore"},
-            "_meta": {"claudeCode": {"toolName": "Agent"}}});
-        let first = subagent(PLUGIN.capture_tool_call_with_state(&start, "", &mut state));
+            "_meta": {"claudeCode": {"toolName": "Agent"}}}),
+        )
+        .expect("tool call");
+        let first = subagent(PLUGIN.capture_tool_call(&start, &mut state));
         assert_eq!((first.surface_state, first.agent_name.as_str()), (Loading, "Explore"));
         assert_eq!(first.description.as_deref(), Some("Explore auth"));
-        let running = serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "toolu_1",
-            "status": "in_progress", "_meta": {"claudeCode": {"toolName": "Agent"}}});
-        let live = subagent(PLUGIN.capture_tool_call_update_with_state(&running, "", &mut state));
+        let running: ToolCallUpdate = serde_json::from_value(
+            serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "toolu_1",
+            "status": "in_progress", "_meta": {"claudeCode": {"toolName": "Agent"}}}),
+        )
+        .expect("tool update");
+        let live = subagent(PLUGIN.capture_tool_call_update(&running, &mut state));
         assert_eq!((live.surface_state, live.agent_name.as_str()), (Live, "Explore"));
-        let done =
-            serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "toolu_1", "status": "completed"});
+        let done: ToolCallUpdate = serde_json::from_value(
+            serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "toolu_1", "status": "completed"}),
+        )
+        .expect("tool update");
         assert_eq!(
-            subagent(PLUGIN.capture_tool_call_update_with_state(&done, "", &mut state)).surface_state,
+            subagent(PLUGIN.capture_tool_call_update(&done, &mut state)).surface_state,
             Done
         );
-        let other = serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "toolu_2", "status": "pending",
-            "_meta": {"claudeCode": {"toolName": "Read"}}});
-        assert!(
-            PLUGIN
-                .capture_tool_call_with_state(&other, "", &mut state)
-                .is_none()
-        );
+        let other: ToolCall = serde_json::from_value(serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "toolu_2", "title": "Read", "status": "pending",
+            "_meta": {"claudeCode": {"toolName": "Read"}}})).expect("tool call");
+        assert!(PLUGIN.capture_tool_call(&other, &mut state).is_none());
     }
     use std::fs;
     use tempfile::tempdir;

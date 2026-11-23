@@ -11,7 +11,9 @@ use aves::runtime::{
 };
 use aves::utils::errors::SharedInfraError;
 
+use super::agent_nodes::WorkspaceCopySourcePort;
 use super::boot::{DiscussBootOptions, DiscussSettings};
+use super::error::DiscussError;
 use super::handle::new as construct_discuss_domain;
 use super::messages::{
     AgentNodeStartedOutput, AgentNodeTickedOutput, AnswerElicitationInput, AnswerPermissionInput, AssignMcpInput,
@@ -32,7 +34,6 @@ use super::messages::{
     ResolveSessionIdentityInput, SendUserTurnInput, SessionIdentityResolvedOutput, SetProviderManagedConfigInput,
     StartAgentInput, StartInspectorInput, SuccessOutput, TickAgentInput, UnassignMcpInput, UpdateCustomMcpInput,
 };
-use super::types::{DiscussError, WorkspaceCopySourcePort};
 
 /// Empty lifecycle marker. Runtime state remains owned by the domain handle.
 pub struct DiscussDomain;

@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use agent_client_protocol::v1::schema::Meta;
 
-use super::super::types::{
-    DiscussError, DiscussSessionId, Effect, LaunchLimitation, Operation, Rule, RuleSet, SessionLaunchConfig,
-};
+use super::super::error::DiscussError;
+use super::super::launch_types::{Effect, LaunchLimitation, Operation, Rule, RuleSet, SessionLaunchConfig};
+use super::super::types::DiscussSessionId;
 use super::ConfigSettings;
 
 pub(crate) struct LaunchContext {
@@ -97,7 +97,7 @@ pub(crate) fn merge_metadata(first: Option<Meta>, second: Option<Meta>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::types::{LaunchLimitationReason, LaunchLimitationSubject, LaunchPermissionOutcome};
+    use super::super::super::launch_types::{LaunchLimitationReason, LaunchLimitationSubject, LaunchPermissionOutcome};
     use super::super::{DEFAULT_PLUGIN, DiscussAgentPlugin};
     use super::*;
     use serde_json::json;

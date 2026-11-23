@@ -7,8 +7,8 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 
+use super::error::DiscussError;
 use super::library::{CustomSkillFile, validate_custom_relative_path};
-use super::types::DiscussError;
 
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_FILES: usize = 64;

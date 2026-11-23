@@ -1,12 +1,18 @@
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::v1::{ConnectionTo, schema::McpServer};
-use agent_client_protocol::{Agent, ByteStreams, Client};
+use agent_client_protocol::v1::{
+    ConnectionTo,
+    schema::{AgentCapabilities, AuthStatusRequest, McpServer},
+};
+use agent_client_protocol::{Agent, ByteStreams, Client, Error as AcpError};
+use serde_json::to_value;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
+use tokio::{io, pin, process, select, spawn, time};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use turso::Connection;
 
@@ -16,12 +22,16 @@ use super::actor::{
     Actor, PROVIDER_CHILD_REAP_DEADLINE, PendingProviderTest, ProviderRestartReady, SharedConnectionReady,
     SharedProviderEvent, SpawnSessionOptions, channel_send_error,
 };
+use super::boot::persist_discuss_agents;
 use super::config::{config_options_from_json, config_settings_from_json, config_settings_from_value};
 use super::database::{cleanup_warning, persistence_context, retained_team_assets_by_scope};
+use super::error::DiscussError;
+use super::launch_types::AcpProvider;
 use super::library::{AgentId, SkillId};
+use super::mcp::clear_mcp_scope;
 use super::messages::DiscussResponse;
 use super::plugins;
-use super::session::{initialize_request, revoke_worker_jti};
+use super::session::{SessionCallbackRouter, initialize_request, revoke_worker_jti};
 use super::storage::{
     CustomInstallationKind, DISCUSS_AGENT_CONFIG_UPSERT_SQL, DiscussAgentConfigRow, delete_custom_installation,
     delete_discuss_agent_config, delete_discuss_session, delete_discuss_team_installation, list_custom_installations,
@@ -30,12 +40,12 @@ use super::storage::{
 };
 use super::supervisor::{CallbackRouteRegistry, CallbackRouter, ProviderSupervisor, ProviderSupervisorResources};
 use super::types::{
-    AcpProvider, CleanupWarning, DiscussConfigOption, DiscussError, DiscussProviderConfig, DiscussSessionId,
-    ProviderRuntimeState, WorkerCommand,
+    CleanupWarning, CustomMcpScope, DiscussAuthState, DiscussConfigOption, DiscussProviderConfig, DiscussSessionId,
+    ProviderRuntimeState, WorkerCommand, auth_status_from_response,
 };
 
 /// Connection plus native-ACP MCP, HTTP MCP and session system-prompt support.
-type SharedConnectionResult = Result<(ConnectionTo<Agent>, bool, bool, bool, bool), agent_client_protocol::Error>;
+type SharedConnectionResult = Result<(ConnectionTo<Agent>, AgentCapabilities), AcpError>;
 
 impl Actor {
     /// Add a provider to the ACP server.
@@ -264,9 +274,9 @@ impl Actor {
         }
         let previous_provider = self.agents.get(&provider_name).cloned();
         let requires_connectivity = force_connectivity
-            || previous_provider.as_ref().is_none_or(|previous| {
-                serde_json::to_value(previous.server()).ok() != serde_json::to_value(provider_spec.server()).ok()
-            });
+            || previous_provider
+                .as_ref()
+                .is_none_or(|previous| to_value(previous.server()).ok() != to_value(provider_spec.server()).ok());
 
         if requires_connectivity {
             let conn = self.persistence.acquire_connection().await?;
@@ -292,7 +302,7 @@ impl Actor {
                         launch_config: None,
                         name: Some("Provider connectivity check".to_string()),
                         setup: None,
-                        session_config_overrides: std::collections::BTreeMap::new(),
+                        session_config_overrides: BTreeMap::new(),
                         acp_session_id: None,
                         announce_desktop_association: false,
                         transient_connectivity: true,
@@ -454,6 +464,48 @@ impl Actor {
         })
     }
 
+    /// Read authentication state from an existing provider connection.
+    pub(super) async fn handle_get_provider_auth_status(
+        &self,
+        provider_name: &str,
+    ) -> Result<DiscussResponse, DiscussError> {
+        if let Some(ProviderSupervisorResources::Shared {
+            connection: Some(connection),
+            capabilities,
+            ..
+        }) = self
+            .provider_supervisors
+            .get(provider_name)
+            .map(|supervisor| &supervisor.resources)
+        {
+            if capabilities.auth.status.is_some() {
+                let response = connection
+                    .send_request(AuthStatusRequest::new())
+                    .block_task()
+                    .await?;
+                let (status, accounts) = auth_status_from_response(response);
+                return Ok(DiscussResponse::ProviderAuthStatus { status, accounts });
+            }
+        } else if let Some(entry) = self
+            .worker_registry
+            .values()
+            .find(|entry| entry.agent_name == provider_name && !entry.join_handle.is_finished())
+        {
+            let (reply, response) = oneshot::channel();
+            entry
+                .command_tx
+                .send(WorkerCommand::GetAuthStatus { reply })
+                .await
+                .map_err(|error| channel_send_error("get_provider_auth_status.worker_command", error.to_string()))?;
+            let (status, accounts) = response.await.map_err(|_| DiscussError::OneshotReply)??;
+            return Ok(DiscussResponse::ProviderAuthStatus { status, accounts });
+        }
+        Ok(DiscussResponse::ProviderAuthStatus {
+            status: DiscussAuthState::Unknown,
+            accounts: Vec::new(),
+        })
+    }
+
     fn provider_runtime_states(&self) -> Vec<ProviderRuntimeState> {
         let mut providers = self
             .provider_supervisors
@@ -560,62 +612,43 @@ impl Actor {
         let callback_routes_for_connection = callback_routes.clone();
         let (ready_tx, ready_rx) = oneshot::channel::<SharedConnectionResult>();
         let (exit_tx, exit_rx) = oneshot::channel();
-        let owner = tokio::spawn(async move {
-            let stderr_task = tokio::spawn(async move {
-                let mut sink = tokio::io::sink();
-                let _ = tokio::io::copy(&mut child_stderr, &mut sink).await;
+        let owner = spawn(async move {
+            let stderr_task = spawn(async move {
+                let mut sink = io::sink();
+                let _ = io::copy(&mut child_stderr, &mut sink).await;
             });
             let connection = Client
                 .v1()
                 .connect_with(transport, move |connection: ConnectionTo<Agent>| async move {
-                    let _callback_handler = connection.add_dynamic_handler(
-                        super::session::SessionCallbackRouter::new(callback_routes_for_connection.clone()),
-                    )?;
+                    let _callback_handler = connection
+                        .add_dynamic_handler(SessionCallbackRouter::new(callback_routes_for_connection.clone()))?;
                     let init_response = connection
                         .send_request(initialize_request())
                         .block_task()
                         .await?;
-                    let _ = ready_tx.send(Ok((
-                        connection.clone(),
-                        init_response.agent_capabilities.mcp_capabilities.acp,
-                        init_response.agent_capabilities.mcp_capabilities.http,
-                        init_response
-                            .agent_capabilities
-                            .session_capabilities
-                            .system_prompt
-                            .is_some(),
-                        init_response
-                            .agent_capabilities
-                            .session_capabilities
-                            .title
-                            .is_some(),
-                    )));
+                    let _ = ready_tx.send(Ok((connection.clone(), init_response.agent_capabilities)));
                     connection.incoming_closed().await;
                     Ok(())
                 });
-            tokio::pin!(connection);
-            tokio::select! {
+            pin!(connection);
+            select! {
                 _ = &mut connection => {}
                 _ = child.wait() => {}
             }
             stderr_task.abort();
             let _ = exit_tx.send(());
         });
-        let (connection, mcp_acp, mcp_http, system_prompt, title_supported) =
-            Self::shared_connection_result(provider_name, ready_rx, &owner).await?;
+        let (connection, capabilities) = Self::shared_connection_result(provider_name, ready_rx, &owner).await?;
         Ok(SharedConnectionReady {
             connection,
             owner,
             exit_rx,
-            mcp_acp,
-            mcp_http,
-            system_prompt,
-            title_supported,
+            capabilities,
             callback_routes,
         })
     }
 
-    fn spawn_shared_provider_process(&self, provider_name: &str) -> Result<tokio::process::Child, DiscussError> {
+    fn spawn_shared_provider_process(&self, provider_name: &str) -> Result<process::Child, DiscussError> {
         let provider = self
             .agents
             .get(provider_name)
@@ -630,7 +663,7 @@ impl Actor {
                 message: "Shared Providers require a stdio ACP server".to_string(),
             });
         };
-        let mut command = tokio::process::Command::new(&server.command);
+        let mut command = process::Command::new(&server.command);
         command
             .args(&server.args)
             .envs(
@@ -671,23 +704,21 @@ impl Actor {
         provider_name: &str,
         ready_rx: oneshot::Receiver<SharedConnectionResult>,
         owner: &JoinHandle<()>,
-    ) -> Result<(ConnectionTo<Agent>, bool, bool, bool, bool), DiscussError> {
-        let ready_result = ready_rx.await;
-        let (connection, mcp_acp, mcp_http, system_prompt, title_supported) = match ready_result {
-            Ok(Ok(ready)) => ready,
+    ) -> Result<(ConnectionTo<Agent>, AgentCapabilities), DiscussError> {
+        match ready_rx.await {
+            Ok(Ok(ready)) => Ok(ready),
             Ok(Err(error)) => {
                 owner.abort();
-                return Err(DiscussError::from(error));
+                Err(DiscussError::from(error))
             }
             Err(error) => {
                 owner.abort();
-                return Err(DiscussError::ProviderRuntime {
+                Err(DiscussError::ProviderRuntime {
                     provider_name: provider_name.to_string(),
                     message: format!("shared Provider connection did not initialize: {error}"),
-                });
+                })
             }
-        };
-        Ok((connection, mcp_acp, mcp_http, system_prompt, title_supported))
+        }
     }
 
     async fn ensure_shared_provider_connection(&mut self, provider_name: &str) -> Result<(), DiscussError> {
@@ -715,19 +746,13 @@ impl Actor {
         if let ProviderSupervisorResources::Shared {
             connection,
             connection_owner,
-            mcp_acp,
-            mcp_http,
-            system_prompt,
-            title_supported,
+            capabilities,
             callback_routes,
             ..
         } = &mut supervisor.resources
         {
             *connection = Some(ready.connection);
-            *mcp_acp = ready.mcp_acp;
-            *mcp_http = ready.mcp_http;
-            *system_prompt = ready.system_prompt;
-            *title_supported = ready.title_supported;
+            **capabilities = ready.capabilities;
             *callback_routes = Some(ready.callback_routes.clone());
             *connection_owner = Some(ready.owner);
         } else {
@@ -756,7 +781,7 @@ impl Actor {
         let generation = *generation;
         let event_tx = self.shared_provider_event_tx.clone();
         let provider_name_for_event = provider_name.to_string();
-        let watcher = tokio::spawn(async move {
+        let watcher = spawn(async move {
             let _ = exit_rx.await;
             let _ = event_tx
                 .send(SharedProviderEvent {
@@ -817,7 +842,7 @@ impl Actor {
                 let event_tx = self.provider_restart_ready_tx.clone();
                 let provider_name = event.provider_name.clone();
                 let generation = event.generation;
-                let task = tokio::spawn(async move {
+                let task = spawn(async move {
                     let mut backoff = RetryBackoff::new(Duration::from_millis(500), Duration::from_secs(30));
                     if sleep_with_backoff(&mut backoff, &mut cancel_rx).await {
                         let _ = event_tx
@@ -860,7 +885,7 @@ impl Actor {
         for session_id in &session_ids {
             if let Some(entry) = self.worker_registry.remove(session_id) {
                 entry.join_handle.abort();
-                let _ = tokio::time::timeout(PROVIDER_CHILD_REAP_DEADLINE, entry.join_handle).await;
+                let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, entry.join_handle).await;
                 revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
             }
             if let Some(supervisor) = self.provider_supervisors.get_mut(provider_name) {
@@ -897,19 +922,13 @@ impl Actor {
                     connection_watcher,
                     callback_router,
                     callback_routes,
-                    mcp_acp,
-                    mcp_http,
-                    system_prompt,
-                    title_supported,
+                    capabilities,
                     ..
                 } => {
                     supervisor.chat_sessions.clear();
                     connection.take();
                     *callback_router = Arc::new(Mutex::new(CallbackRouter::default()));
-                    *mcp_acp = false;
-                    *mcp_http = false;
-                    *system_prompt = false;
-                    *title_supported = false;
+                    **capabilities = AgentCapabilities::new();
                     (
                         connection_owner.take(),
                         connection_watcher.take(),
@@ -925,11 +944,11 @@ impl Actor {
         }
         if let Some(owner) = connection_owner {
             owner.abort();
-            let _ = tokio::time::timeout(PROVIDER_CHILD_REAP_DEADLINE, owner).await;
+            let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, owner).await;
         }
         if let Some(watcher) = connection_watcher {
             watcher.abort();
-            let _ = tokio::time::timeout(PROVIDER_CHILD_REAP_DEADLINE, watcher).await;
+            let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, watcher).await;
         }
     }
 
@@ -1042,7 +1061,7 @@ impl Actor {
                         launch_config: None,
                         name: Some(row.session_name),
                         setup: None,
-                        session_config_overrides: std::collections::BTreeMap::new(),
+                        session_config_overrides: BTreeMap::new(),
                         acp_session_id: Some(acp_session_id),
                         announce_desktop_association: false,
                         transient_connectivity: false,
@@ -1070,7 +1089,7 @@ impl Actor {
         for session_id in &session_ids {
             if let Some(entry) = self.worker_registry.remove(session_id) {
                 entry.join_handle.abort();
-                let _ = tokio::time::timeout(PROVIDER_CHILD_REAP_DEADLINE, entry.join_handle).await;
+                let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, entry.join_handle).await;
                 revoke_worker_jti(
                     self.auth_service.as_ref(),
                     entry.worker_jti,
@@ -1149,11 +1168,11 @@ impl Actor {
         }
         if let Some(owner) = connection_owner {
             owner.abort();
-            let _ = tokio::time::timeout(PROVIDER_CHILD_REAP_DEADLINE, owner).await;
+            let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, owner).await;
         }
         if let Some(watcher) = connection_watcher {
             watcher.abort();
-            let _ = tokio::time::timeout(PROVIDER_CHILD_REAP_DEADLINE, watcher).await;
+            let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, watcher).await;
         }
         if let Some(supervisor) = self.provider_supervisors.get_mut(provider_name) {
             supervisor.chat_sessions.clear();
@@ -1227,7 +1246,7 @@ impl Actor {
         }
         let conn = self.persistence.acquire_connection().await?;
         self.remove_provider_sessions(&conn, provider_name).await?;
-        super::mcp::clear_mcp_scope(&conn, super::types::CustomMcpScope::Provider, provider_name).await?;
+        clear_mcp_scope(&conn, CustomMcpScope::Provider, provider_name).await?;
         let removed_team_installations = list_discuss_team_installations_by_provider(&conn, provider_name).await?;
         let surviving_team_installations = list_discuss_team_installations(&conn)
             .await?
@@ -1406,8 +1425,7 @@ impl Actor {
         }
 
         for session in &sessions {
-            super::mcp::clear_mcp_scope(conn, super::types::CustomMcpScope::Session, &session.discuss_session_id)
-                .await?;
+            clear_mcp_scope(conn, CustomMcpScope::Session, &session.discuss_session_id).await?;
             delete_discuss_session(conn, &session.discuss_session_id).await?;
         }
 
@@ -1430,7 +1448,7 @@ impl Actor {
     }
 
     async fn persist_agents(&self) -> Result<(), DiscussError> {
-        super::boot::persist_discuss_agents(&self.root_context, &self.agents).await
+        persist_discuss_agents(&self.root_context, &self.agents).await
     }
 }
 

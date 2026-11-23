@@ -17,7 +17,9 @@ pub use messages::{
     SuccessOutput, TASKS_REQUEST_PAYLOAD_OPERATIONS, TasksBroadcast, TasksRequestPayload, TasksResponse,
     TickScriptInput, TickShellInput, rpc_router,
 };
+pub use shell::run_shell;
 pub use types::{
     ScriptNodeCompletion, ScriptNodeFailure, ScriptNodeOutputs, ScriptNodeTickResult, ShellNodeCompletion,
-    ShellNodeFailure, ShellNodeTickResult, ShellPostSpawnFailureKind, TasksError,
+    ShellNodeFailure, ShellNodeTickResult, ShellPostSpawnFailureKind, ShellRunSpec, ShellTerminal, ShellTerminalCause,
+    TasksError,
 };

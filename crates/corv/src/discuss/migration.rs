@@ -46,4 +46,9 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "session_launch_limitations",
         sql: include_str!("../../migrations/0009_session_launch_limitations.sql"),
     },
+    Migration {
+        version: 10,
+        name: "session_modes",
+        sql: include_str!("../../migrations/0010_session_modes.sql"),
+    },
 ];

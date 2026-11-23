@@ -2,29 +2,35 @@ pub(super) mod permissions;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env::{self, VarError},
     fs,
+    io::{Error as IoError, ErrorKind},
     path::{Path, PathBuf},
 };
 
-use agent_client_protocol::v1::schema::{EnvVariable, McpServer};
+use agent_client_protocol::v1::schema::{EnvVariable, McpServer, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
+use super::super::error::DiscussError;
+use super::super::launch_types::{
+    LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, SessionCliLogin, SessionLaunchConfig,
+};
 use super::super::library::{
     AgentId, AgentRole, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
     SkillDefinition, SkillId, TeamDefinition,
 };
 use super::super::types::{
-    DiscussError, DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTodoItem, DiscussTodoSnapshot,
-    DiscussTodoStatus, DiscussUtilityPayload, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject,
-    SessionCliLogin, SessionLaunchConfig,
+    DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussTodoItem, DiscussTodoSnapshot, DiscussTodoStatus,
+    DiscussUtilityPayload,
 };
 use super::files::{RenderedFile, write_rendered_files};
-use super::subagents::{SubagentObservation, SubagentTracker};
+use super::subagents::{SubagentObservation, SubagentTracker, tool_status_state};
 use super::{
     BILLING_INPUT, BILLING_OUTPUT, BILLING_TOTAL, BillingCategorySemantics, ConfigSettings, ConnectionStrategy,
     DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig, PluginCaptureState, PrimaryAgentSelection,
-    render_skill_file, resolve_agent, resolve_skill,
+    json_object, markdown_metadata, render_skill_contents, render_skill_file, resolve_agent, resolve_skill,
 };
 
 pub const OPENCODE_PLUGIN_NAME: &str = "opencode";
@@ -64,8 +70,22 @@ struct V2SubagentInput {
 }
 
 #[derive(Deserialize)]
-struct V2SubagentResult {
+struct V2SubagentOutput {
+    metadata: Option<Value>,
+    result: Option<Value>,
     #[serde(rename = "sessionID")]
+    session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct V1SubagentInput {
+    subagent_type: String,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V1SubagentMetadata {
     session_id: Option<String>,
 }
 
@@ -78,15 +98,29 @@ struct OpenCodeSubagentCapture {
 /// OpenCode's `child_update` status for a direct child of the session (`created` | `running` |
 /// `completed` | `failed` | `interrupted`). Nested children and transcript updates are ignored;
 /// the subagent inspector loads the child session itself.
-fn capture_child_update(params: &serde_json::Value, tracker: &mut SubagentTracker) {
-    let text = |key: &str| params.get(key).and_then(serde_json::Value::as_str);
-    if text("type") != Some("status") || text("parentSessionId") != text("rootSessionId") {
-        return;
-    }
-    let Some(child) = text("childSessionId") else {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChildUpdate {
+    root_session_id: Option<String>,
+    parent_session_id: Option<String>,
+    child_session_id: Option<String>,
+    title: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    status: Option<String>,
+}
+
+fn capture_child_update(params: &Value, tracker: &mut SubagentTracker) {
+    let Ok(update) = serde_json::from_value::<ChildUpdate>(params.clone()) else {
         return;
     };
-    let state = match text("status") {
+    if update.kind.as_deref() != Some("status") || update.parent_session_id != update.root_session_id {
+        return;
+    }
+    let Some(child) = update.child_session_id.as_deref() else {
+        return;
+    };
+    let state = match update.status.as_deref() {
         Some("created") => DiscussSubagentSurfaceState::Loading,
         Some("running") => DiscussSubagentSurfaceState::Live,
         Some("completed") => DiscussSubagentSurfaceState::Done,
@@ -97,7 +131,7 @@ fn capture_child_update(params: &serde_json::Value, tracker: &mut SubagentTracke
         capture_id: child,
         child_session_id: Some(child),
         agent_name: None,
-        description: text("title"),
+        description: update.title.as_deref(),
         state: Some(state),
     });
 }
@@ -241,7 +275,7 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         let ownership_path = root.join(SESSION_CONFIG_PATH);
         let previous: SessionConfigOwnership = match fs::read_to_string(&ownership_path) {
             Ok(content) => serde_json::from_str(&content)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionConfigOwnership::default(),
+            Err(error) if error.kind() == ErrorKind::NotFound => SessionConfigOwnership::default(),
             Err(error) => {
                 return Err(DiscussError::WorkspaceIo {
                     plugin: OPENCODE_PLUGIN_NAME.to_string(),
@@ -251,8 +285,8 @@ impl DiscussAgentPlugin for OpenCodePlugin {
             }
         };
         let mut project = match fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str::<serde_json::Value>(&content)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Ok(content) => serde_json::from_str::<Value>(&content)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => serde_json::json!({}),
             Err(error) => {
                 return Err(DiscussError::WorkspaceIo {
                     plugin: OPENCODE_PLUGIN_NAME.to_string(),
@@ -273,9 +307,9 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         if !previous.mcp_servers.is_empty() {
             let servers = object
                 .get_mut("mcp")
-                .and_then(serde_json::Value::as_object_mut)
+                .and_then(Value::as_object_mut)
                 .and_then(|mcp| mcp.get_mut("servers"))
-                .and_then(serde_json::Value::as_object_mut)
+                .and_then(Value::as_object_mut)
                 .ok_or_else(|| DiscussError::Validation {
                     message: "Unsupported OpenCode project MCP configuration".to_string(),
                 })?;
@@ -313,7 +347,7 @@ impl DiscussAgentPlugin for OpenCodePlugin {
             }
         }
         if !config.mcp_servers.is_empty() {
-            let mut incoming = serde_json::Map::new();
+            let mut incoming = Map::new();
             for descriptor in &config.mcp_servers {
                 let (name, value) = match descriptor {
                     McpServer::Stdio(mcp) => {
@@ -442,22 +476,22 @@ impl DiscussAgentPlugin for OpenCodePlugin {
             .rev()
             .find(|entry| entry.name == "OPENCODE_CONFIG_CONTENT")
             .map(|entry| Ok(Some(entry.value.clone())))
-            .unwrap_or_else(|| match std::env::var("OPENCODE_CONFIG_CONTENT") {
+            .unwrap_or_else(|| match env::var("OPENCODE_CONFIG_CONTENT") {
                 Ok(value) => Ok(Some(value)),
-                Err(std::env::VarError::NotPresent) => Ok(None),
-                Err(std::env::VarError::NotUnicode(_)) => Err(DiscussError::Validation {
+                Err(VarError::NotPresent) => Ok(None),
+                Err(VarError::NotUnicode(_)) => Err(DiscussError::Validation {
                     message: "OpenCode inline configuration is not UTF-8".to_string(),
                 }),
             })?;
         let mut content = if let Some(inline) = inline {
-            serde_json::from_str::<serde_json::Value>(&inline)
+            serde_json::from_str::<Value>(&inline)
                 .ok()
                 .and_then(|value| value.as_object().cloned())
                 .ok_or_else(|| DiscussError::Validation {
                     message: "OpenCode inline configuration must be a JSON object".to_string(),
                 })?
         } else {
-            serde_json::Map::new()
+            Map::new()
         };
         if !config.rule_sources.is_empty() {
             if ["permission", "permissions", "policies"]
@@ -475,12 +509,12 @@ impl DiscussAgentPlugin for OpenCodePlugin {
                 });
             }
             let fragment = serde_json::to_value(translation.config)?;
-            if let serde_json::Value::Object(fragment) = fragment {
+            if let Value::Object(fragment) = fragment {
                 content.extend(fragment);
             }
         }
         if !config.mcp_servers.is_empty() {
-            let mut servers = serde_json::Map::new();
+            let mut servers = Map::new();
             for descriptor in &config.mcp_servers {
                 let (name, value) = match descriptor {
                     McpServer::Stdio(mcp) => {
@@ -554,7 +588,7 @@ impl DiscussAgentPlugin for OpenCodePlugin {
                     message: "Unsupported OpenCode inline plugins configuration".to_string(),
                 })?;
             for reference in &config.plugin_references {
-                let value = serde_json::Value::String(reference.clone());
+                let value = Value::String(reference.clone());
                 if !plugins.contains(&value) {
                     plugins.push(value);
                 }
@@ -574,17 +608,14 @@ impl DiscussAgentPlugin for OpenCodePlugin {
     // `task` accepts `{ description, prompt, subagent_type, task_id? }`.
     // OpenCode emits task lifecycle statuses through ACP `status` updates:
     // `pending`, `in_progress`, `completed`, and `failed`.
-    fn capture_tool_call(&self, payload: &serde_json::Value, agent_scope_key: &str) -> Option<DiscussUtilityPayload> {
-        if agent_scope_key != self.agent_scope_key() {
-            return None;
-        }
-        classify_tool_payload(payload)
+    fn capture_tool_call(&self, call: &ToolCall, state: &mut PluginCaptureState) -> Option<DiscussUtilityPayload> {
+        self.capture_tool_call_update(&call.clone().into(), state)
     }
 
     fn capture_extension_notification(
         &self,
         method: &str,
-        params: &serde_json::Value,
+        params: &Value,
         state: &mut PluginCaptureState,
     ) -> Option<DiscussUtilityPayload> {
         let PluginCaptureState::OpenCode(state) = state else {
@@ -604,37 +635,13 @@ impl DiscussAgentPlugin for OpenCodePlugin {
 
     fn capture_tool_call_update(
         &self,
-        payload: &serde_json::Value,
-        agent_scope_key: &str,
-    ) -> Option<DiscussUtilityPayload> {
-        if agent_scope_key != self.agent_scope_key() {
-            return None;
-        }
-        classify_tool_payload(payload)
-    }
-
-    fn capture_tool_call_with_state(
-        &self,
-        payload: &serde_json::Value,
-        agent_scope_key: &str,
+        update: &ToolCallUpdate,
         state: &mut PluginCaptureState,
     ) -> Option<DiscussUtilityPayload> {
-        if agent_scope_key != self.agent_scope_key() {
-            return None;
-        }
         let PluginCaptureState::OpenCode(state) = state else {
             return None;
         };
-        capture_subagent_update(payload, state)
-    }
-
-    fn capture_tool_call_update_with_state(
-        &self,
-        payload: &serde_json::Value,
-        agent_scope_key: &str,
-        state: &mut PluginCaptureState,
-    ) -> Option<DiscussUtilityPayload> {
-        self.capture_tool_call_with_state(payload, agent_scope_key, state)
+        state.capture_update(update)
     }
 
     fn agent_scope_key(&self) -> &'static str {
@@ -650,7 +657,7 @@ impl DiscussAgentPlugin for OpenCodePlugin {
             plugin: OPENCODE_PLUGIN_NAME,
             path: CONFIG_PATH,
             default: render_config,
-            validate: |document| super::json_object(OPENCODE_PLUGIN_NAME, document).map(|_| ()),
+            validate: |document| json_object(OPENCODE_PLUGIN_NAME, document).map(|_| ()),
         })
     }
 
@@ -659,7 +666,7 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         let path = root.join(CONFIG_PATH);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(capture_write_error(&path, error)),
         }
     }
@@ -741,11 +748,11 @@ impl DiscussAgentPlugin for OpenCodePlugin {
                 .join(skill.id.normalized_destination())
                 .join(&file.relative_path);
             let body = if file.relative_path == "SKILL.md" {
-                super::markdown_metadata(&file.contents)?.2
+                markdown_metadata(&file.contents)?.2
             } else {
                 &file.contents
             };
-            let contents = super::render_skill_contents(
+            let contents = render_skill_contents(
                 OPENCODE_PLUGIN_NAME,
                 &path,
                 &skill.id,
@@ -797,39 +804,37 @@ impl DiscussAgentPlugin for OpenCodePlugin {
     }
 }
 
-fn classify_tool_payload(payload: &serde_json::Value) -> Option<DiscussUtilityPayload> {
-    let update = payload
-        .get("sessionUpdate")
-        .and_then(serde_json::Value::as_str)?;
-    if !matches!(update, "tool_call" | "tool_call_update") {
-        return None;
-    }
-    if payload.get("title").and_then(serde_json::Value::as_str) == Some("todowrite") {
-        return parse_todo_snapshot(payload);
-    }
-    if payload.get("kind").and_then(serde_json::Value::as_str) == Some("think") {
-        return parse_subagent(payload);
-    }
-    None
+#[derive(Deserialize)]
+struct TodoInput {
+    todos: Vec<TodoEntry>,
+}
+#[derive(Deserialize)]
+struct TodoEntry {
+    content: String,
+    status: String,
 }
 
-fn parse_todo_snapshot(update: &serde_json::Value) -> Option<DiscussUtilityPayload> {
+fn parse_todo_snapshot(update: &ToolCallUpdate) -> Option<DiscussUtilityPayload> {
     let todos = update
-        .get("rawInput")
-        .and_then(|input| input.get("todos"))
+        .fields
+        .raw_input
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<TodoInput>(value.clone()).ok())
         .or_else(|| {
             update
-                .get("rawOutput")
-                .and_then(|output| output.get("metadata"))
-                .and_then(|metadata| metadata.get("todos"))
-        })?
-        .as_array()?;
+                .fields
+                .raw_output
+                .as_ref()
+                .and_then(|value| value.get("metadata"))
+                .and_then(|value| serde_json::from_value::<TodoInput>(value.clone()).ok())
+        })?;
     let items = todos
-        .iter()
+        .todos
+        .into_iter()
         .map(|todo| {
             Some(DiscussTodoItem {
-                content: todo.get("content")?.as_str()?.to_string(),
-                status: parse_todo_status(todo.get("status")?.as_str()?)?,
+                content: todo.content,
+                status: parse_todo_status(&todo.status)?,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -848,70 +853,23 @@ fn parse_todo_status(status: &str) -> Option<DiscussTodoStatus> {
     }
 }
 
-fn parse_subagent(update: &serde_json::Value) -> Option<DiscussUtilityPayload> {
-    let input = update.get("rawInput")?;
-    let metadata = update.get("rawOutput")?.get("metadata")?;
-    let child_session_id = metadata.get("sessionId")?.as_str()?;
-    let agent_name = input.get("subagent_type")?.as_str()?;
-    let surface_state = match update.get("status").and_then(serde_json::Value::as_str) {
-        // OpenCode's ACP adapter maps its pending/running/completed/error task
-        // states to ACP pending/in_progress/completed/failed statuses.
-        Some("pending") | None => DiscussSubagentSurfaceState::Loading,
-        Some("in_progress") | Some("running") => DiscussSubagentSurfaceState::Live,
-        Some("completed") => DiscussSubagentSurfaceState::Done,
-        Some("failed") => DiscussSubagentSurfaceState::Error,
-        Some(_) => return None,
-    };
-    if child_session_id.is_empty() || agent_name.is_empty() {
-        return None;
-    }
-    let description = input
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .filter(|description| !description.is_empty())
-        .map(str::to_string)
-        .or_else(|| Some(format!("{agent_name} subagent")));
-    Some(DiscussUtilityPayload::Subagent {
-        subagent: DiscussSubagentRecord {
-            capture_id: update
-                .get("toolCallId")
-                .and_then(serde_json::Value::as_str)
-                .filter(|capture_id| !capture_id.is_empty())?
-                .to_string(),
-            child_session_id: Some(child_session_id.to_string()),
-            agent_name: agent_name.to_string(),
-            description,
-            fallback_capability: None,
-            surface_state,
-            last_updated_at: Utc::now().timestamp_millis(),
-        },
-    })
-}
-
-fn capture_subagent_update(
-    update: &serde_json::Value,
-    state: &mut OpenCodeCaptureState,
-) -> Option<DiscussUtilityPayload> {
-    state.capture_update(update)
-}
-
 impl OpenCodeCaptureState {
     pub(super) fn subagent_tracker(&mut self) -> &mut SubagentTracker {
         &mut self.tracker
     }
 
-    fn capture_update(&mut self, update: &serde_json::Value) -> Option<DiscussUtilityPayload> {
-        if update.get("title").and_then(serde_json::Value::as_str) == Some("todowrite") {
+    fn capture_update(&mut self, update: &ToolCallUpdate) -> Option<DiscussUtilityPayload> {
+        if update.fields.title.as_deref() == Some("todowrite") {
             return parse_todo_snapshot(update);
         }
-        let tool_call_id = update
-            .get("toolCallId")
-            .and_then(serde_json::Value::as_str)?;
+        let tool_call_id = update.tool_call_id.0.as_ref();
         if tool_call_id.is_empty() {
             return None;
         }
         if let Some(input) = update
-            .get("rawInput")
+            .fields
+            .raw_input
+            .as_ref()
             .and_then(|input| serde_json::from_value::<V2SubagentInput>(input.clone()).ok())
         {
             self.v2_tools.insert(tool_call_id.to_string(), input);
@@ -922,15 +880,24 @@ impl OpenCodeCaptureState {
         // The v2 `subagent` tool returns as soon as the child is handed off; its lifecycle comes
         // from `opencode/session/child_update`. The call only names the child's agent.
         if let Some(input) = self.v2_tools.get(tool_call_id) {
-            let output = update.get("rawOutput");
-            let child = ["metadata", "result"]
-                .iter()
-                .filter_map(|key| output.and_then(|output| output.get(*key)))
-                .chain(output)
-                .find_map(|value| {
-                    serde_json::from_value::<V2SubagentResult>(value.clone())
-                        .ok()?
-                        .session_id
+            let child = update
+                .fields
+                .raw_output
+                .as_ref()
+                .and_then(|output| serde_json::from_value::<V2SubagentOutput>(output.clone()).ok())
+                .and_then(|output| {
+                    let session = |value: Option<Value>| -> Option<Option<String>> {
+                        let Some(value) = value else { return Some(None) };
+                        let object = value.as_object()?;
+                        match object.get("sessionID") {
+                            None | Some(Value::Null) => Some(None),
+                            Some(Value::String(id)) => Some(Some(id.clone())),
+                            _ => None,
+                        }
+                    };
+                    let metadata = session(output.metadata)?;
+                    let result = session(output.result)?;
+                    metadata.or(result).or(output.session_id)
                 })
                 .or_else(|| input.session_id.clone())?;
             self.tracker.observe(SubagentObservation {
@@ -944,27 +911,29 @@ impl OpenCodeCaptureState {
         }
         self.update_subagent_input(update, tool_call_id)?;
         self.update_child_session_id(update, tool_call_id);
-        let surface_state = parse_subagent_state(update)?;
+        let surface_state = match update.fields.status.as_ref() {
+            Some(status) => tool_status_state(Some(status))?,
+            None => DiscussSubagentSurfaceState::Loading,
+        };
         let payload = self.subagent_payload(tool_call_id, surface_state)?;
         self.remove_finished_subagent(update, tool_call_id);
         Some(payload)
     }
 
-    fn update_subagent_input(&mut self, update: &serde_json::Value, capture_id: &str) -> Option<()> {
+    fn update_subagent_input(&mut self, update: &ToolCallUpdate, capture_id: &str) -> Option<()> {
         let is_tracked = self.subagents.contains_key(capture_id);
-        if !is_tracked && update.get("kind").and_then(serde_json::Value::as_str) != Some("think") {
+        if !is_tracked && update.fields.kind.as_ref() != Some(&ToolKind::Think) {
             return None;
         }
-        if let Some(input) = update.get("rawInput") {
-            let agent_name = input
-                .get("subagent_type")
-                .and_then(serde_json::Value::as_str)?;
+        if let Some(input) = update.fields.raw_input.as_ref() {
+            let input = serde_json::from_value::<V1SubagentInput>(input.clone()).ok()?;
+            let agent_name = input.subagent_type.as_str();
             if agent_name.is_empty() {
                 return None;
             }
             let description = input
-                .get("description")
-                .and_then(serde_json::Value::as_str)
+                .description
+                .as_deref()
                 .filter(|description| !description.is_empty())
                 .map(str::to_string)
                 .or_else(|| Some(format!("{agent_name} subagent")));
@@ -984,16 +953,18 @@ impl OpenCodeCaptureState {
         Some(())
     }
 
-    fn update_child_session_id(&mut self, update: &serde_json::Value, capture_id: &str) {
+    fn update_child_session_id(&mut self, update: &ToolCallUpdate, capture_id: &str) {
         if let Some(child_session_id) = update
-            .get("rawOutput")
-            .and_then(|output| output.get("metadata"))
-            .and_then(|metadata| metadata.get("sessionId"))
-            .and_then(serde_json::Value::as_str)
+            .fields
+            .raw_output
+            .as_ref()
+            .and_then(|value| value.get("metadata"))
+            .and_then(|value| serde_json::from_value::<V1SubagentMetadata>(value.clone()).ok())
+            .and_then(|metadata| metadata.session_id)
             .filter(|session_id| !session_id.is_empty())
             && let Some(entry) = self.subagents.get_mut(capture_id)
         {
-            entry.child_session_id = Some(child_session_id.to_string());
+            entry.child_session_id = Some(child_session_id);
         }
     }
 
@@ -1016,10 +987,10 @@ impl OpenCodeCaptureState {
         })
     }
 
-    fn remove_finished_subagent(&mut self, update: &serde_json::Value, capture_id: &str) {
+    fn remove_finished_subagent(&mut self, update: &ToolCallUpdate, capture_id: &str) {
         if matches!(
-            update.get("status").and_then(serde_json::Value::as_str),
-            Some("completed" | "failed")
+            update.fields.status.as_ref(),
+            Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
         ) && self
             .subagents
             .get(capture_id)
@@ -1027,16 +998,6 @@ impl OpenCodeCaptureState {
         {
             self.subagents.remove(capture_id);
         }
-    }
-}
-
-fn parse_subagent_state(update: &serde_json::Value) -> Option<DiscussSubagentSurfaceState> {
-    match update.get("status").and_then(serde_json::Value::as_str) {
-        Some("pending") | None => Some(DiscussSubagentSurfaceState::Loading),
-        Some("in_progress") | Some("running") => Some(DiscussSubagentSurfaceState::Live),
-        Some("completed") => Some(DiscussSubagentSurfaceState::Done),
-        Some("failed") => Some(DiscussSubagentSurfaceState::Error),
-        Some(_) => None,
     }
 }
 
@@ -1049,21 +1010,18 @@ fn render_agent(
     let mut settings = member_settings.cloned().unwrap_or_default();
     let permissions = settings
         .remove(SESSION_PERMISSIONS_SETTING)
-        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+        .map(|value| serde_json::from_str::<Value>(&value))
         .transpose()?;
     let mut frontmatter = BTreeMap::new();
     let has_permissions = permissions.is_some();
     if !has_permissions {
         let name: &str = agent.id.as_ref();
-        frontmatter.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+        frontmatter.insert("name".to_string(), Value::String(name.to_string()));
     }
-    frontmatter.insert(
-        "description".to_string(),
-        serde_json::Value::String(agent.description.to_string()),
-    );
+    frontmatter.insert("description".to_string(), Value::String(agent.description.to_string()));
     frontmatter.insert(
         "mode".to_string(),
-        serde_json::Value::String(
+        Value::String(
             match role {
                 Some(AgentRole::Leader) => "primary",
                 Some(AgentRole::Follower) => "subagent",
@@ -1075,7 +1033,7 @@ fn render_agent(
     frontmatter.extend(
         settings
             .into_iter()
-            .map(|(key, value)| (key, serde_json::Value::String(value))),
+            .map(|(key, value)| (key, Value::String(value))),
     );
     if let Some(permissions) = permissions {
         frontmatter.insert("permissions".to_string(), permissions);
@@ -1119,12 +1077,12 @@ fn remove_file(root: &Path, relative_path: &Path) -> Result<(), DiscussError> {
     let path = root.join(relative_path);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(capture_write_error(&path, error)),
     }
 }
 
-fn capture_write_error(path: &Path, error: std::io::Error) -> DiscussError {
+fn capture_write_error(path: &Path, error: IoError) -> DiscussError {
     DiscussError::WorkspaceIo {
         plugin: OPENCODE_PLUGIN_NAME.to_string(),
         path: path.to_string_lossy().into_owned(),
@@ -1139,6 +1097,23 @@ mod tests {
     use super::super::super::test_library;
     use super::*;
     use tempfile::tempdir;
+
+    fn capture_fixture(mut fixture: serde_json::Value) -> Option<DiscussUtilityPayload> {
+        let mut state = PluginCaptureState::OpenCode(OpenCodeCaptureState::default());
+        if fixture["sessionUpdate"] == "tool_call_update" {
+            let update: ToolCallUpdate = serde_json::from_value(fixture).expect("tool update");
+            PLUGIN.capture_tool_call_update(&update, &mut state)
+        } else {
+            if fixture.get("toolCallId").is_none() {
+                fixture["toolCallId"] = serde_json::json!("tool");
+            }
+            if fixture.get("title").is_none() {
+                fixture["title"] = serde_json::json!("task");
+            }
+            let call: ToolCall = serde_json::from_value(fixture).expect("tool call");
+            PLUGIN.capture_tool_call(&call, &mut state)
+        }
+    }
 
     #[test]
     fn materializes_permissions_and_mcp_in_session_root() {
@@ -1349,7 +1324,7 @@ mod tests {
 
     #[test]
     fn configured_launch_denies_omitted_operations_from_partial_rules() {
-        use crate::discuss::types::{Effect, Operation, Rule, RuleSet};
+        use crate::discuss::launch_types::{Effect, Operation, Rule, RuleSet};
 
         let workspace = tempdir().unwrap();
         let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));
@@ -1385,7 +1360,7 @@ mod tests {
 
     #[test]
     fn configured_launch_rejects_explicit_cli_tools_without_exposing_credentials() {
-        use super::super::super::types::SessionCliTool;
+        use super::super::super::launch_types::SessionCliTool;
 
         let workspace = tempdir().unwrap();
         let original = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode"));
@@ -1417,7 +1392,7 @@ mod tests {
         });
 
         assert!(matches!(
-            classify_tool_payload(&payload),
+            capture_fixture(payload),
             Some(DiscussUtilityPayload::TodoSnapshot { .. })
         ));
     }
@@ -1428,7 +1403,6 @@ mod tests {
             ("pending", DiscussSubagentSurfaceState::Loading),
             ("in_progress", DiscussSubagentSurfaceState::Live),
             ("completed", DiscussSubagentSurfaceState::Done),
-            ("running", DiscussSubagentSurfaceState::Live),
             ("failed", DiscussSubagentSurfaceState::Error),
         ] {
             let payload = serde_json::json!({
@@ -1443,7 +1417,7 @@ mod tests {
                 "rawOutput": {"metadata": {"sessionId": "child-1"}}
             });
 
-            let Some(DiscussUtilityPayload::Subagent { subagent }) = classify_tool_payload(&payload) else {
+            let Some(DiscussUtilityPayload::Subagent { subagent }) = capture_fixture(payload) else {
                 panic!("expected subagent payload for {status}");
             };
             assert_eq!(subagent.child_session_id.as_deref(), Some("child-1"));
@@ -1458,19 +1432,21 @@ mod tests {
             "sessionUpdate": "tool_call_update",
             "kind": "think",
             "toolCallId": "tool-1",
-            "status": "running",
+            "status": "in_progress",
             "rawInput": {"subagent_type": "InternalScout"},
             "rawOutput": {"metadata": {"sessionId": "child-1"}}
         });
 
-        let Some(DiscussUtilityPayload::Subagent { subagent }) = classify_tool_payload(&payload) else {
+        let Some(DiscussUtilityPayload::Subagent { subagent }) = capture_fixture(payload.clone()) else {
             panic!("expected running subagent payload");
         };
         assert_eq!(subagent.surface_state, DiscussSubagentSurfaceState::Live);
 
         let mut unknown_status = payload;
         unknown_status["status"] = serde_json::json!("queued");
-        assert!(classify_tool_payload(&unknown_status).is_none());
+        assert!(serde_json::from_value::<ToolCallStatus>(unknown_status["status"].clone()).is_err());
+        let unknown: ToolCallUpdate = serde_json::from_value(unknown_status).expect("tool update");
+        assert!(unknown.fields.status.is_none());
     }
 
     #[test]
@@ -1483,7 +1459,7 @@ mod tests {
             "rawOutput": {"metadata": {"sessionId": "child-1"}}
         });
 
-        let Some(DiscussUtilityPayload::Subagent { subagent }) = classify_tool_payload(&payload) else {
+        let Some(DiscussUtilityPayload::Subagent { subagent }) = capture_fixture(payload) else {
             panic!("expected loading subagent payload");
         };
         assert_eq!(subagent.surface_state, DiscussSubagentSurfaceState::Loading);
@@ -1498,9 +1474,11 @@ mod tests {
             "status": "in_progress",
             "rawInput": {"subagent_type": "InternalScout"}
         });
-        let mut state = OpenCodeCaptureState::default();
+        let mut state = PluginCaptureState::OpenCode(OpenCodeCaptureState::default());
 
-        let Some(DiscussUtilityPayload::Subagent { subagent }) = capture_subagent_update(&payload, &mut state) else {
+        let update: ToolCallUpdate = serde_json::from_value(payload).expect("tool update");
+        let Some(DiscussUtilityPayload::Subagent { subagent }) = PLUGIN.capture_tool_call_update(&update, &mut state)
+        else {
             panic!("expected provisional subagent payload");
         };
 
@@ -1508,6 +1486,29 @@ mod tests {
         assert_eq!(subagent.child_session_id, None);
         assert_eq!(subagent.surface_state, DiscussSubagentSurfaceState::Live);
         assert!(subagent.last_updated_at > 0);
+    }
+
+    #[test]
+    fn captures_v2_child_from_each_output_shape() {
+        for output in [
+            serde_json::json!({"metadata": {"sessionID": "child"}}),
+            serde_json::json!({"result": {"sessionID": "child"}}),
+            serde_json::json!({"sessionID": "child"}),
+        ] {
+            let update: ToolCallUpdate = serde_json::from_value(serde_json::json!({
+                "toolCallId": "call", "title": "subagent", "kind": "think",
+                "rawInput": {"agent": "Scout"}, "rawOutput": output
+            }))
+            .expect("tool update");
+            let mut state = PluginCaptureState::OpenCode(OpenCodeCaptureState::default());
+            let Some(DiscussUtilityPayload::Subagent { subagent }) =
+                PLUGIN.capture_tool_call_update(&update, &mut state)
+            else {
+                panic!("expected v2 child");
+            };
+            assert_eq!(subagent.child_session_id.as_deref(), Some("child"));
+            assert_eq!(subagent.agent_name, "Scout");
+        }
     }
 
     #[test]
@@ -1540,14 +1541,13 @@ mod tests {
             Some(DiscussSubagentSurfaceState::Error)
         );
 
-        let PluginCaptureState::OpenCode(inner) = &mut state else {
-            unreachable!()
-        };
         let call = serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "call-1", "title": "subagent",
             "kind": "think", "status": "completed",
             "rawInput": {"agent": "InternalScout", "description": "Explore code", "prompt": "look"},
             "rawOutput": {"metadata": {"sessionID": "child-1", "status": "running"}}});
-        let Some(DiscussUtilityPayload::Subagent { subagent }) = inner.capture_update(&call) else {
+        let call: ToolCallUpdate = serde_json::from_value(call).expect("tool update");
+        let Some(DiscussUtilityPayload::Subagent { subagent }) = PLUGIN.capture_tool_call_update(&call, &mut state)
+        else {
             panic!("expected the subagent's agent name from its tool call");
         };
         assert_eq!(subagent.capture_id, "child-1");

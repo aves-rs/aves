@@ -6,14 +6,14 @@ use chrono::{Datelike, Utc};
 use rust_decimal::Decimal;
 
 use super::actor::Actor;
+use super::error::DiscussError;
 use super::messages::DiscussResponse;
-use super::storage::{select_allowance_range, select_usage_range};
-use super::types::{
+use super::report_types::{
     DiscussAllowanceGroupBy, DiscussAllowanceProjection, DiscussAllowanceReport, DiscussAllowanceReportRow,
-    DiscussAllowanceSample, DiscussCompletionKind, DiscussError, DiscussHarnessCost, DiscussHarnessCostKind,
-    DiscussModelUsageEntry, DiscussReportKey, DiscussTurnRecord, DiscussUsageGroupBy, DiscussUsageReport,
-    DiscussUsageReportRow,
+    DiscussAllowanceSample, DiscussCompletionKind, DiscussHarnessCost, DiscussHarnessCostKind, DiscussModelUsageEntry,
+    DiscussReportKey, DiscussTurnRecord, DiscussUsageGroupBy, DiscussUsageReport, DiscussUsageReportRow,
 };
+use super::storage::{select_allowance_range, select_usage_range};
 
 const LIMIT: usize = 5_000;
 const DAY: i64 = 86_400_000;

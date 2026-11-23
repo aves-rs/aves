@@ -6,9 +6,9 @@ use aves::utils::buffers::DEFAULT_BUFFER_SIZE;
 use super::DiscussKernelServices;
 use super::actor::{Actor, run_actor};
 use super::agent_nodes::agent_node_registration;
+use super::agent_nodes::{ActorInboundPorts, WorkspaceCopySourcePort};
 use super::domain::{DiscussAgentNodeLifecycleServiceImpl, DiscussGeneratedHandler};
 use super::messages::{DiscussBroadcast, DiscussRequest};
-use super::types::{ActorInboundPorts, WorkspaceCopySourcePort};
 
 /// Construct the Discuss actor and its generated routing loop.
 pub(super) async fn new<Root>(

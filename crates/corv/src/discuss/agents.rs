@@ -1,5 +1,7 @@
 //! Put all the stuff to talk the agents here
 
+use std::collections::BTreeMap;
+use std::mem::take;
 use std::sync::{
     Arc,
     atomic::{AtomicI64, Ordering},
@@ -8,42 +10,31 @@ use std::sync::{
 use agent_client_protocol::v1::{
     SessionMessage,
     schema::{
-        CreateElicitationRequest, PermissionOptionId, RequestPermissionRequest, RequestPermissionResponse, SessionId,
+        AvailableCommandInput, ContentBlock, CreateElicitationRequest, PermissionOptionId, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionId,
+        SessionNotification, SessionUpdate, StopReason,
     },
 };
 use agent_client_protocol::{Dispatch, Error as AcpCrateError, Responder};
-use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use super::database::PersistenceJob;
 use super::elicitation::classify_elicitation_schema;
+use super::error::DiscussError;
 use super::plugins::{DiscussAgentPlugin, PluginCaptureState};
+use super::report_types::DiscussCompletionKind;
 use super::types::{
-    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussCompletionKind,
-    DiscussElicitationAnswer, DiscussError, DiscussPermissionOption, DiscussSessionId, DiscussStreamEvent,
-    DiscussTurnUsage, DiscussUtilityPayload, DiscussUtilityUpdate, ElicitationRequestId, PendingElicitation,
-    PermissionRequestId,
+    AcpAgentMessagePayload, AcpDispatchPayload, AcpDispatchResponsePayload, DiscussElicitationAnswer,
+    DiscussPermissionOption, DiscussSessionId, DiscussStreamEvent, DiscussTurnUsage, DiscussUtilityPayload,
+    DiscussUtilityUpdate, ElicitationRequestId, PendingElicitation, PermissionRequestId,
 };
 use super::usage::{UsageCaptureEvent, UsageTurnAccumulator};
 
 /// Handles an incoming permission request from the agent.
 ///
-/// Creates the worker-response oneshot, generates an opaque
-/// `PermissionRequestId`, and returns both so the actor can register the
-/// pending entry in its registry **before** publishing
-/// `DiscussStreamEvent::PermissionRequested`. This ordering prevents an
-/// early-answer race where an answer arrives before the pending entry exists.
-///
-/// The actor is responsible for:
-/// 1. Inserting the `PendingPermission` into its registry keyed by
-///    `(discuss_session_id, permission_request_id)`.
-/// 2. Publishing `DiscussStreamEvent::PermissionRequested` on the stream.
-/// 3. If the stream send fails, removing the just-inserted pending entry and
-///    resolving the provider responder as cancelled.
-///
-/// Returns the `PermissionRequestId`, the offered option ids (for later
-/// validation), and the oneshot receiver that the actor resolves when the
-/// user answers through `AnswerPermission`.
+/// The actor must register the pending entry before publishing the request,
+/// and remove it and cancel the responder if publication fails.
 pub fn prepare_permission_request(
     _session: &SessionId,
     request: &RequestPermissionRequest,
@@ -117,8 +108,6 @@ pub async fn resolve_permission_responder(
     responder: Responder<RequestPermissionResponse>,
     option: DiscussPermissionOption,
 ) -> Result<(), AcpCrateError> {
-    use agent_client_protocol::v1::schema::{PermissionOptionId, RequestPermissionOutcome, SelectedPermissionOutcome};
-
     let response = match option {
         DiscussPermissionOption::Select { option_id } => RequestPermissionResponse::new(
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(PermissionOptionId::new(option_id))),
@@ -127,53 +116,6 @@ pub async fn resolve_permission_responder(
     };
     responder.respond(response)?;
     Ok(())
-}
-
-// ── Session-update DTOs ────────────────────────────────────────────────────
-//
-// Typed reshaped projections of the three metadata-only `session/update`
-// discriminators (`available_commands_update`, `session_info_update`,
-// `config_option_update`). They are declared `pub(crate)` so the actor and
-// handle layers can read the typed shape when they wire metadata persistence,
-// but they are not part of the public API surface. They live next to the
-// message payload per the subtask contract — no new module.
-
-/// One provider-exposed available slash command.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AvailableCommandDto {
-    pub name: String,
-    pub description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_hint: Option<String>,
-}
-
-/// Typed reshape of an `available_commands_update` session update.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AvailableCommandsUpdate {
-    pub session_id: String,
-    pub available_commands: Vec<AvailableCommandDto>,
-}
-
-/// Typed reshape of a `session_info_update` session update.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SessionInfoUpdate {
-    pub session_id: String,
-    pub title: Option<String>,
-    pub updated_at: Option<String>,
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
-}
-
-/// Typed reshape of a `config_option_update` session update.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ConfigOptionUpdate {
-    pub session_id: String,
-    pub options: Vec<serde_json::Value>,
-    pub selected: std::collections::BTreeMap<String, String>,
 }
 
 // ── Assistant-turn buffer ──────────────────────────────────────────────────
@@ -186,7 +128,7 @@ pub(super) struct FlushPayload {
     pub(super) aggregated_thought: String,
     /// Ordered transcript parts. Tool-call updates are retained as raw ACP
     /// update objects so the client can apply its existing stable-id merge.
-    pub(super) parts: Vec<serde_json::Value>,
+    pub(super) parts: Vec<Value>,
     pub(super) stop_reason: String,
     pub(super) usage: Option<DiscussTurnUsage>,
 }
@@ -196,8 +138,8 @@ pub(super) struct FlushPayload {
 pub(super) struct AssistantTurnBuffer {
     accumulated_text: String,
     accumulated_thought: String,
-    parts: Vec<serde_json::Value>,
-    metadata_updates: Vec<serde_json::Value>,
+    parts: Vec<Value>,
+    metadata_updates: Vec<Value>,
 }
 
 impl AssistantTurnBuffer {
@@ -218,7 +160,14 @@ impl AssistantTurnBuffer {
             .push(serde_json::json!({"kind": "image", "mimeType": mime_type, "data": data}));
     }
 
-    pub(super) fn append_tool_call(&mut self, update: serde_json::Value, is_update: bool) {
+    fn append_content_block(&mut self, block: &ContentBlock) {
+        if let Ok(block) = serde_json::to_value(block) {
+            self.parts
+                .push(serde_json::json!({"kind": "content", "block": block}));
+        }
+    }
+
+    pub(super) fn append_tool_call(&mut self, update: Value, is_update: bool) {
         self.parts.push(serde_json::json!({
             "kind": "tool_call",
             "update": update,
@@ -230,16 +179,16 @@ impl AssistantTurnBuffer {
         self.parts
             .iter()
             .filter(|part| {
-                part.get("kind").and_then(serde_json::Value::as_str) == Some("tool_call")
-                    && part.get("isUpdate").and_then(serde_json::Value::as_bool) != Some(true)
+                part.get("kind").and_then(Value::as_str) == Some("tool_call")
+                    && part.get("isUpdate").and_then(Value::as_bool) != Some(true)
             })
             .count() as u64
     }
 
     pub(super) fn flush(&mut self, stop_reason: String) -> FlushPayload {
-        let aggregated_text = std::mem::take(&mut self.accumulated_text);
-        let aggregated_thought = std::mem::take(&mut self.accumulated_thought);
-        let parts = std::mem::take(&mut self.parts);
+        let aggregated_text = take(&mut self.accumulated_text);
+        let aggregated_thought = take(&mut self.accumulated_thought);
+        let parts = take(&mut self.parts);
         FlushPayload {
             aggregated_text,
             aggregated_thought,
@@ -249,12 +198,12 @@ impl AssistantTurnBuffer {
         }
     }
 
-    pub(super) fn push_metadata_update(&mut self, update: serde_json::Value) {
+    pub(super) fn push_metadata_update(&mut self, update: Value) {
         self.metadata_updates.push(update);
     }
 
-    pub(super) fn take_metadata_updates(&mut self) -> Vec<serde_json::Value> {
-        std::mem::take(&mut self.metadata_updates)
+    pub(super) fn take_metadata_updates(&mut self) -> Vec<Value> {
+        take(&mut self.metadata_updates)
     }
 }
 
@@ -304,6 +253,7 @@ pub(super) async fn send_message_to_user(
         mut usage,
     } = context;
     let mut turn_usage = None;
+    let mut typed_notification = None;
     let stop_reason = match &message {
         SessionMessage::PromptResponse(Ok(response)) => Some(response.stop_reason),
         _ => None,
@@ -314,10 +264,23 @@ pub(super) async fn send_message_to_user(
             let raw = dispatch.into_raw();
             if let Dispatch::Notification(notification) = &raw {
                 let (method, params) = notification.clone().into_parts();
-                if let Some(evidence) = agent_plugin.capture_usage_evidence(&UsageCaptureEvent::Notification {
-                    method: &method,
-                    params: &params,
-                }) && let Some((accumulator, queue)) = usage.as_mut()
+                if method == "session/update" {
+                    typed_notification = serde_json::from_value::<SessionNotification>(params.clone()).ok();
+                }
+                let event = if method == "session/update" {
+                    typed_notification
+                        .as_ref()
+                        .map(|notification| UsageCaptureEvent::Update(&notification.update))
+                } else {
+                    Some(UsageCaptureEvent::Notification {
+                        method: &method,
+                        params: &params,
+                    })
+                };
+                if let Some(evidence) = event
+                    .as_ref()
+                    .and_then(|event| agent_plugin.capture_usage_evidence(event))
+                    && let Some((accumulator, queue)) = usage.as_mut()
                 {
                     let correlatable = evidence.turn_correlatable;
                     accumulator.capture(evidence, queue).await;
@@ -348,22 +311,28 @@ pub(super) async fn send_message_to_user(
                 }
                 turn_usage = accumulator.finalized_snapshot();
             }
-            AcpAgentMessagePayload::StopReason {
-                session_id: session.to_string(),
-                stop_reason: response.stop_reason,
-            }
+            acp_message_payload(session, SessionMessage::PromptResponse(Ok(response)))?
         }
         other => acp_message_payload(session, other)?,
     };
 
-    if suppress_transcript && is_transcript_event(&payload) {
+    if suppress_transcript
+        && (stop_reason.is_some()
+            || typed_notification
+                .as_ref()
+                .is_some_and(|notification| is_transcript_dispatch(&notification.update)))
+    {
         return Ok(AgentMessageForwardOutcome::Continue { utility_payload: None });
     }
 
     let utility_payload = if let AcpAgentMessagePayload::Dispatch { dispatch, .. } = &payload {
-        append_dispatch_delta(buffer, dispatch);
-        append_metadata_update(buffer, dispatch);
-        capture_utility_payload(agent_plugin, dispatch, capture_state)
+        if let Some(notification) = &typed_notification {
+            if let AcpDispatchPayload::Notification { params, .. } = dispatch {
+                append_dispatch_delta(buffer, &notification.update, params);
+            }
+            append_metadata_update(buffer, notification);
+        }
+        capture_utility_payload(agent_plugin, dispatch, typed_notification.as_ref(), capture_state)
     } else {
         None
     };
@@ -420,6 +389,7 @@ fn stream_send_error(operation: &'static str, error: mpsc::error::SendError<Disc
 fn capture_utility_payload(
     agent_plugin: &dyn DiscussAgentPlugin,
     dispatch: &AcpDispatchPayload,
+    notification: Option<&SessionNotification>,
     capture_state: &mut PluginCaptureState,
 ) -> Option<DiscussUtilityPayload> {
     let AcpDispatchPayload::Notification { method, params } = dispatch else {
@@ -428,125 +398,98 @@ fn capture_utility_payload(
     if method != "session/update" {
         return agent_plugin.capture_extension_notification(method, params, capture_state);
     }
-    let update = params.get("update")?;
-    let session_update = update.get("sessionUpdate")?.as_str()?;
-    let agent_scope_key = agent_plugin.agent_scope_key();
-    match session_update {
-        "subagent_update" => capture_state.capture_standard_subagent(update),
-        "tool_call" => agent_plugin.capture_tool_call_with_state(update, agent_scope_key, capture_state),
-        "tool_call_update" => agent_plugin.capture_tool_call_update_with_state(update, agent_scope_key, capture_state),
+    match &notification?.update {
+        SessionUpdate::SubagentUpdate(update) => capture_state.capture_standard_subagent(update),
+        SessionUpdate::ToolCall(call) => agent_plugin.capture_tool_call(call, capture_state),
+        SessionUpdate::ToolCallUpdate(update) => agent_plugin.capture_tool_call_update(update, capture_state),
         _ => None,
     }
 }
 
-fn is_transcript_event(payload: &AcpAgentMessagePayload) -> bool {
-    match payload {
-        AcpAgentMessagePayload::StopReason { .. } => true,
-        AcpAgentMessagePayload::Dispatch { dispatch, .. } => is_transcript_dispatch(dispatch),
-    }
-}
-
-fn is_transcript_dispatch(dispatch: &AcpDispatchPayload) -> bool {
-    let AcpDispatchPayload::Notification { method, params } = dispatch else {
-        return false;
-    };
-
-    if method != "session/update" {
-        return false;
-    }
-
-    let session_update = params
-        .get("update")
-        .and_then(|update| update.get("sessionUpdate"))
-        .and_then(|value| value.as_str());
-
+fn is_transcript_dispatch(update: &SessionUpdate) -> bool {
     matches!(
-        session_update,
-        Some("user_message_chunk" | "agent_thought_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update")
+        update,
+        SessionUpdate::UserMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::ToolCall(_)
+            | SessionUpdate::ToolCallUpdate(_)
     )
 }
 
 /// Serialize a `StopReason` to the snake_case string the provider emitted.
-fn stop_reason_to_string(reason: agent_client_protocol::v1::schema::StopReason) -> String {
+fn stop_reason_to_string(reason: StopReason) -> String {
     serde_json::to_value(reason)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{reason:?}").to_lowercase())
 }
 
-fn append_dispatch_delta(buffer: &mut AssistantTurnBuffer, dispatch: &AcpDispatchPayload) {
-    if let AcpDispatchPayload::Notification { method, params } = dispatch {
-        if method != "session/update" {
-            return;
-        }
-        if let Some(delta) = extract_assistant_delta(params) {
-            match delta {
-                AssistantDelta::Text(text) => buffer.append_text(&text),
-                AssistantDelta::Thought(thought) => buffer.append_thought(&thought),
-                AssistantDelta::Image { data, mime_type } => buffer.append_image(&data, &mime_type),
+fn append_dispatch_delta(buffer: &mut AssistantTurnBuffer, update: &SessionUpdate, params: &Value) {
+    match update {
+        SessionUpdate::AgentMessageChunk(chunk) | SessionUpdate::AgentThoughtChunk(chunk) => match &chunk.content {
+            ContentBlock::Text(text) if matches!(update, SessionUpdate::AgentThoughtChunk(_)) => {
+                buffer.append_thought(&text.text);
             }
-            return;
+            ContentBlock::Text(text) => buffer.append_text(&text.text),
+            ContentBlock::Image(image) if matches!(update, SessionUpdate::AgentMessageChunk(_)) => {
+                buffer.append_image(&image.data, &image.mime_type);
+            }
+            ContentBlock::Resource(_) | ContentBlock::ResourceLink(_) => buffer.append_content_block(&chunk.content),
+            _ => {}
+        },
+        SessionUpdate::ToolCall(_) | SessionUpdate::ToolCallUpdate(_) => {
+            if let Some(raw_update) = params.get("update") {
+                buffer.append_tool_call(raw_update.clone(), matches!(update, SessionUpdate::ToolCallUpdate(_)));
+            }
         }
-        let Some(update) = params.get("update") else {
-            return;
-        };
-        let Some(session_update) = update
-            .get("sessionUpdate")
-            .and_then(serde_json::Value::as_str)
-        else {
-            return;
-        };
-        if matches!(session_update, "tool_call" | "tool_call_update") {
-            buffer.append_tool_call(update.clone(), session_update == "tool_call_update");
-        }
+        _ => {}
     }
 }
 
-fn append_metadata_update(buffer: &mut AssistantTurnBuffer, dispatch: &AcpDispatchPayload) {
-    if let AcpDispatchPayload::Notification { method, params } = dispatch
-        && method == "session/update"
-        && (params.get("availableCommands").is_some()
-            || params.get("options").is_some()
-            || params.get("title").is_some()
-            || params.get("updatedAt").is_some())
-    {
-        buffer.push_metadata_update(params.clone());
-    }
-}
-
-enum AssistantDelta {
-    Text(String),
-    Thought(String),
-    Image { data: String, mime_type: String },
-}
-
-fn extract_assistant_delta(params: &serde_json::Value) -> Option<AssistantDelta> {
-    let update = params.get("update")?;
-    let session_update = update.get("sessionUpdate")?.as_str()?;
-    match session_update {
-        "agent_message_chunk" => {
-            let content = update.get("content")?;
-            if content.get("type")?.as_str()? == "image" {
-                Some(AssistantDelta::Image {
-                    data: content.get("data")?.as_str()?.to_string(),
-                    mime_type: content.get("mimeType")?.as_str()?.to_string(),
+fn append_metadata_update(buffer: &mut AssistantTurnBuffer, notification: &SessionNotification) {
+    let session_id = notification.session_id.to_string();
+    let value = match &notification.update {
+        SessionUpdate::AvailableCommandsUpdate(update) => {
+            let commands: Vec<_> = update
+                .available_commands
+                .iter()
+                .map(|command| {
+                    let mut value = serde_json::json!({"name": command.name, "description": command.description});
+                    if let Some(hint) = command.input.as_ref().and_then(|input| match input {
+                        AvailableCommandInput::Unstructured(input) => Some(input.hint.clone()),
+                        _ => None,
+                    }) {
+                        value["inputHint"] = Value::String(hint);
+                    }
+                    value
                 })
-            } else {
-                extract_text_from_content_block(content).map(AssistantDelta::Text)
-            }
+                .collect();
+            serde_json::json!({"sessionId": session_id, "availableCommands": commands})
         }
-        "agent_thought_chunk" => extract_text_from_content_block(update.get("content")?).map(AssistantDelta::Thought),
-        _ => None,
-    }
-}
-
-fn extract_text_from_content_block(content: &serde_json::Value) -> Option<String> {
-    let content_type = content.get("type")?.as_str()?;
-    if content_type == "text" {
-        content.get("text")?.as_str().map(str::to_string)
-    } else {
-        None
-    }
+        SessionUpdate::SessionInfoUpdate(update) => {
+            let mut value = serde_json::json!({"sessionId": session_id, "title": update.title.value(), "updatedAt": update.updated_at.value()});
+            if let Some(meta) = &update.meta {
+                value["_meta"] = serde_json::json!(meta);
+            }
+            value
+        }
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            let selected: BTreeMap<_, _> = update
+                .config_options
+                .iter()
+                .filter_map(|option| match &option.kind {
+                    SessionConfigKind::Select(select) => {
+                        Some((option.id.to_string(), select.current_value.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            serde_json::json!({"sessionId": session_id, "options": update.config_options, "selected": selected})
+        }
+        _ => return,
+    };
+    buffer.push_metadata_update(value);
 }
 
 fn acp_message_payload(session: &SessionId, message: SessionMessage) -> Result<AcpAgentMessagePayload, AcpCrateError> {
@@ -573,14 +516,6 @@ fn dispatch_payload(dispatch: Dispatch) -> AcpDispatchPayload {
         }
         Dispatch::Notification(notification) => {
             let (method, params) = notification.into_parts();
-            if method == "session/update"
-                && let Some(reshaped) = reshape_session_update(&params)
-            {
-                return AcpDispatchPayload::Notification {
-                    method,
-                    params: reshaped,
-                };
-            }
             AcpDispatchPayload::Notification { method, params }
         }
         Dispatch::Response(result, _) => AcpDispatchPayload::Response {
@@ -594,113 +529,14 @@ fn dispatch_payload(dispatch: Dispatch) -> AcpDispatchPayload {
     }
 }
 
-/// Reshape a serialized `SessionNotification` params blob into a typed
-/// DTO when the `update.sessionUpdate` discriminator is one of the three
-/// metadata-only session-update kinds.
-fn reshape_session_update(params: &serde_json::Value) -> Option<serde_json::Value> {
-    let update = params.get("update")?;
-    let session_update = update.get("sessionUpdate")?.as_str()?;
-    let session_id = params
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    match session_update {
-        "available_commands_update" => {
-            let dto = parse_available_commands_update(session_id, update)?;
-            Some(serde_json::to_value(dto).ok()?)
-        }
-        "session_info_update" => {
-            let dto = parse_session_info_update(session_id, update)?;
-            Some(serde_json::to_value(dto).ok()?)
-        }
-        "config_option_update" => {
-            let dto = parse_config_option_update(session_id, update)?;
-            Some(serde_json::to_value(dto).ok()?)
-        }
-        _ => None,
-    }
-}
-
-fn parse_available_commands_update(
-    session_id: Option<String>,
-    update: &serde_json::Value,
-) -> Option<AvailableCommandsUpdate> {
-    let commands = update.get("availableCommands")?;
-    let available_commands = commands
-        .as_array()?
-        .iter()
-        .filter_map(parse_available_command)
-        .collect::<Vec<_>>();
-    Some(AvailableCommandsUpdate {
-        session_id: session_id.unwrap_or_default(),
-        available_commands,
-    })
-}
-
-fn parse_available_command(value: &serde_json::Value) -> Option<AvailableCommandDto> {
-    let name = value.get("name")?.as_str()?.to_string();
-    let description = value.get("description")?.as_str()?.to_string();
-    let input_hint = value
-        .get("input")
-        .and_then(|input| input.get("hint"))
-        .and_then(|hint| hint.as_str())
-        .map(str::to_string);
-    Some(AvailableCommandDto {
-        name,
-        description,
-        input_hint,
-    })
-}
-
-fn parse_session_info_update(session_id: Option<String>, update: &serde_json::Value) -> Option<SessionInfoUpdate> {
-    let title = update
-        .get("title")
-        .and_then(|v| if v.is_null() { None } else { v.as_str() })
-        .map(str::to_string);
-    let updated_at = update
-        .get("updatedAt")
-        .and_then(|v| if v.is_null() { None } else { v.as_str() })
-        .map(str::to_string);
-    let meta = update
-        .get("_meta")
-        .and_then(|v| if v.is_null() { None } else { v.as_object() })
-        .cloned();
-    Some(SessionInfoUpdate {
-        session_id: session_id.unwrap_or_default(),
-        title,
-        updated_at,
-        meta,
-    })
-}
-
-fn parse_config_option_update(session_id: Option<String>, update: &serde_json::Value) -> Option<ConfigOptionUpdate> {
-    // Keep the provider's flattened wire shape intact. The ACP SDK's typed
-    // `SessionConfigOption` decoder expects its internal representation, while
-    // session/update uses the protocol's flattened `type`/`currentValue` form.
-    let options = update.get("configOptions")?.as_array()?.to_vec();
-    let mut selected = std::collections::BTreeMap::new();
-    for option in &options {
-        let Some(id) = option.get("id").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if let Some(value) = option
-            .get("currentValue")
-            .and_then(serde_json::Value::as_str)
-        {
-            selected.insert(id.to_string(), value.to_string());
-        }
-    }
-    Some(ConfigOptionUpdate {
-        session_id: session_id.unwrap_or_default(),
-        options,
-        selected,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use agent_client_protocol::v1::SessionMessage;
-    use agent_client_protocol::v1::schema::{PromptResponse, SessionId, StopReason};
+    use agent_client_protocol::v1::schema::{
+        ContentBlock, ElicitationFormMode, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason,
+    };
+    use agent_client_protocol::{Dispatch, UntypedMessage};
+    use serde_json::Value;
     use tokio::sync::mpsc;
 
     use super::super::elicitation::{DiscussRestrictedFormFieldType, sdk_to_restricted_schema};
@@ -714,32 +550,31 @@ mod tests {
 
     #[test]
     fn restricted_schema_projects_titled_multi_select_fields() {
-        let mode =
-            serde_json::from_value::<agent_client_protocol::v1::schema::ElicitationFormMode>(serde_json::json!({
-                "sessionId": "session-1",
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": {
-                        "channels": {
-                            "type": "array",
-                            "title": "Channels",
-                            "description": "Select delivery channels",
-                            "minItems": 1,
-                            "maxItems": 2,
-                            "items": {
-                                "type": "string",
-                                "anyOf": [
-                                    { "const": "email", "title": "Email", "description": "Send email" },
-                                    { "const": "slack", "title": "Slack", "description": "Send Slack message" }
-                                ]
-                            },
-                            "default": ["email"]
-                        }
-                    },
-                    "required": ["channels"]
-                }
-            }))
-            .expect("valid ACP multi-select form");
+        let mode = serde_json::from_value::<ElicitationFormMode>(serde_json::json!({
+            "sessionId": "session-1",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "channels": {
+                        "type": "array",
+                        "title": "Channels",
+                        "description": "Select delivery channels",
+                        "minItems": 1,
+                        "maxItems": 2,
+                        "items": {
+                            "type": "string",
+                            "anyOf": [
+                                { "const": "email", "title": "Email", "description": "Send email" },
+                                { "const": "slack", "title": "Slack", "description": "Send Slack message" }
+                            ]
+                        },
+                        "default": ["email"]
+                    }
+                },
+                "required": ["channels"]
+            }
+        }))
+        .expect("valid ACP multi-select form");
 
         let schema = sdk_to_restricted_schema(&mode).expect("restricted schema");
         let field = schema.fields.first().expect("multi-select field");
@@ -758,11 +593,9 @@ mod tests {
 
     #[test]
     fn dispatch_payload_notification_variant() {
-        use agent_client_protocol::UntypedMessage;
-
         let notification =
             UntypedMessage::new("tools/progress", serde_json::json!({"pct": 75})).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let dispatch = Dispatch::Notification(notification);
         let payload = dispatch_payload(dispatch);
 
         match payload {
@@ -776,11 +609,9 @@ mod tests {
 
     #[test]
     fn dispatch_payload_notification_serializes_correctly() {
-        use agent_client_protocol::UntypedMessage;
-
         let notification =
             UntypedMessage::new("session/update", serde_json::json!({"data": "x"})).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let dispatch = Dispatch::Notification(notification);
         let payload = dispatch_payload(dispatch);
 
         let json = serde_json::to_value(&payload).expect("serialize");
@@ -835,12 +666,10 @@ mod tests {
 
     #[test]
     fn acp_message_payload_dispatch_notification_variant() {
-        use agent_client_protocol::UntypedMessage;
-
         let session = SessionId::from("dispatch-session");
         let notification =
             UntypedMessage::new("tools/progress", serde_json::json!({"pct": 90})).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let dispatch = Dispatch::Notification(notification);
         let message = SessionMessage::Message(dispatch);
 
         let payload = acp_message_payload(&session, message).expect("payload ok");
@@ -859,12 +688,10 @@ mod tests {
 
     #[test]
     fn acp_message_payload_dispatch_serializes_to_bridge_shape() {
-        use agent_client_protocol::UntypedMessage;
-
         let session = SessionId::from("bridge-shape-session");
         let notification =
             UntypedMessage::new("session/update", serde_json::json!({"data": "x"})).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let dispatch = Dispatch::Notification(notification);
         let message = SessionMessage::Message(dispatch);
 
         let payload = acp_message_payload(&session, message).expect("payload ok");
@@ -894,27 +721,152 @@ mod tests {
         let json = serde_json::to_value(&payload).expect("serialize");
         let obj = json.as_object().expect("object");
         assert_eq!(
-            obj.get("kind").and_then(serde_json::Value::as_str),
+            obj.get("kind").and_then(Value::as_str),
             Some("stopReason"),
             "kind must be camelCase stopReason for bridge compatibility"
         );
+        assert_eq!(obj.get("sessionId").and_then(Value::as_str), Some("serde-session"));
         assert_eq!(
-            obj.get("sessionId").and_then(serde_json::Value::as_str),
-            Some("serde-session")
-        );
-        assert_eq!(
-            obj.get("stopReason").and_then(serde_json::Value::as_str),
+            obj.get("stopReason").and_then(Value::as_str),
             Some("refusal"),
             "StopReason::Refusal must serialize as snake_case 'refusal'"
         );
     }
 
-    // ── session-update reshape ───────────────────────────────────────────────
+    // ── session-update passthrough ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn non_transcript_updates_forward_unchanged_without_turn_parts() {
+        let updates = [
+            serde_json::json!({"sessionUpdate":"plan_update", "plan":{"type":"items", "planId":"p", "entries":[]}}),
+            serde_json::json!({"sessionUpdate":"plan_removed", "planId":"p"}),
+            serde_json::json!({"sessionUpdate":"notice", "severity":"info", "title":"Notice"}),
+            serde_json::json!({"sessionUpdate":"compaction_update", "compactionId":"c", "status":"completed"}),
+            serde_json::json!({"sessionUpdate":"compaction_summary_chunk", "compactionId":"c", "content":{"type":"text", "text":"summary"}}),
+            serde_json::json!({"sessionUpdate":"current_mode_update", "currentModeId":"mode"}),
+        ];
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let session = SessionId::from("s");
+        let plugin = super::super::plugins::for_agent("custom-agent");
+        let mut capture_state = PluginCaptureState::for_plugin(plugin);
+        let mut buffer = AssistantTurnBuffer::default();
+        for (index, update) in updates.into_iter().enumerate() {
+            let params = serde_json::json!({"sessionId":"s", "update":update});
+            let typed: SessionNotification = serde_json::from_value(params.clone()).expect("typed update");
+            assert!(match (index, &typed.update) {
+                (0, SessionUpdate::PlanUpdate(_))
+                | (1, SessionUpdate::PlanRemoved(_))
+                | (2, SessionUpdate::Notice(_))
+                | (3, SessionUpdate::CompactionUpdate(_))
+                | (4, SessionUpdate::CompactionSummaryChunk(_))
+                | (5, SessionUpdate::CurrentModeUpdate(_)) => true,
+                _ => false,
+            });
+            assert!(!super::is_transcript_dispatch(&typed.update));
+            let dispatch =
+                Dispatch::Notification(UntypedMessage::new("session/update", params.clone()).expect("notification"));
+            let outcome = send_message_to_user(
+                AgentMessageForwardContext {
+                    stream_tx: &stream_tx,
+                    discuss_session_id: DiscussSessionId::new(),
+                    session: &session,
+                    agent_plugin: plugin,
+                    capture_state: &mut capture_state,
+                    usage: None,
+                },
+                SessionMessage::Message(dispatch),
+                &mut buffer,
+                true,
+            )
+            .await
+            .expect("forwarded");
+            assert!(matches!(outcome, AgentMessageForwardOutcome::Continue { .. }));
+            match stream_rx.recv().await.expect("stream event") {
+                DiscussStreamEvent::AgentMessage {
+                    payload:
+                        AcpAgentMessagePayload::Dispatch {
+                            dispatch:
+                                AcpDispatchPayload::Notification {
+                                    method,
+                                    params: forwarded,
+                                },
+                            ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(method, "session/update");
+                    assert_eq!(forwarded, params);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(buffer.flush("end_turn".to_string()).parts.is_empty());
+            assert!(buffer.take_metadata_updates().is_empty());
+        }
+    }
 
     #[test]
-    fn dispatch_payload_reshapes_available_commands_update() {
-        use agent_client_protocol::UntypedMessage;
+    fn resource_message_chunks_preserve_serialized_content_blocks() {
+        for block in [
+            serde_json::json!({"type":"resource", "resource":{"uri":"file:///a", "text":"contents"}}),
+            serde_json::json!({"type":"resource_link", "uri":"file:///b", "name":"file", "mimeType":"text/plain"}),
+        ] {
+            let content: ContentBlock = serde_json::from_value(block).expect("content block");
+            let expected = serde_json::to_value(&content).expect("serialize content");
+            for kind in ["agent_message_chunk", "agent_thought_chunk"] {
+                let params = serde_json::json!({"sessionId":"s", "update":{"sessionUpdate":kind, "content":expected}});
+                let notification: SessionNotification = serde_json::from_value(params.clone()).expect("typed update");
+                assert!(super::is_transcript_dispatch(&notification.update));
+                let mut buffer = AssistantTurnBuffer::default();
+                super::append_dispatch_delta(&mut buffer, &notification.update, &params);
+                assert_eq!(
+                    buffer.flush("end_turn".to_string()).parts,
+                    vec![serde_json::json!({"kind":"content", "block":expected})]
+                );
+            }
+        }
+    }
 
+    #[test]
+    fn metadata_projection_preserves_persistence_shape() {
+        let mut buffer = AssistantTurnBuffer::default();
+        for params in [
+            serde_json::json!({"sessionId":"s", "update": {
+                "sessionUpdate":"available_commands_update", "availableCommands":[
+                    {"name":"plan", "description":"Plan", "input":{"hint":"Goal"}}
+                ]
+            }}),
+            serde_json::json!({"sessionId":"s", "update": {
+                "sessionUpdate":"session_info_update", "title":"Title", "_meta":{"key":"value"}
+            }}),
+            serde_json::json!({"sessionId":"s", "update": {
+                "sessionUpdate":"config_option_update", "configOptions":[{
+                    "id":"model", "name":"Model", "type":"select", "currentValue":"a",
+                    "options":[{"value":"a", "name":"A"}]
+                }]
+            }}),
+        ] {
+            let notification = serde_json::from_value(params).expect("typed notification");
+            super::append_metadata_update(&mut buffer, &notification);
+        }
+        let updates = buffer.take_metadata_updates();
+        assert_eq!(
+            updates[0],
+            serde_json::json!({"sessionId":"s", "availableCommands":[
+                {"name":"plan", "description":"Plan", "inputHint":"Goal"}
+            ]})
+        );
+        assert_eq!(
+            updates[1],
+            serde_json::json!({
+                "sessionId":"s", "title":"Title", "updatedAt":null, "_meta":{"key":"value"}
+            })
+        );
+        assert_eq!(updates[2]["selected"], serde_json::json!({"model":"a"}));
+        assert_eq!(updates[2]["options"][0]["currentValue"], "a");
+    }
+
+    #[test]
+    fn dispatch_payload_forwards_available_commands_update() {
         let params = serde_json::json!({
             "sessionId": "acp-sess-1",
             "update": {
@@ -925,43 +877,24 @@ mod tests {
                 ]
             }
         });
-        let notification = UntypedMessage::new("session/update", params).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let notification = UntypedMessage::new("session/update", params.clone()).expect("valid untyped message");
+        let dispatch = Dispatch::Notification(notification);
         let payload = dispatch_payload(dispatch);
 
         match payload {
-            AcpDispatchPayload::Notification { method, params } => {
+            AcpDispatchPayload::Notification {
+                method,
+                params: forwarded,
+            } => {
                 assert_eq!(method, "session/update");
-                assert_eq!(
-                    params.get("sessionId").and_then(|v| v.as_str()),
-                    Some("acp-sess-1"),
-                    "session_id must be the ACP protocol session id"
-                );
-                let commands = params
-                    .get("availableCommands")
-                    .and_then(|v| v.as_array())
-                    .expect("availableCommands array");
-                assert_eq!(commands.len(), 2);
-                assert_eq!(commands[0].get("name").and_then(|v| v.as_str()), Some("create_plan"));
-                assert_eq!(
-                    commands[0].get("inputHint").and_then(|v| v.as_str()),
-                    Some("Describe the plan"),
-                    "inputHint must be camelCase"
-                );
-                assert_eq!(
-                    commands[1].get("inputHint"),
-                    None,
-                    "missing input must produce absent inputHint, not null"
-                );
+                assert_eq!(forwarded, params);
             }
             other => panic!("expected Notification, got {other:?}"),
         }
     }
 
     #[test]
-    fn dispatch_payload_reshapes_session_info_update() {
-        use agent_client_protocol::UntypedMessage;
-
+    fn dispatch_payload_forwards_session_info_update() {
         let params = serde_json::json!({
             "sessionId": "acp-sess-2",
             "update": {
@@ -971,36 +904,24 @@ mod tests {
                 "_meta": {"custom": "value"}
             }
         });
-        let notification = UntypedMessage::new("session/update", params).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let notification = UntypedMessage::new("session/update", params.clone()).expect("valid untyped message");
+        let dispatch = Dispatch::Notification(notification);
         let payload = dispatch_payload(dispatch);
 
         match payload {
-            AcpDispatchPayload::Notification { method, params } => {
+            AcpDispatchPayload::Notification {
+                method,
+                params: forwarded,
+            } => {
                 assert_eq!(method, "session/update");
-                assert_eq!(params.get("sessionId").and_then(|v| v.as_str()), Some("acp-sess-2"));
-                assert_eq!(params.get("title").and_then(|v| v.as_str()), Some("My Chat"));
-                assert_eq!(
-                    params.get("updatedAt").and_then(|v| v.as_str()),
-                    Some("2026-07-08T00:00:00Z")
-                );
-                assert_eq!(
-                    params
-                        .get("_meta")
-                        .and_then(|v| v.get("custom"))
-                        .and_then(|v| v.as_str()),
-                    Some("value"),
-                    "_meta must be propagated verbatim"
-                );
+                assert_eq!(forwarded, params);
             }
             other => panic!("expected Notification, got {other:?}"),
         }
     }
 
     #[test]
-    fn dispatch_payload_reshapes_config_option_update() {
-        use agent_client_protocol::UntypedMessage;
-
+    fn dispatch_payload_forwards_config_option_update() {
         let params = serde_json::json!({
             "sessionId": "acp-sess-3",
             "update": {
@@ -1016,26 +937,17 @@ mod tests {
                 ]
             }
         });
-        let notification = UntypedMessage::new("session/update", params).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let notification = UntypedMessage::new("session/update", params.clone()).expect("valid untyped message");
+        let dispatch = Dispatch::Notification(notification);
         let payload = dispatch_payload(dispatch);
 
         match payload {
-            AcpDispatchPayload::Notification { method, params } => {
+            AcpDispatchPayload::Notification {
+                method,
+                params: forwarded,
+            } => {
                 assert_eq!(method, "session/update");
-                assert_eq!(params.get("sessionId").and_then(|v| v.as_str()), Some("acp-sess-3"));
-                let options = params
-                    .get("options")
-                    .and_then(|v| v.as_array())
-                    .expect("options array");
-                assert_eq!(options.len(), 1);
-                assert_eq!(options[0].get("id").and_then(|v| v.as_str()), Some("model"));
-                let selected = params.get("selected").expect("selected map");
-                assert_eq!(
-                    selected.get("model").and_then(|v| v.as_str()),
-                    Some("provider-a"),
-                    "selected must map option id to current value"
-                );
+                assert_eq!(forwarded, params);
             }
             other => panic!("expected Notification, got {other:?}"),
         }
@@ -1043,8 +955,6 @@ mod tests {
 
     #[test]
     fn dispatch_payload_forwards_non_metadata_update_unchanged() {
-        use agent_client_protocol::UntypedMessage;
-
         let params = serde_json::json!({
             "sessionId": "acp-sess-4",
             "update": {
@@ -1053,7 +963,7 @@ mod tests {
             }
         });
         let notification = UntypedMessage::new("session/update", params.clone()).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let dispatch = Dispatch::Notification(notification);
         let payload = dispatch_payload(dispatch);
 
         match payload {
@@ -1114,7 +1024,7 @@ mod tests {
         let kinds = payload
             .parts
             .iter()
-            .map(|part| part.get("kind").and_then(serde_json::Value::as_str))
+            .map(|part| part.get("kind").and_then(Value::as_str))
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
@@ -1232,8 +1142,6 @@ mod tests {
     /// transcript events.
     #[tokio::test]
     async fn replayed_stop_reason_is_not_forwarded_or_flushed() {
-        use agent_client_protocol::UntypedMessage;
-
         let (stream_tx, mut stream_rx) = mpsc::channel(1);
         let discuss_id = DiscussSessionId::new();
         let session = SessionId::from("replayed-session");
@@ -1260,7 +1168,7 @@ mod tests {
                 capture_state: &mut capture_state,
                 usage: None,
             },
-            SessionMessage::Message(agent_client_protocol::Dispatch::Notification(replayed_dispatch)),
+            SessionMessage::Message(Dispatch::Notification(replayed_dispatch)),
             &mut buffer,
             true,
         )
@@ -1299,15 +1207,13 @@ mod tests {
     /// Non-StopReason dispatch still returns `Continue` and does not flush.
     #[tokio::test]
     async fn send_message_to_user_dispatch_returns_continue() {
-        use agent_client_protocol::UntypedMessage;
-
         let (stream_tx, mut stream_rx) = mpsc::channel(8);
         let discuss_id = DiscussSessionId::new();
         let session = SessionId::from("dispatch-session");
 
         let notification =
             UntypedMessage::new("tools/progress", serde_json::json!({"pct": 50})).expect("valid untyped message");
-        let dispatch = agent_client_protocol::Dispatch::Notification(notification);
+        let dispatch = Dispatch::Notification(notification);
 
         let mut capture_state = PluginCaptureState::for_plugin(super::super::plugins::for_agent("custom-agent"));
         let outcome = send_message_to_user(

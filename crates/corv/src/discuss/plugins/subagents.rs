@@ -6,6 +6,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+// The schema crate exports MaybeUndefined only at its root, not through v1.
+use agent_client_protocol::schema::MaybeUndefined;
+use agent_client_protocol::v1::schema::{IdleStopReason, StateUpdate, SubagentUpdate, ToolCallStatus};
 use chrono::Utc;
 
 use super::super::types::{DiscussSubagentRecord, DiscussSubagentSurfaceState, DiscussUtilityPayload};
@@ -123,38 +126,47 @@ impl SubagentTracker {
 /// `description` are display metadata, and `state` is `running` | `requires_action` | `unknown` |
 /// `idle` (with `stopReason`; `error` or `cancelled` means the work did not finish). Omitted or
 /// null fields keep their previous values.
-pub(super) fn capture_standard_update(update: &serde_json::Value, tracker: &mut SubagentTracker) {
-    let text = |key: &str| update.get(key).and_then(serde_json::Value::as_str);
-    let Some(child) = text("sessionId") else {
-        return;
-    };
-    let state = update.get("state").and_then(|state| {
-        Some(match state.get("state")?.as_str()? {
-            "running" | "requires_action" => DiscussSubagentSurfaceState::Live,
-            "unknown" => DiscussSubagentSurfaceState::Loading,
-            "idle" => match state.get("stopReason").and_then(serde_json::Value::as_str) {
-                Some("error" | "cancelled") => DiscussSubagentSurfaceState::Error,
-                _ => DiscussSubagentSurfaceState::Done,
+pub(super) fn capture_standard_update(update: &SubagentUpdate, tracker: &mut SubagentTracker) {
+    let child = update.session_id.0.as_ref();
+    let state = match &update.state {
+        MaybeUndefined::Value(StateUpdate::Running(_) | StateUpdate::RequiresAction(_)) => {
+            Some(DiscussSubagentSurfaceState::Live)
+        }
+        MaybeUndefined::Value(StateUpdate::Unknown(_)) => Some(DiscussSubagentSurfaceState::Loading),
+        MaybeUndefined::Value(StateUpdate::Idle(idle)) => Some(
+            if matches!(
+                &idle.stop_reason,
+                Some(IdleStopReason::Cancelled | IdleStopReason::Error(_))
+            ) {
+                DiscussSubagentSurfaceState::Error
+            } else {
+                DiscussSubagentSurfaceState::Done
             },
-            _ => return None,
-        })
-    });
+        ),
+        _ => None,
+    };
     tracker.observe_reported(SubagentObservation {
         capture_id: child,
         child_session_id: Some(child),
-        agent_name: text("title"),
-        description: text("description"),
+        agent_name: match &update.title {
+            MaybeUndefined::Value(value) => Some(value.as_str()),
+            _ => None,
+        },
+        description: match &update.description {
+            MaybeUndefined::Value(value) => Some(value.as_str()),
+            _ => None,
+        },
         state,
     });
 }
 
 /// The surface state for an ACP tool-call status.
-pub(super) fn tool_status_state(status: Option<&str>) -> Option<DiscussSubagentSurfaceState> {
+pub(super) fn tool_status_state(status: Option<&ToolCallStatus>) -> Option<DiscussSubagentSurfaceState> {
     match status? {
-        "pending" => Some(DiscussSubagentSurfaceState::Loading),
-        "in_progress" => Some(DiscussSubagentSurfaceState::Live),
-        "completed" => Some(DiscussSubagentSurfaceState::Done),
-        "failed" | "cancelled" => Some(DiscussSubagentSurfaceState::Error),
+        ToolCallStatus::Pending => Some(DiscussSubagentSurfaceState::Loading),
+        ToolCallStatus::InProgress => Some(DiscussSubagentSurfaceState::Live),
+        ToolCallStatus::Completed => Some(DiscussSubagentSurfaceState::Done),
+        ToolCallStatus::Failed => Some(DiscussSubagentSurfaceState::Error),
         _ => None,
     }
 }
@@ -210,7 +222,7 @@ mod tests {
     fn standard_updates_report_and_reopen_the_child() {
         let mut tracker = SubagentTracker::default();
         let mut capture = |update: serde_json::Value| {
-            capture_standard_update(&update, &mut tracker);
+            capture_standard_update(&serde_json::from_value(update).expect("subagent update"), &mut tracker);
             match tracker.next() {
                 Some(DiscussUtilityPayload::Subagent { subagent }) => {
                     Some((subagent.capture_id, subagent.agent_name, subagent.surface_state))

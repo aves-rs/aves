@@ -16,9 +16,11 @@ use aves::config::{
     dispatch_save_config_section,
 };
 
+use super::error::DiscussError;
+use super::launch_types::AcpProvider;
 use super::library::AssetLibrary;
 use super::mcp_direct::McpAcpTransport;
-use super::types::{AcpProvider, DiscussError, DiscussStreamEvent};
+use super::types::DiscussStreamEvent;
 
 pub struct DiscussMcpDomain {
     pub server_name: &'static str,

@@ -86,6 +86,10 @@ The worker's own turn flag is the single source of session activity. A turn that
 
 `SendUserTurn` carries optional `images` (`DiscussImageAttachment { mime_type, data }`, base64). Validation checks non-empty data and a `type/subtype` MIME shape only — no format allowlist, no size cap, no transcoding. Images are admitted regardless of the harness's advertised `PromptCapabilities.image`; the harness decides. They are send-only: nothing durable is stored and `last_user_prompt` stays the text.
 
+User turns also carry optional resource links. The worker sends them as ACP resource-link content blocks following the text, without a capability check.
+
+Discuss exposes `archiveSession`, `unarchiveSession`, `getProviderAuthStatus`, `getSessionModes`, and `setSessionMode`. The worker tracks modes reported on session open and subsequent mode updates. Archive and authentication requests are sent only when advertised; closing and deleting provider sessions are best-effort.
+
 ## Identity bindings
 
 `discuss_identity_bindings` (migration 0007) maps a verified `(issuer, subject)` to a session, its Provider and agent, and an optional Flow execution id. The foreign key to `discuss_sessions` cascades on delete, so removing a session removes its bindings.

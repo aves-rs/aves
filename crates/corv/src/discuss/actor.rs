@@ -5,10 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::Agent;
-use agent_client_protocol::v1::{ConnectionTo, schema::SessionId};
+use agent_client_protocol::v1::{
+    ConnectionTo,
+    schema::{AgentCapabilities, SessionId},
+};
 use semver::Version;
+use serde_json::from_str;
+use tokio::select;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use aves::auth::{AuthSudoService, Jwt};
@@ -18,17 +24,24 @@ use aves::runtime::ServiceReader;
 use aves::utils::buffers::DEFAULT_BUFFER_SIZE;
 use aves::utils::database::{MigrationRunner, maintain_database, open_database_at_path};
 
-use super::allowance::AllowanceService;
+use super::agent_nodes::{
+    ActorInboundPorts, AgentNodeTerminalResult, WorkspaceCopySourceRequest, WorkspaceCopySources,
+};
+use super::allowance::{AllowanceService, spawn as spawn_allowance};
 use super::assets::{ImportCompletion, PendingImport};
 use super::boot::{DiscussBootOptions, DiscussMcpDomain, load_discuss_settings};
 use super::config::config_settings_from_value;
 use super::database::persist_accounting_prune;
+use super::error::DiscussError;
+use super::identity::resolve as resolve_identity;
+use super::launch_types::{AcpProvider, SessionLaunchConfig};
 use super::library::AssetLibrary;
-use super::messages::{DiscussRequest, DiscussRequestPayload, DiscussResponse};
+use super::messages::{DiscussRequest, DiscussRequestPayload, DiscussResponse, acp_request_kind};
 use super::migration::MIGRATIONS as DISCUSS_MIGRATIONS;
 use super::plugins;
-use super::pricing::PriceIndex;
+use super::pricing::{PriceIndex, spawn as spawn_pricing};
 use super::provider::effective_workspace_copy_sources;
+use super::report_types::DiscussAllowanceProjection;
 use super::session::{
     PendingElicitationCancel, PendingElicitationRegistration, PendingPermissionCancel, PendingPermissionRegistration,
     SessionCapabilitiesCache, WorkerReady, revoke_worker_jti,
@@ -39,21 +52,15 @@ use super::storage::{
 };
 use super::supervisor::{CallbackRouteRegistry, ProviderSupervisor};
 use super::types::{
-    AcpProvider, ActorInboundPorts, AgentNodeTerminalResult, DiscussAllowanceProjection, DiscussConfigOption,
-    DiscussElicitationAnswer, DiscussError, DiscussImageAttachment, DiscussMemberOverrides, DiscussPermissionOption,
-    DiscussSessionId, DiscussSessionSetup, DiscussStreamEvent, ElicitationRequestId, InspectorBinding,
-    PendingElicitation, PendingPermission, PendingPermissionRegistry, SessionLaunchConfig, WorkerEntry, WorkerRegistry,
-    WorkspaceCopySourceRequest, WorkspaceCopySources,
+    DiscussConfigOption, DiscussElicitationAnswer, DiscussImageAttachment, DiscussMemberOverrides,
+    DiscussPermissionOption, DiscussSessionId, DiscussSessionSetup, DiscussStreamEvent, ElicitationRequestId,
+    InspectorBinding, PendingElicitation, PendingPermission, PendingPermissionRegistry, WorkerEntry, WorkerRegistry,
 };
 
 const DISCUSS_DOMAIN: &str = "discuss";
 const MAX_USER_TURN_BYTES: usize = 256 * 1024;
 pub(super) const CANCEL_TURN_DEADLINE: Duration = Duration::from_secs(1);
 pub(super) const PROVIDER_CHILD_REAP_DEADLINE: Duration = Duration::from_secs(1);
-
-// ProviderSessionInfo, WorkerCommand, WorkerEntry, WorkerRegistry, PendingPermission,
-// PendingPermissionRegistry, DiscussSessionId, PermissionRequestId, DiscussStreamEvent,
-// DiscussPermissionOption are now defined in types.rs and imported via `use super::types::*`.
 
 pub(super) struct SpawnSessionOptions {
     pub(super) launch_config: Option<SessionLaunchConfig>,
@@ -89,10 +96,7 @@ pub(super) struct SharedConnectionReady {
     pub(super) connection: ConnectionTo<Agent>,
     pub(super) owner: JoinHandle<()>,
     pub(super) exit_rx: oneshot::Receiver<()>,
-    pub(super) mcp_acp: bool,
-    pub(super) mcp_http: bool,
-    pub(super) system_prompt: bool,
-    pub(super) title_supported: bool,
+    pub(super) capabilities: AgentCapabilities,
     pub(super) callback_routes: Arc<Mutex<CallbackRouteRegistry>>,
 }
 
@@ -488,7 +492,7 @@ impl Actor {
         }
         let result: Result<DiscussResponse, DiscussError> = match payload {
             DiscussRequestPayload::ResolveSessionIdentity { issuer, subject } => {
-                super::identity::resolve(&self.persistence, issuer, subject).await
+                resolve_identity(&self.persistence, issuer, subject).await
             }
             DiscussRequestPayload::GetTokenUsageReport {
                 from_ms,
@@ -774,11 +778,8 @@ impl Actor {
                     drop(conn);
                     let (member_overrides, theme_color): (DiscussMemberOverrides, _) = match installation {
                         Some(row) => (
-                            serde_json::from_str(&row.member_overrides_json)?,
-                            row.theme_color_json
-                                .as_deref()
-                                .map(serde_json::from_str)
-                                .transpose()?,
+                            from_str(&row.member_overrides_json)?,
+                            row.theme_color_json.as_deref().map(from_str).transpose()?,
                         ),
                         None => (BTreeMap::new(), None),
                     };
@@ -886,6 +887,25 @@ impl Actor {
             DiscussRequestPayload::GetConfigOptions { discuss_session_id } => {
                 self.handle_get_config_options(discuss_session_id).await
             }
+            DiscussRequestPayload::GetSessionModes { discuss_session_id } => {
+                self.handle_get_session_modes(discuss_session_id).await
+            }
+            DiscussRequestPayload::GetProviderAuthStatus { provider_name } => {
+                self.handle_get_provider_auth_status(&provider_name).await
+            }
+            DiscussRequestPayload::SetSessionMode {
+                discuss_session_id,
+                mode_id,
+            } => {
+                self.handle_set_session_mode(discuss_session_id, mode_id)
+                    .await
+            }
+            DiscussRequestPayload::ArchiveSession { discuss_session_id } => {
+                self.handle_set_archived(discuss_session_id, true).await
+            }
+            DiscussRequestPayload::UnarchiveSession { discuss_session_id } => {
+                self.handle_set_archived(discuss_session_id, false).await
+            }
             DiscussRequestPayload::SetConfigOption {
                 discuss_session_id,
                 config_id,
@@ -922,8 +942,9 @@ impl Actor {
                 discuss_session_id,
                 text,
                 images,
+                resource_links,
             } => {
-                self.handle_send_user_turn(discuss_session_id, text, images)
+                self.handle_send_user_turn(discuss_session_id, text, images, resource_links)
                     .await
             }
             DiscussRequestPayload::AnswerPermission {
@@ -990,12 +1011,12 @@ impl Actor {
 
         if !was_running {
             let cancel = CancellationToken::new();
-            self.pricing_task = Some(super::pricing::spawn(
+            self.pricing_task = Some(spawn_pricing(
                 self.persistence.clone(),
                 cancel.clone(),
                 self.price_index.clone(),
             ));
-            self.allowance = Some(super::allowance::spawn(self.persistence.clone()));
+            self.allowance = Some(spawn_allowance(self.persistence.clone()));
             self.accounting_cancel = Some(cancel);
             self.allowance_snapshot = None;
             self.server_running = true;
@@ -1289,93 +1310,6 @@ impl Actor {
     }
 }
 
-/// Static kind label for an [`DiscussRequestPayload`], for structured tracing only.
-///
-/// Returns a stable `&'static str` discriminant so debug logs can trace which
-/// ACP operation the actor is handling without ever serializing prompt text,
-/// config values, agent specs, or provider ids.
-fn acp_request_kind(payload: &DiscussRequestPayload) -> &'static str {
-    match payload {
-        DiscussRequestPayload::ResolveSessionIdentity { .. } => "resolveSessionIdentity",
-        DiscussRequestPayload::GetTokenUsageReport { .. } => "getTokenUsageReport",
-        DiscussRequestPayload::GetSpendReport { .. } => "getSpendReport",
-        DiscussRequestPayload::GetAllowanceReport { .. } => "getAllowanceReport",
-        DiscussRequestPayload::GetCurrentAllowance => "getCurrentAllowance",
-        DiscussRequestPayload::RecordAllowance { .. } => "recordAllowance",
-        DiscussRequestPayload::StartAgent { .. } => "startAgent",
-        DiscussRequestPayload::TickAgent { .. } => "tickAgent",
-        DiscussRequestPayload::CancelAgentExecution { .. } => "cancelAgentExecution",
-        DiscussRequestPayload::StartServer => "startServer",
-        DiscussRequestPayload::StopServer => "stopServer",
-        DiscussRequestPayload::GetServerStatus => "getServerStatus",
-        DiscussRequestPayload::StartProvider { .. } => "startProvider",
-        DiscussRequestPayload::StopProvider { .. } => "stopProvider",
-        DiscussRequestPayload::SendUserTurn { .. } => "sendUserTurn",
-        DiscussRequestPayload::AnswerPermission { .. } => "answerPermission",
-        DiscussRequestPayload::AnswerElicitation { .. } => "answerElicitation",
-        DiscussRequestPayload::CancelElicitation { .. } => "cancelElicitation",
-        DiscussRequestPayload::CancelTurn { .. } => "cancelTurn",
-        DiscussRequestPayload::CancelSession { .. } => "cancelSession",
-        DiscussRequestPayload::ReserveInspector { .. } => "reserveInspector",
-        DiscussRequestPayload::StartInspector { .. } => "startInspector",
-        DiscussRequestPayload::DisposeInspector { .. } => "disposeInspector",
-        DiscussRequestPayload::AddProvider { .. } => "addProvider",
-        DiscussRequestPayload::ListProviders => "listProviders",
-        DiscussRequestPayload::GetProviderConfig { .. } => "getProviderConfig",
-        DiscussRequestPayload::GetProviderManagedConfig { .. } => "getProviderManagedConfig",
-        DiscussRequestPayload::SetProviderManagedConfig { .. } => "setProviderManagedConfig",
-        DiscussRequestPayload::RefreshProviderConfig { .. } => "refreshProviderConfig",
-        DiscussRequestPayload::RemoveProvider { .. } => "removeProvider",
-        DiscussRequestPayload::InstallProviderConfig { .. } => "installProviderConfig",
-        DiscussRequestPayload::RemoveProviderConfig { .. } => "removeProviderConfig",
-        DiscussRequestPayload::ListCustomMcps => "listCustomMcps",
-        DiscussRequestPayload::CreateCustomMcp { .. } => "createCustomMcp",
-        DiscussRequestPayload::UpdateCustomMcp { .. } => "updateCustomMcp",
-        DiscussRequestPayload::DeleteCustomMcp { .. } => "deleteCustomMcp",
-        DiscussRequestPayload::AssignMcp { .. } => "assignMcp",
-        DiscussRequestPayload::UnassignMcp { .. } => "unassignMcp",
-        DiscussRequestPayload::ListBuiltinSkills => "listBuiltinSkills",
-        DiscussRequestPayload::ListProviderInstalledAssets => "listProviderInstalledAssets",
-        DiscussRequestPayload::ListProviderMcpAssignments { .. } => "listProviderMcpAssignments",
-        DiscussRequestPayload::ListCustomAgents => "listCustomAgents",
-        DiscussRequestPayload::ListCustomSkills => "listCustomSkills",
-        DiscussRequestPayload::GetCustomAgent { .. } => "getCustomAgent",
-        DiscussRequestPayload::GetCustomSkill { .. } => "getCustomSkill",
-        DiscussRequestPayload::ImportCustomAgentFromUrl { .. } => "importCustomAgentFromUrl",
-        DiscussRequestPayload::ImportCustomSkillFromUrl { .. } => "importCustomSkillFromUrl",
-        DiscussRequestPayload::SetInstalledAssetInstructions { .. } => "setInstalledAssetInstructions",
-        DiscussRequestPayload::GetInstalledAssetInstructions { .. } => "getInstalledAssetInstructions",
-        DiscussRequestPayload::CreateCustomAgent { .. } => "createCustomAgent",
-        DiscussRequestPayload::CreateCustomSkill { .. } => "createCustomSkill",
-        DiscussRequestPayload::UpdateCustomAgent { .. } => "updateCustomAgent",
-        DiscussRequestPayload::UpdateCustomSkill { .. } => "updateCustomSkill",
-        DiscussRequestPayload::DeleteCustomAgent { .. } => "deleteCustomAgent",
-        DiscussRequestPayload::DeleteCustomSkill { .. } => "deleteCustomSkill",
-        DiscussRequestPayload::InstallCustomAgent { .. } => "installCustomAgent",
-        DiscussRequestPayload::UninstallCustomAgent { .. } => "uninstallCustomAgent",
-        DiscussRequestPayload::InstallCustomSkill { .. } => "installCustomSkill",
-        DiscussRequestPayload::UninstallCustomSkill { .. } => "uninstallCustomSkill",
-        DiscussRequestPayload::CreateCustomTeam { .. } => "createCustomTeam",
-        DiscussRequestPayload::UpdateCustomTeam { .. } => "updateCustomTeam",
-        DiscussRequestPayload::DeleteCustomTeam { .. } => "deleteCustomTeam",
-        DiscussRequestPayload::ListTeamCatalog => "listTeamCatalog",
-        DiscussRequestPayload::InstallTeam { .. } => "installTeam",
-        DiscussRequestPayload::InstallTeamAndStartSession { .. } => "installTeamAndStartSession",
-        DiscussRequestPayload::EditTeam { .. } => "editTeam",
-        DiscussRequestPayload::UninstallTeam { .. } => "uninstallTeam",
-        DiscussRequestPayload::NewSession { .. } => "newSession",
-        DiscussRequestPayload::ConnectProviderSession { .. } => "connectProviderSession",
-        DiscussRequestPayload::ListSessions => "listSessions",
-        DiscussRequestPayload::LoadSession { .. } => "loadSession",
-        DiscussRequestPayload::GetConfigOptions { .. } => "getConfigOptions",
-        DiscussRequestPayload::SetConfigOption { .. } => "setConfigOption",
-        DiscussRequestPayload::RemoveSession { .. } => "removeSession",
-        DiscussRequestPayload::ChangeSessionWorkingDir { .. } => "changeSessionWorkingDir",
-        DiscussRequestPayload::EnsureAttachedSession { .. } => "ensureAttachedSession",
-        DiscussRequestPayload::RenameSession { .. } => "renameSession",
-    }
-}
-
 pub(super) fn validate_user_turn(text: &str, images: &[DiscussImageAttachment]) -> Result<(), DiscussError> {
     let actual_bytes = text.len();
     if actual_bytes > MAX_USER_TURN_BYTES {
@@ -1423,9 +1357,9 @@ pub(super) fn channel_send_error(operation: &'static str, cause: impl Into<Strin
 }
 
 pub(super) async fn run_actor(mut actor: Actor) {
-    let mut retention = tokio::time::interval(Duration::from_secs(86_400));
+    let mut retention = interval(Duration::from_secs(86_400));
     loop {
-        tokio::select! {
+        select! {
             _ = retention.tick() => {
                 if actor.accounting_retention_days != 0 {
                     let cutoff = chrono::Utc::now().timestamp_millis().saturating_sub(i64::from(actor.accounting_retention_days) * 86_400_000);

@@ -14,22 +14,28 @@ mod subagents;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
+    io::{Error as IoError, ErrorKind},
+    iter::once,
     path::{Path, PathBuf},
 };
 
 use agent_client_protocol::v1::schema::{
     McpServer, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions,
+    SubagentUpdate, ToolCall, ToolCallUpdate,
 };
+use serde_json::{Map, Value};
 
 use super::assets::markdown_metadata;
+use super::error::DiscussError;
+use super::launch_types::{
+    LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, LaunchPermissionOutcome, SessionLaunchConfig,
+};
 use super::library::{
     AgentDefinition, AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
     SkillBundleFile, SkillDefinition, SkillId, TeamDefinition,
 };
-use super::types::{
-    DiscussConfigOption, DiscussConfigOptionValue, DiscussError, DiscussMemberOverrides, DiscussUtilityPayload,
-    LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, LaunchPermissionOutcome, SessionLaunchConfig,
-};
+use super::types::{DiscussConfigOption, DiscussConfigOptionValue, DiscussMemberOverrides, DiscussUtilityPayload};
 use super::usage::{DiscussUsageEvidence, UsageCaptureEvent, capture_standard_usage};
 use files::{RenderedFile, write_rendered_files};
 pub(super) use launch::{LaunchContext, LaunchPreparation, LaunchSelections, intersect_rules, merge_metadata};
@@ -84,18 +90,18 @@ pub(super) fn append_installed_instructions(
     agent: bool,
 ) -> Result<(), DiscussError> {
     let path = root.join(path);
-    let capture_error = |error: std::io::Error| DiscussError::WorkspaceIo {
+    let capture_error = |error: IoError| DiscussError::WorkspaceIo {
         plugin: plugin.workspace_label().to_owned(),
         path: path.to_string_lossy().into_owned(),
         message: error.to_string(),
     };
-    let rendered = std::fs::read_to_string(&path).map_err(capture_error)?;
+    let rendered = fs::read_to_string(&path).map_err(capture_error)?;
     let contents = if agent {
         plugin.append_agent_instructions(&rendered, instructions)?
     } else {
         format!("{rendered}\n\n{instructions}")
     };
-    std::fs::write(&path, contents).map_err(capture_error)
+    fs::write(&path, contents).map_err(capture_error)
 }
 
 static DEFAULT_PLUGIN: DefaultAgentPlugin = DefaultAgentPlugin;
@@ -159,12 +165,11 @@ pub(super) fn apply_managed_launch_env(
     Ok(())
 }
 
-fn json_object(plugin: &str, document: &str) -> Result<serde_json::Value, DiscussError> {
-    let value: serde_json::Value =
-        serde_json::from_str(document).map_err(|error| DiscussError::ManagedConfigValidation {
-            plugin: plugin.to_owned(),
-            reason: error.to_string(),
-        })?;
+fn json_object(plugin: &str, document: &str) -> Result<Value, DiscussError> {
+    let value: Value = serde_json::from_str(document).map_err(|error| DiscussError::ManagedConfigValidation {
+        plugin: plugin.to_owned(),
+        reason: error.to_string(),
+    })?;
     if !value.is_object() {
         return Err(DiscussError::ManagedConfigValidation {
             plugin: plugin.to_owned(),
@@ -199,7 +204,7 @@ impl PluginCaptureState {
     }
 
     /// Capture an ACP `subagent_update` (the client declared `clientCapabilities.subagents`).
-    pub(crate) fn capture_standard_subagent(&mut self, update: &serde_json::Value) -> Option<DiscussUtilityPayload> {
+    pub(crate) fn capture_standard_subagent(&mut self, update: &SubagentUpdate) -> Option<DiscussUtilityPayload> {
         let tracker = self.subagents();
         subagents::capture_standard_update(update, tracker);
         tracker.next()
@@ -226,7 +231,7 @@ pub enum PrimaryAgentSelection {
     /// Select the Provider-advertised session config option whose value is the Agent id.
     ConfigOption(&'static str),
     /// Attach Provider-specific `_meta` to the session open request.
-    SessionMeta(serde_json::Map<String, serde_json::Value>),
+    SessionMeta(Map<String, Value>),
     /// Append the Agent's instructions as the ACP session system prompt; requires the
     /// Provider to advertise `sessionCapabilities.systemPrompt`.
     SystemPrompt,
@@ -458,14 +463,9 @@ pub trait DiscussAgentPlugin: Sync {
         ConnectionStrategy::Isolated
     }
 
-    /// Classify and normalize one provider tool-call payload into a utility update.
-    ///
-    /// The actor supplies the physical Agent workspace scope so a plugin can
-    /// distinguish harness-specific tool names without making that knowledge
-    /// part of the provider-neutral DTOs. Implementations must remain pure:
-    /// this hook only inspects the payload and returns a normalized value.
-    fn capture_tool_call(&self, payload: &serde_json::Value, agent_scope_key: &str) -> Option<DiscussUtilityPayload> {
-        let _ = (payload, agent_scope_key);
+    /// Capture a tool call using worker-local state.
+    fn capture_tool_call(&self, call: &ToolCall, state: &mut PluginCaptureState) -> Option<DiscussUtilityPayload> {
+        let _ = (call, state);
         None
     }
 
@@ -474,33 +474,11 @@ pub trait DiscussAgentPlugin: Sync {
     /// Unverified providers intentionally return no utility update by default.
     fn capture_tool_call_update(
         &self,
-        payload: &serde_json::Value,
-        agent_scope_key: &str,
+        update: &ToolCallUpdate,
+        state: &mut PluginCaptureState,
     ) -> Option<DiscussUtilityPayload> {
-        let _ = (payload, agent_scope_key);
+        let _ = (update, state);
         None
-    }
-
-    /// Classify a utility update with worker-local correlation state.
-    fn capture_tool_call_with_state(
-        &self,
-        payload: &serde_json::Value,
-        agent_scope_key: &str,
-        state: &mut PluginCaptureState,
-    ) -> Option<DiscussUtilityPayload> {
-        let _ = state;
-        self.capture_tool_call(payload, agent_scope_key)
-    }
-
-    /// Classify a utility update with worker-local correlation state.
-    fn capture_tool_call_update_with_state(
-        &self,
-        payload: &serde_json::Value,
-        agent_scope_key: &str,
-        state: &mut PluginCaptureState,
-    ) -> Option<DiscussUtilityPayload> {
-        let _ = state;
-        self.capture_tool_call_update(payload, agent_scope_key)
     }
 
     /// Classify a provider extension notification (any method other than `session/update`).
@@ -510,7 +488,7 @@ pub trait DiscussAgentPlugin: Sync {
     fn capture_extension_notification(
         &self,
         method: &str,
-        params: &serde_json::Value,
+        params: &Value,
         state: &mut PluginCaptureState,
     ) -> Option<DiscussUtilityPayload> {
         let _ = (method, params, state);
@@ -729,7 +707,7 @@ pub trait DiscussAgentPlugin: Sync {
         member_settings: &BTreeMap<AgentId, ConfigSettings>,
     ) -> Result<(), DiscussError> {
         let mut files = Vec::new();
-        for id in std::iter::once(&team.leader).chain(&team.followers) {
+        for id in once(&team.leader).chain(&team.followers) {
             let settings = member_settings
                 .get(id)
                 .filter(|settings| !settings.is_empty());
@@ -847,7 +825,7 @@ pub trait DiscussAgentPlugin: Sync {
     fn initial_config_options(
         &self,
         standard_options: Option<Vec<SessionConfigOption>>,
-        metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+        metadata: Option<&Map<String, Value>>,
     ) -> Option<Vec<DiscussConfigOption>> {
         standard_options
             .map(|options| self.standard_config_options(options))
@@ -914,15 +892,12 @@ pub trait DiscussAgentPlugin: Sync {
     }
 
     /// Normalize non-standard provider metadata after standard ACP parsing fails.
-    fn extension_config_options(
-        &self,
-        _metadata: &serde_json::Map<String, serde_json::Value>,
-    ) -> Option<Vec<DiscussConfigOption>> {
+    fn extension_config_options(&self, _metadata: &Map<String, Value>) -> Option<Vec<DiscussConfigOption>> {
         None
     }
 
     /// Normalize a provider config-update notification.
-    fn metadata_config_options(&self, metadata: &serde_json::Value) -> Option<Vec<DiscussConfigOption>> {
+    fn metadata_config_options(&self, metadata: &Value) -> Option<Vec<DiscussConfigOption>> {
         self.standard_metadata_config_options(metadata).or_else(|| {
             metadata
                 .as_object()
@@ -931,7 +906,7 @@ pub trait DiscussAgentPlugin: Sync {
     }
 
     /// Normalize standard ACP config metadata into the canonical Discuss menu.
-    fn standard_metadata_config_options(&self, metadata: &serde_json::Value) -> Option<Vec<DiscussConfigOption>> {
+    fn standard_metadata_config_options(&self, metadata: &Value) -> Option<Vec<DiscussConfigOption>> {
         let options = metadata
             .get("configOptions")
             .or_else(|| metadata.get("options"))?
@@ -1008,9 +983,9 @@ pub fn resolve_skill(library: AssetLibrary, skill_id: &SkillId) -> Result<&'stat
 
 fn remove_file(plugin: &str, root: &Path, relative_path: &Path) -> Result<(), DiscussError> {
     let path = root.join(relative_path);
-    match std::fs::remove_file(&path) {
+    match fs::remove_file(&path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(DiscussError::WorkspaceIo {
             plugin: plugin.to_string(),
             path: path.to_string_lossy().into_owned(),

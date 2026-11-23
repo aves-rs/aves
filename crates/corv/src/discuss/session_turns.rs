@@ -1,20 +1,202 @@
-use agent_client_protocol::v1::schema::{PermissionOptionId, SessionId};
-use tokio::sync::oneshot;
+use std::str::FromStr;
+
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
+    AgentCapabilities, ArchiveSessionRequest, PermissionOptionId, SessionId, UnarchiveSessionRequest,
+};
+use agent_client_protocol::{AcpAgent, Agent, Client, Error as AcpError};
+use serde_json::to_string as json_to_string;
+use tokio::sync::{mpsc, oneshot};
+use tokio::{spawn, time::timeout};
 
 use super::actor::{Actor, CANCEL_TURN_DEADLINE, channel_send_error, validate_user_turn};
 use super::database::persist_elicitation_turn_inner;
 use super::elicitation::validate_elicitation_content;
+use super::error::DiscussError;
+use super::launch_types::AcpProvider;
 use super::messages::DiscussResponse;
 use super::plugins;
-use super::session::revoke_worker_jti;
-use super::storage::ElicitationPersistenceInput;
-use super::supervisor::ProviderSupervisor;
+use super::session::{initialize_request, revoke_worker_jti};
+use super::storage::{
+    ElicitationPersistenceInput, load_discuss_session, load_session_modes, present_acp_session_id, update_session_modes,
+};
+use super::supervisor::{ProviderSupervisor, ProviderSupervisorResources};
 use super::types::{
-    DiscussElicitationAnswer, DiscussError, DiscussImageAttachment, DiscussPermissionOption, DiscussSessionId,
-    DiscussStreamEvent, ElicitationRequestId, InspectorBinding, PendingElicitation, PermissionRequestId, WorkerCommand,
+    DiscussElicitationAnswer, DiscussImageAttachment, DiscussPermissionOption, DiscussResourceLink, DiscussSessionId,
+    DiscussSessionModes, DiscussStreamEvent, ElicitationRequestId, InspectorBinding, PendingElicitation,
+    PermissionRequestId, WorkerCommand,
 };
 
+async fn forward_worker<T>(
+    sender: &mpsc::Sender<WorkerCommand>,
+    context: &'static str,
+    command: impl FnOnce(oneshot::Sender<T>) -> WorkerCommand,
+) -> Result<T, DiscussError> {
+    let (reply, response) = oneshot::channel();
+    sender
+        .send(command(reply))
+        .await
+        .map_err(|error| channel_send_error(context, error.to_string()))?;
+    response.await.map_err(|_| DiscussError::OneshotReply)
+}
+
+async fn forward_archive(
+    connection: &ConnectionTo<Agent>,
+    capabilities: &AgentCapabilities,
+    session_id: String,
+    archived: bool,
+) -> Result<(), AcpError> {
+    if capabilities.session_capabilities.archive.is_some() {
+        if archived {
+            connection
+                .send_request(ArchiveSessionRequest::new(session_id))
+                .block_task()
+                .await?;
+        } else {
+            connection
+                .send_request(UnarchiveSessionRequest::new(session_id))
+                .block_task()
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn archive_provider_session_short_lived(
+    provider: &AcpProvider,
+    session_id: String,
+    archived: bool,
+) -> Result<(), DiscussError> {
+    let agent_key = json_to_string(provider.server())?;
+    let agent = AcpAgent::from_str(&agent_key)?;
+    Client
+        .v1()
+        .name("acp-session-archive")
+        .connect_with(agent, move |cx: ConnectionTo<Agent>| async move {
+            let initialized = cx.send_request(initialize_request()).block_task().await?;
+            forward_archive(&cx, &initialized.agent_capabilities, session_id, archived).await
+        })
+        .await
+        .map_err(DiscussError::from)
+}
+
 impl Actor {
+    /// Set a config option only when the live worker advertises support.
+    pub(super) async fn handle_set_config_option(
+        &mut self,
+        discuss_session_id: DiscussSessionId,
+        config_id: String,
+        value: String,
+    ) -> Result<DiscussResponse, DiscussError> {
+        self.revive_saved_session(discuss_session_id).await?;
+        let entry = self
+            .worker_registry
+            .get(&discuss_session_id)
+            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
+        if !self
+            .worker_capabilities
+            .get(&discuss_session_id)
+            .is_some_and(|caps| caps.set_config_option)
+        {
+            return Err(DiscussError::UnsupportedCapability {
+                capability: "set_config_option".to_string(),
+            });
+        }
+        forward_worker(&entry.command_tx, "handle_set_config_option.worker_command", |reply| {
+            WorkerCommand::SetConfigOption {
+                config_id,
+                value,
+                reply,
+            }
+        })
+        .await??;
+        Ok(DiscussResponse::Success)
+    }
+
+    /// Set provider archive state without changing the local session.
+    pub(super) async fn handle_set_archived(
+        &mut self,
+        discuss_session_id: DiscussSessionId,
+        archived: bool,
+    ) -> Result<DiscussResponse, DiscussError> {
+        if let Some(entry) = self.worker_registry.get(&discuss_session_id) {
+            forward_worker(&entry.command_tx, "set_archived.worker_command", |reply| {
+                WorkerCommand::SetArchived { archived, reply }
+            })
+            .await??;
+        } else {
+            let conn = self.persistence.acquire_connection().await?;
+            if let Some(row) = load_discuss_session(&conn, &discuss_session_id.to_string()).await?
+                && let Some(session_id) = present_acp_session_id(row.acp_session_id.as_deref())
+            {
+                if let Some(ProviderSupervisorResources::Shared {
+                    connection: Some(connection),
+                    capabilities,
+                    ..
+                }) = self
+                    .provider_supervisors
+                    .get(&row.agent_name)
+                    .map(|supervisor| &supervisor.resources)
+                {
+                    forward_archive(connection, capabilities, session_id, archived).await?;
+                } else if let Some(provider) = self.agents.get(&row.agent_name) {
+                    archive_provider_session_short_lived(provider, session_id, archived).await?;
+                }
+            }
+        }
+        Ok(DiscussResponse::Success)
+    }
+
+    /// Read session modes from the owning worker, recording them so they outlast it. Without a
+    /// live worker, return the last recorded modes; a session that never reported any has none.
+    pub(super) async fn handle_get_session_modes(
+        &mut self,
+        discuss_session_id: DiscussSessionId,
+    ) -> Result<DiscussResponse, DiscussError> {
+        let session_id = discuss_session_id.to_string();
+        let Some(entry) = self.worker_registry.get(&discuss_session_id) else {
+            let conn = self.persistence.acquire_connection().await?;
+            let modes = load_session_modes(&conn, &session_id).await?;
+            return Ok(DiscussResponse::SessionModes { modes });
+        };
+        let modes = forward_worker(&entry.command_tx, "get_session_modes.worker_command", |reply| {
+            WorkerCommand::GetSessionModes { reply }
+        })
+        .await?;
+        if let Some(modes) = &modes
+            && let Err(error) = self.record_session_modes(&session_id, modes).await
+        {
+            tracing::warn!(%discuss_session_id, %error, "Failed to record session modes");
+        }
+        Ok(DiscussResponse::SessionModes { modes })
+    }
+
+    async fn record_session_modes(&self, session_id: &str, modes: &DiscussSessionModes) -> Result<(), DiscussError> {
+        let conn = self.persistence.acquire_connection().await?;
+        update_session_modes(&conn, session_id, modes).await
+    }
+
+    /// Set a session mode through its worker.
+    pub(super) async fn handle_set_session_mode(
+        &mut self,
+        discuss_session_id: DiscussSessionId,
+        mode_id: String,
+    ) -> Result<DiscussResponse, DiscussError> {
+        self.revive_saved_session(discuss_session_id).await?;
+        let entry = self
+            .worker_registry
+            .get(&discuss_session_id)
+            .ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
+        forward_worker(&entry.command_tx, "set_session_mode.worker_command", |reply| {
+            WorkerCommand::SetSessionMode { mode_id, reply }
+        })
+        .await??;
+        // Record the new current mode; the change itself already succeeded.
+        if let Err(error) = self.handle_get_session_modes(discuss_session_id).await {
+            tracing::warn!(%discuss_session_id, %error, "Failed to refresh session modes after a mode change");
+        }
+        Ok(DiscussResponse::Success)
+    }
     // ── New control request handlers ──────────────────────────────────────
 
     /// Send a user turn to a live session worker.
@@ -23,6 +205,7 @@ impl Actor {
         discuss_session_id: DiscussSessionId,
         text: String,
         images: Vec<DiscussImageAttachment>,
+        resource_links: Vec<DiscussResourceLink>,
     ) -> Result<DiscussResponse, DiscussError> {
         if !self.server_running {
             return Err(DiscussError::ShuttingDown);
@@ -42,14 +225,15 @@ impl Actor {
                 provider_name: entry.agent_name.clone(),
             });
         }
-        let command_tx = entry.command_tx.clone();
-        let (reply, reply_rx) = oneshot::channel();
-        command_tx
-            .send(WorkerCommand::SendUserTurn { text, images, reply })
-            .await
-            .map_err(|error| channel_send_error("handle_send_user_turn.worker_command", error.to_string()))?;
-        let result = reply_rx.await.map_err(|_| DiscussError::OneshotReply)?;
-        result?;
+        forward_worker(&entry.command_tx, "handle_send_user_turn.worker_command", |reply| {
+            WorkerCommand::SendUserTurn {
+                text,
+                images,
+                resource_links,
+                reply,
+            }
+        })
+        .await??;
         Ok(DiscussResponse::Success)
     }
 
@@ -183,7 +367,7 @@ impl Actor {
             .await;
             return Ok(DiscussResponse::Success);
         }
-        match tokio::time::timeout(CANCEL_TURN_DEADLINE, reply_rx).await {
+        match timeout(CANCEL_TURN_DEADLINE, reply_rx).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => return Err(error),
             Ok(Err(_)) => {
@@ -292,18 +476,14 @@ impl Actor {
             });
         }
         let provider_name = parent.agent_name.clone();
-        let (reply, reply_rx) = oneshot::channel();
-        parent
-            .command_tx
-            .clone()
-            .send(WorkerCommand::AttachInspector {
+        let options = forward_worker(&parent.command_tx, "handle_start_inspector.worker_command", |reply| {
+            WorkerCommand::AttachInspector {
                 viewer_session_id,
                 child_session_id: SessionId::from(binding.child_session_id),
                 reply,
-            })
-            .await
-            .map_err(|error| channel_send_error("handle_start_inspector.worker_command", error.to_string()))?;
-        let options = reply_rx.await.map_err(|_| DiscussError::OneshotReply)??;
+            }
+        })
+        .await??;
         self.inspector_config_options
             .entry(viewer_session_id)
             .or_insert((provider_name, options));
@@ -325,23 +505,14 @@ impl Actor {
         self.cancel_pending_elicitations_for_session(&viewer_session_id);
         self.worker_capabilities.remove(&viewer_session_id);
         let detach_result = if let Some(parent) = self.worker_registry.get(&binding.parent_session_id) {
-            let (reply, reply_rx) = oneshot::channel();
-            let send_result = parent
-                .command_tx
-                .clone()
-                .send(WorkerCommand::DisposeInspector {
+            forward_worker(&parent.command_tx, "handle_dispose_inspector.worker_command", |reply| {
+                WorkerCommand::DisposeInspector {
                     viewer_session_id,
                     reply,
-                })
-                .await
-                .map_err(|error| channel_send_error("handle_dispose_inspector.worker_command", error.to_string()));
-            match send_result {
-                Ok(()) => reply_rx
-                    .await
-                    .map_err(|_| DiscussError::OneshotReply)
-                    .and_then(|result| result),
-                Err(error) => Err(error),
-            }
+                }
+            })
+            .await
+            .and_then(|result| result)
         } else {
             Ok(())
         };
@@ -418,7 +589,7 @@ impl Actor {
         let session_id = discuss_session_id.to_string();
         let request_id = elicitation_request_id.to_string();
         let answer = answer.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             if let Err(error) =
                 persist_elicitation_turn_inner(&persistence, &session_id, &request_id, pending, answer).await
             {

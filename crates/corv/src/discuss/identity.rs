@@ -4,9 +4,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::error::DiscussError;
 use super::messages::DiscussResponse;
 use super::storage::{DiscussPersistence, INSERT_IDENTITY_BINDING_SQL, READ_IDENTITY_BINDING_SQL};
-use super::types::{DiscussError, DiscussSessionId};
+use super::types::DiscussSessionId;
 
 const FLOW_NODE_SUBJECT_PREFIX: &str = "flow-node:";
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::collections::BTreeMap;
 
-use super::types::DiscussError;
+use super::error::DiscussError;
 
 /// Control types supported by ACP's restricted elicitation form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]

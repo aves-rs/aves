@@ -24,7 +24,7 @@ aves-corv = { path = "crates/corv" }
 aves-kea = { path = "crates/kea" }
 
 [workspace.dependencies]
-agent-client-protocol = { version = "=5.3.0" }
+agent-client-protocol = { version = "=5.5.1" }
 arc-malachitebft-app-channel = { version = "=0.8.2" }
 arc-malachitebft-codec = { version = "=0.8.2" }
 arc-malachitebft-config = { version = "=0.8.2" }
@@ -53,7 +53,7 @@ bytes = { version = "=1.12.2", default-features = false }
 cbc = { version = "=0.2.1" }
 chacha20poly1305 = { version = "=0.11.0" }
 chrono = { version = "=0.4.45", features = ["serde"] }
-croner = { version = "=4.0.3" }
+croner = { version = "=5.0.0" }
 ed25519-dalek = { version = "=3.0.0" }
 futures-util = { version = "=0.3.34" }
 gethostname = { version = "=1.1.0" }
@@ -65,16 +65,16 @@ iroh-docs = { version = "=0.101.0", default-features = false, features = ["fs-st
 iroh-gossip = { version = "=0.101.0" } # required by iroh-docs
 jsonwebtoken = { version = "=12.0.0", default-features = false, features = ["rust_crypto"] }
 keyring = { version = "=4.2.0", features = ["v1"] }
-keyring-core = { version = "=1.0.1" }
+keyring-core = { version = "=1.1.0" }
 lettre = { version = "=0.11.24", default-features = false, features = [
   "tokio1",
   "tokio1-native-tls",
   "smtp-transport",
   "builder",
 ] }
-mail-parser = { version = "=1.0.1" }
+mail-parser = { version = "=1.0.2" }
 native-tls = { version = "=0.2.18" }
-num-integer = { version = "=0.1.46" }
+num-integer = { version = "=0.1.47" }
 oxc = { version = "=0.159.0", features = [
   "codegen",
   "semantic",
@@ -120,18 +120,18 @@ tokio = { version = "=1.54.1", features = ["full"] }
 tokio-native-tls = { version = "=0.3.1" }
 tokio-stream = { version = "=0.1.19" }
 tokio-util = { version = "=0.7.20" }
-toml = { version = "=1.2.1" }
+toml = { version = "=1.2.2" }
 tower = { version = "=0.5.3" }
 tracing = { version = "=0.1.44" }
 turbovault-core = { version = "=4.1.0" }
 turbovault-parser = { version = "=4.1.0" }
 turbovault-tools = { version = "=4.1.0" }
 turbovault-vault = { version = "=4.1.0" }
-turso = { version = "=0.8.3", default-features = false }
-url = { version = "=2.5.8" }
+turso = { version = "=0.8.4", default-features = false }
+url = { version = "=2.5.9" }
 uuid = { version = "=1.29.3", features = ["serde", "v4"] }
-wasmtime = { version = "=50.0.2" }
-wasmtime-wasi = { version = "=50.0.2", features = ["p1"] }
+wasmtime = { version = "=51.0.0" }
+wasmtime-wasi = { version = "=51.0.0", features = ["p1"] }
 yaml_serde = { version = "=0.10.7" }
 zbus-secret-service-keyring-store = { version = "=1.0.1" }
 zeroize = { version = "=1.9.2", features = ["derive"] }

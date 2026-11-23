@@ -24,6 +24,8 @@ use aves::bus::{BusRpcContext, DomainPublication, RequestOperationDescriptor};
 
 use super::actor::Actor;
 use super::boot::{DiscussMcpDomain, DiscussMcpService};
+use super::error::DiscussError;
+use super::launch_types::SessionLaunchConfig;
 use super::library::AgentId;
 use super::mcp_direct::McpAcpTransport;
 use super::messages::DiscussResponse;
@@ -32,10 +34,7 @@ use super::storage::{
     delete_mcp_assignments_by_scope, insert_mcp_assignment, list_custom_mcps, list_mcp_assignments_by_scope,
     load_custom_mcp, load_discuss_session, upsert_custom_mcp,
 };
-use super::types::{
-    CustomMcpEntry, CustomMcpScope, DiscussError, DiscussSessionId, DiscussSessionSetup, SensitiveMcpDescriptor,
-    SessionLaunchConfig,
-};
+use super::types::{CustomMcpEntry, CustomMcpScope, DiscussSessionId, DiscussSessionSetup, SensitiveMcpDescriptor};
 
 fn mcp_transport(server: &McpServer) -> Result<(&str, &'static str), DiscussError> {
     match server {

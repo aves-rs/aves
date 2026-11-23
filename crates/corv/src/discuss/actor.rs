@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,8 +34,8 @@ use super::session::{
     SessionCapabilitiesCache, WorkerReady, revoke_worker_jti,
 };
 use super::storage::{
-    CustomInstallationKind, DiscussAgentConfigRow, DiscussPersistence, list_recent_discuss_sessions,
-    load_discuss_agent_config, load_discuss_team_installation, present_acp_session_id, upsert_discuss_agent_config,
+    CustomInstallationKind, DiscussAgentConfigRow, DiscussPersistence, load_discuss_agent_config, load_discuss_session,
+    load_discuss_team_installation, present_acp_session_id, upsert_discuss_agent_config,
 };
 use super::supervisor::{CallbackRouteRegistry, ProviderSupervisor};
 use super::types::{
@@ -161,6 +160,9 @@ pub(super) struct Actor {
 
     /// Ephemeral inspector bindings, held only for the viewer lifetime.
     pub(super) inspector_bindings: HashMap<DiscussSessionId, InspectorBinding>,
+
+    /// Each attached inspector's provider name and the child session's own config options (model, effort).
+    pub(super) inspector_config_options: HashMap<DiscussSessionId, (String, Vec<DiscussConfigOption>)>,
 
     /// Inspector viewers whose parent attachment is being disposed.
     pub(super) disposing_inspectors: HashSet<DiscussSessionId>,
@@ -391,6 +393,7 @@ impl Actor {
             provider_restart_tasks: HashMap::new(),
             provider_restart_cancellations: HashMap::new(),
             inspector_bindings: HashMap::new(),
+            inspector_config_options: HashMap::new(),
             disposing_inspectors: HashSet::new(),
             worker_capabilities: HashMap::new(),
             capabilities_update_rx,
@@ -984,12 +987,6 @@ impl Actor {
     /// provider does not prevent the remaining sessions from warming.
     async fn handle_start_server(&mut self) -> Result<DiscussResponse, DiscussError> {
         let was_running = self.server_running;
-        let rows = if was_running {
-            Vec::new()
-        } else {
-            let conn = self.persistence.acquire_connection().await?;
-            list_recent_discuss_sessions(&conn).await?
-        };
 
         if !was_running {
             let cancel = CancellationToken::new();
@@ -1034,65 +1031,67 @@ impl Actor {
             }
         }
 
-        for row in rows {
-            if row.is_task_session {
-                continue;
-            }
-            let Some(acp_session_id) = present_acp_session_id(row.acp_session_id.as_deref()) else {
-                continue;
-            };
-            if row.discuss_session_id.trim().is_empty() {
-                tracing::warn!(target: "application_acp", "skipping Discuss anchor without a usable discuss_session_id");
-                continue;
-            }
-            if !self.agents.contains_key(&row.agent_name) {
-                tracing::warn!(
-                    target: "application_acp",
-                    discuss_session_id = %row.discuss_session_id,
-                    agent_name = %row.agent_name,
-                    "skipping Discuss anchor whose agent is no longer installed"
-                );
-                continue;
-            }
-
-            let Ok(discuss_session_id) = DiscussSessionId::from_str(&row.discuss_session_id) else {
-                tracing::warn!(
-                    target: "application_acp",
-                    discuss_session_id = %row.discuss_session_id,
-                    "skipping Discuss anchor with unparseable discuss_session_id"
-                );
-                continue;
-            };
-
-            if let Err(error) = self
-                .spawn_session(
-                    discuss_session_id,
-                    &row.agent_name,
-                    SpawnSessionOptions {
-                        launch_config: None,
-                        name: Some(row.session_name),
-                        setup: None,
-                        session_config_overrides: BTreeMap::new(),
-                        acp_session_id: Some(acp_session_id),
-                        announce_desktop_association: false,
-                        transient_connectivity: false,
-                        session_cwd: None,
-                        application_mcp_enabled: None,
-                        node_token: None,
-                        flow_mcp_endpoints: None,
-                    },
-                )
-                .await
-            {
-                tracing::warn!(target: "application_acp", ?error, "skipping unrecoverable Discuss session during startup");
-            }
-        }
-
+        // Saved sessions are not reattached here: each one gets its worker the first time
+        // a worker-bound command needs it (`revive_saved_session`).
         if !was_running {
             self.publish_server_status(DiscussResponse::ServerStarted)
                 .await;
         }
         Ok(DiscussResponse::Success)
+    }
+
+    /// Reattaches a saved, non-task session that has no live worker, so worker-bound commands
+    /// work lazily after a restart. A live worker, an unknown anchor, an anchor without a provider
+    /// session or one whose agent is no longer installed is left alone; the caller's own
+    /// `SessionNotFound` then applies.
+    pub(super) async fn revive_saved_session(
+        &mut self,
+        discuss_session_id: DiscussSessionId,
+    ) -> Result<(), DiscussError> {
+        if !self.server_running
+            || self
+                .worker_registry
+                .get(&discuss_session_id)
+                .is_some_and(|entry| !entry.join_handle.is_finished() && !entry.command_tx.is_closed())
+        {
+            return Ok(());
+        }
+        let conn = self.persistence.acquire_connection().await?;
+        let Some(row) = load_discuss_session(&conn, &discuss_session_id.to_string()).await? else {
+            return Ok(());
+        };
+        drop(conn);
+        if row.is_task_session || !self.agents.contains_key(&row.agent_name) {
+            return Ok(());
+        }
+        let Some(acp_session_id) = present_acp_session_id(row.acp_session_id.as_deref()) else {
+            return Ok(());
+        };
+        tracing::debug!(
+            target: "application_acp",
+            %discuss_session_id,
+            agent_name = %row.agent_name,
+            "reattaching saved Discuss session on first use"
+        );
+        self.spawn_session(
+            discuss_session_id,
+            &row.agent_name,
+            SpawnSessionOptions {
+                launch_config: None,
+                name: Some(row.session_name),
+                setup: None,
+                session_config_overrides: BTreeMap::new(),
+                acp_session_id: Some(acp_session_id),
+                announce_desktop_association: false,
+                transient_connectivity: false,
+                session_cwd: None,
+                application_mcp_enabled: None,
+                node_token: None,
+                flow_mcp_endpoints: None,
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn publish_server_status(&self, response: DiscussResponse) {

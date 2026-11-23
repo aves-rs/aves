@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -737,6 +738,7 @@ async fn make_actor(
         provider_restart_tasks: HashMap::new(),
         provider_restart_cancellations: HashMap::new(),
         inspector_bindings: HashMap::new(),
+        inspector_config_options: HashMap::new(),
         disposing_inspectors: HashSet::new(),
         worker_capabilities: HashMap::new(),
         capabilities_update_rx,
@@ -3709,6 +3711,7 @@ async fn make_migrated_actor(
         provider_restart_tasks: HashMap::new(),
         provider_restart_cancellations: HashMap::new(),
         inspector_bindings: HashMap::new(),
+        inspector_config_options: HashMap::new(),
         disposing_inspectors: HashSet::new(),
         worker_capabilities: HashMap::new(),
         capabilities_update_rx,

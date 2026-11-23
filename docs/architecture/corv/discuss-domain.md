@@ -1,7 +1,7 @@
 ---
 title: Discuss Domain Architecture
 type: architecture
-updated: 2026-11-17
+updated: 2026-11-21
 references:
   - crates/corv/AGENTS.md
   - crates/corv/src/lib.rs
@@ -37,6 +37,11 @@ references:
   - crates/corv/src/discuss/migration.rs
   - crates/aves/src/runtime/supervisor.rs
   - crates/aves/src/flow/actor.rs
+  - crates/corv/src/discuss/types.rs
+  - crates/corv/src/discuss/provider.rs
+  - crates/corv/src/discuss/sessions.rs
+  - crates/corv/src/discuss/messages.rs
+  - crates/corv/src/discuss/plugins/opencode/mod.rs
 ---
 
 # Discuss Domain Architecture
@@ -102,6 +107,14 @@ Broadcasts: `ServerStarted` / `ServerStopped`, `SessionReady`, `SessionActivity`
 
 Actor-owned `provider_supervisors` (memory only). Shared: `opencode`, `codex-acp`, `claude-acp`. Isolated: `grok-build` and custom. Shared connections use `SessionCallbackRouter` (`session.rs`). Missing queue returns the intact `CallbackEvent`; `fail_closed` answers Permission with internal error and Elicitation with Cancel.
 
+`DiscussProviderConfig.agent_config_option_id` names the provider option that selects the primary agent, from the plugin's private selection. It is `None` for system-prompt, session-metadata or launch-argument selections. `ConfigOptionsOutput` carries the same optional id; no lookup operation exists.
+
+Team primary-Agent precedence (`open_configured_session`, `session.rs`): when the Agent is selected through that option, Corv sets the advertised value after open, then removes the same option from the resolved stored preferences before reconciling, so a saved value cannot undo it. This runs on both new and reconnect opens. If the Provider does not advertise the Agent, the open fails with `Validation`.
+
+## Background work
+
+Subagents reach the parent as `UtilityUpdate`s carrying `DiscussUtilityPayload::Subagent` records, whose `surface_state` is separate from `active_turn`; subagent states never change parent activity. Sources and state mapping per provider are in [Subagent Reporting](../../concepts/subagent-reporting.md). `DiscussUtilityPayload::BackgroundWork` remains in the contract, but no plugin currently produces it.
+
 ## Worker tokens
 
 - Chat and transient workers: delegated JWT (`sub = "agent"`, `SESSION_WORKER_JWT_EXPIRATION` = 30 days) via `issue_worker_jwt`. Discuss stores the JTI and revokes on terminal paths (`revoke_worker_jti`).
@@ -126,18 +139,7 @@ SQL lives in `crates/corv/migrations/`, a peer of `src/`; `crates/corv/src/discu
 
 Migrations `0001`–`0009` create the session, turn, config, team and subagent tables, the session-launch context, launch-config and setup-kind columns, the launch-limitations column, and the accounting (0005), custom-asset (0006), identity-binding (0007) and custom-MCP (0008) tables. There is no Job table: durable automation is Aves Flow.
 
-## Consumer reexport surface
-
-The following symbols are reexported from the Corv crate root for embedding applications (verified against `crates/corv/src/lib.rs`):
-
-- `DiscussSettings` (from `boot.rs`)
-- `AcpProvider`, `ProviderRuntimeStatus`, `ProviderRuntimeFailure`, `CleanupWarning` (from `types.rs`)
-- Provider operation DTOs and dispatchers: `ListProvidersInput`, `ProvidersListOutput`, `dispatch_list_providers`, `AddProviderInput`, `SuccessOutput`, `dispatch_add_provider`, `RemoveProviderInput`, `ProviderRemoveSuccessOutput`, `dispatch_remove_provider` (generated from `messages.rs` declarations)
-- Custom content: `GetCustomAgentOutput`, `GetCustomSkillOutput`, `ImportCustomAgentFromUrlInput`, `ImportCustomSkillFromUrlInput`, `InstalledAssetKind`
-- Custom MCP: `CustomMcpEntry`, `CustomMcpScope`, `SensitiveMcpDescriptor`, `ListCustomMcpsInput`, `ListCustomMcpsOutput`, `CreateCustomMcpInput`, `UpdateCustomMcpInput`, `DeleteCustomMcpInput`, `AssignMcpInput`, `UnassignMcpInput`, `dispatch_list_custom_mcps`
-- Managed Provider configuration and identity: `GetProviderManagedConfigInput`, `ProviderManagedConfigOutput`, `dispatch_get_provider_managed_config`, `ResolveSessionIdentityInput`, `SessionIdentityResolvedOutput`, `DiscussIdentityService`
-
-Implementation modules remain private; only consumer contracts are reexported. Provider-config lifecycle operations remain privileged as declared.
+Embedding applications import only the consumer contracts re-exported from `crates/corv/src/lib.rs`; the list is maintained there and in [crates/corv/AGENTS.md](../../../crates/corv/AGENTS.md).
 
 ## Related
 

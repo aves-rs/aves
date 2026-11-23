@@ -710,7 +710,7 @@ pub struct DiscussTodoSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscussSubagentSurfaceState {
-    /// The child session is being created.
+    /// The child session is being created or its state is unconfirmed.
     Loading,
     /// The child session is live and running.
     Live,
@@ -724,7 +724,7 @@ pub enum DiscussSubagentSurfaceState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscussSubagentRecord {
-    /// Stable capture identity sourced from the provider tool call id.
+    /// Stable provider work or tool-call identity.
     pub capture_id: String,
     /// Child harness session identity, unavailable until the provider commits it.
     pub child_session_id: Option<String>,
@@ -738,6 +738,56 @@ pub struct DiscussSubagentRecord {
     pub surface_state: DiscussSubagentSurfaceState,
     /// Unix timestamp in milliseconds of the latest provider update.
     pub last_updated_at: i64,
+}
+
+/// Provider-reported background work associated with a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussBackgroundWork {
+    /// Provider identity for this work.
+    pub id: String,
+    /// Kind of work.
+    pub kind: DiscussBackgroundWorkKind,
+    /// Observed lifecycle state.
+    pub status: DiscussBackgroundWorkStatus,
+    /// Optional provider description.
+    pub description: Option<String>,
+    /// Start time in milliseconds since the Unix epoch.
+    pub started_at: i64,
+    /// Completion time in milliseconds since the Unix epoch, if known.
+    pub completed_at: Option<i64>,
+    /// Provider child session, when applicable.
+    pub child_session_id: Option<String>,
+}
+
+/// Kind of provider background work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussBackgroundWorkKind {
+    /// Child agent session.
+    Subagent,
+    /// Shell command.
+    Shell,
+    /// Image generation.
+    Image,
+    /// Code mode execution.
+    CodeMode,
+}
+
+/// Observed state of provider background work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussBackgroundWorkStatus {
+    /// Work is active.
+    Running,
+    /// Work completed successfully.
+    Completed,
+    /// Work failed.
+    Failed,
+    /// Work was cancelled.
+    Cancelled,
+    /// Its state cannot currently be established.
+    Unknown,
 }
 
 /// Provider-neutral utility update associated with a parent session.
@@ -758,6 +808,11 @@ pub enum DiscussUtilityPayload {
     TodoSnapshot { snapshot: DiscussTodoSnapshot },
     /// Current record for one child subagent.
     Subagent { subagent: DiscussSubagentRecord },
+    /// Replacement snapshot of observed background work.
+    BackgroundWork {
+        work: Vec<DiscussBackgroundWork>,
+        available: bool,
+    },
 }
 
 pub type ConfigSettings = BTreeMap<String, String>;
@@ -945,7 +1000,8 @@ pub(crate) enum WorkerCommand {
     AttachInspector {
         viewer_session_id: DiscussSessionId,
         child_session_id: SessionId,
-        reply: oneshot::Sender<Result<(), DiscussError>>,
+        /// Replies with the child session's config options, empty when the viewer was already attached.
+        reply: oneshot::Sender<Result<Vec<DiscussConfigOption>, DiscussError>>,
     },
     /// Dispose a viewer attached to this worker without cancelling its ACP session.
     DisposeInspector {

@@ -1,10 +1,11 @@
 ---
 title: Discuss Accounting Ledgers
 type: concept
-updated: 2026-11-18
+updated: 2026-11-21
 references:
   - crates/corv/migrations/0005_accounting_ledgers.sql
   - crates/corv/src/discuss/usage.rs
+  - crates/corv/src/discuss/types.rs
   - crates/corv/src/discuss/pricing.rs
   - crates/corv/src/discuss/allowance.rs
   - crates/corv/src/discuss/plugins/mod.rs
@@ -69,6 +70,18 @@ Observations are written at most once per 15-minute window per `(provider, accou
 Ledger rows are written only at a turn's terminal boundary — completion, cancellation, or worker failure. A turn's ordinal comes from the ledger itself (`MAX(turn_ordinal) + 1` for the session) when the session spawns, then increments in memory.
 
 `DiscussSettings.accounting_retention_days` defaults to **90**; `0` disables pruning. The actor prunes once per day: model entries before their turns, allowance observations last.
+
+## Turn usage sidecar
+
+`DiscussStreamEvent::AgentMessage` carries optional `turn_usage` (`DiscussTurnUsage`, `types.rs`). It rides the existing envelope; no new event variant exists.
+
+- `turn_ordinal` is set for every dispatched turn, even with no counts. Missing counts stay `None`, and `usage_is_incomplete` is true when the turn has no model entries, so an empty turn is never reported as zero.
+- Only real provider counts are used (`PromptResponse.usage`, `usage_update`); nothing is estimated.
+- `end_to_end_ms` exists only for `Completed` turns. Cancelled and failed turns have no elapsed time. Corv records no time-to-first-token.
+- `finish` takes the active turn once, enqueues one `UsageTurn`, and retains it as the last slot.
+- Order at a terminal boundary (`worker.rs`): `finish` enqueues `UsageTurn` first; the assistant row is queued next; `bind_assistant_position` runs only after that queue send succeeds. A failed send leaves the row unbound.
+- Eager cancel (`cancel_turn`) finishes the turn as `Cancelled` before queuing the flushed partial row, so its `finalized_snapshot` carries the cancelled ordinal and no elapsed time.
+- A `PromptResponse` that arrives after the cancel finds no active turn. It reaches the retained slot and enqueues `UpdateTurnUsage` for that ordinal, with the bound position when a row was queued. Uncorrelated late evidence is dropped.
 
 ## Related
 

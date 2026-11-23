@@ -4,17 +4,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
-use agent_client_protocol::v1::schema::{EnvVariable, McpServer, SessionId};
+use agent_client_protocol::v1::schema::{EnvVariable, McpServer};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::{
-    process::Command,
-    sync::mpsc,
-    time::{Duration, sleep, timeout},
-};
 
 use super::super::library::{
     AgentId, AgentRole, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
@@ -26,6 +20,7 @@ use super::super::types::{
     SessionCliLogin, SessionLaunchConfig,
 };
 use super::files::{RenderedFile, write_rendered_files};
+use super::subagents::{SubagentObservation, SubagentTracker};
 use super::{
     BILLING_INPUT, BILLING_OUTPUT, BILLING_TOTAL, BillingCategorySemantics, ConfigSettings, ConnectionStrategy,
     DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig, PluginCaptureState, PrimaryAgentSelection,
@@ -40,8 +35,10 @@ const SESSION_CONFIG_PATH: &str = ".opencode/corv-session.json";
 const SESSION_PERMISSIONS_SETTING: &str = "__corv_session_permissions";
 /// OpenCode's session config option selecting the primary agent.
 const MODE_CONFIG_ID: &str = "mode";
-const CHILD_SESSION_LOOKUP_ATTEMPTS: usize = 3;
-const CHILD_SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Most `subagent` tool calls remembered per session.
+const TOOL_LIMIT: usize = 64;
+/// OpenCode's subagent lifecycle notification, enabled by `opencode/child-session-updates`.
+const CHILD_UPDATE_METHOD: &str = "opencode/session/child_update";
 
 pub static PLUGIN: OpenCodePlugin = OpenCodePlugin;
 
@@ -50,35 +47,59 @@ pub struct OpenCodePlugin;
 
 #[derive(Default)]
 pub struct OpenCodeCaptureState {
+    /// v1 `task` tool calls, keyed by tool-call id.
     subagents: BTreeMap<String, OpenCodeSubagentCapture>,
-    db_lookup: Option<OpenCodeDbLookup>,
+    /// v2 `subagent` tool inputs, keyed by tool-call id.
+    v2_tools: BTreeMap<String, V2SubagentInput>,
+    tracker: SubagentTracker,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2SubagentInput {
+    agent: String,
+    description: Option<String>,
+    #[serde(rename = "sessionID")]
+    session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct V2SubagentResult {
+    #[serde(rename = "sessionID")]
+    session_id: Option<String>,
 }
 
 struct OpenCodeSubagentCapture {
     agent_name: String,
     description: Option<String>,
     child_session_id: Option<String>,
-    lookup_started: bool,
 }
 
-#[derive(Clone)]
-struct OpenCodeDbLookup {
-    command: PathBuf,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-    parent_session_id: String,
-    resolved_subagent_tx: mpsc::Sender<DiscussSubagentRecord>,
-}
-
-impl OpenCodeCaptureState {
-    pub fn configure_db_lookup(
-        &mut self,
-        launch_server: &McpServer,
-        parent_session_id: &SessionId,
-        resolved_subagent_tx: mpsc::Sender<DiscussSubagentRecord>,
-    ) {
-        self.db_lookup = build_db_lookup(launch_server, parent_session_id, resolved_subagent_tx);
+/// OpenCode's `child_update` status for a direct child of the session (`created` | `running` |
+/// `completed` | `failed` | `interrupted`). Nested children and transcript updates are ignored;
+/// the subagent inspector loads the child session itself.
+fn capture_child_update(params: &serde_json::Value, tracker: &mut SubagentTracker) {
+    let text = |key: &str| params.get(key).and_then(serde_json::Value::as_str);
+    if text("type") != Some("status") || text("parentSessionId") != text("rootSessionId") {
+        return;
     }
+    let Some(child) = text("childSessionId") else {
+        return;
+    };
+    let state = match text("status") {
+        Some("created") => DiscussSubagentSurfaceState::Loading,
+        Some("running") => DiscussSubagentSurfaceState::Live,
+        Some("completed") => DiscussSubagentSurfaceState::Done,
+        Some("failed" | "interrupted") => DiscussSubagentSurfaceState::Error,
+        _ => return,
+    };
+    tracker.observe_reported(SubagentObservation {
+        capture_id: child,
+        child_session_id: Some(child),
+        agent_name: None,
+        description: text("title"),
+        state: Some(state),
+    });
 }
 
 #[derive(Serialize)]
@@ -560,6 +581,21 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         classify_tool_payload(payload)
     }
 
+    fn capture_extension_notification(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        state: &mut PluginCaptureState,
+    ) -> Option<DiscussUtilityPayload> {
+        let PluginCaptureState::OpenCode(state) = state else {
+            return None;
+        };
+        if method.trim_start_matches('_') == CHILD_UPDATE_METHOD {
+            capture_child_update(params, &mut state.tracker);
+        }
+        state.tracker.next()
+    }
+
     fn supports_child_session_load(&self) -> bool {
         // OpenCode advertises ACP loadSession and loads the supplied provider
         // session id through its session service.
@@ -860,6 +896,10 @@ fn capture_subagent_update(
 }
 
 impl OpenCodeCaptureState {
+    pub(super) fn subagent_tracker(&mut self) -> &mut SubagentTracker {
+        &mut self.tracker
+    }
+
     fn capture_update(&mut self, update: &serde_json::Value) -> Option<DiscussUtilityPayload> {
         if update.get("title").and_then(serde_json::Value::as_str) == Some("todowrite") {
             return parse_todo_snapshot(update);
@@ -870,10 +910,41 @@ impl OpenCodeCaptureState {
         if tool_call_id.is_empty() {
             return None;
         }
+        if let Some(input) = update
+            .get("rawInput")
+            .and_then(|input| serde_json::from_value::<V2SubagentInput>(input.clone()).ok())
+        {
+            self.v2_tools.insert(tool_call_id.to_string(), input);
+            if self.v2_tools.len() > TOOL_LIMIT {
+                self.v2_tools.pop_first();
+            }
+        }
+        // The v2 `subagent` tool returns as soon as the child is handed off; its lifecycle comes
+        // from `opencode/session/child_update`. The call only names the child's agent.
+        if let Some(input) = self.v2_tools.get(tool_call_id) {
+            let output = update.get("rawOutput");
+            let child = ["metadata", "result"]
+                .iter()
+                .filter_map(|key| output.and_then(|output| output.get(*key)))
+                .chain(output)
+                .find_map(|value| {
+                    serde_json::from_value::<V2SubagentResult>(value.clone())
+                        .ok()?
+                        .session_id
+                })
+                .or_else(|| input.session_id.clone())?;
+            self.tracker.observe(SubagentObservation {
+                capture_id: &child,
+                child_session_id: Some(&child),
+                agent_name: Some(&input.agent),
+                description: input.description.as_deref(),
+                state: None,
+            });
+            return self.tracker.next();
+        }
         self.update_subagent_input(update, tool_call_id)?;
         self.update_child_session_id(update, tool_call_id);
         let surface_state = parse_subagent_state(update)?;
-        self.start_child_lookup(tool_call_id, surface_state);
         let payload = self.subagent_payload(tool_call_id, surface_state)?;
         self.remove_finished_subagent(update, tool_call_id);
         Some(payload)
@@ -904,7 +975,6 @@ impl OpenCodeCaptureState {
                     agent_name: agent_name.to_string(),
                     description: description.clone(),
                     child_session_id: None,
-                    lookup_started: false,
                 });
             entry.agent_name = agent_name.to_string();
             entry.description = description;
@@ -925,39 +995,6 @@ impl OpenCodeCaptureState {
         {
             entry.child_session_id = Some(child_session_id.to_string());
         }
-    }
-
-    fn start_child_lookup(&mut self, capture_id: &str, surface_state: DiscussSubagentSurfaceState) {
-        let Some(entry) = self.subagents.get_mut(capture_id) else {
-            return;
-        };
-        if entry.child_session_id.is_some()
-            || entry.lookup_started
-            || surface_state != DiscussSubagentSurfaceState::Live
-        {
-            return;
-        }
-        let Some(lookup) = self.db_lookup.clone() else { return };
-        entry.lookup_started = true;
-        let capture_id = capture_id.to_string();
-        let resolved_agent_name = entry.agent_name.clone();
-        let resolved_description = entry.description.clone();
-        let resolved_subagent_tx = lookup.resolved_subagent_tx.clone();
-        tokio::spawn(async move {
-            if let Some(child_session_id) = lookup_child_session(&lookup, &capture_id).await {
-                let _ = resolved_subagent_tx
-                    .send(DiscussSubagentRecord {
-                        capture_id,
-                        child_session_id: Some(child_session_id),
-                        agent_name: resolved_agent_name,
-                        description: resolved_description,
-                        fallback_capability: None,
-                        surface_state,
-                        last_updated_at: Utc::now().timestamp_millis(),
-                    })
-                    .await;
-            }
-        });
     }
 
     fn subagent_payload(
@@ -991,87 +1028,6 @@ impl OpenCodeCaptureState {
             self.subagents.remove(capture_id);
         }
     }
-}
-
-fn build_db_lookup(
-    launch_server: &McpServer,
-    parent_session_id: &SessionId,
-    resolved_subagent_tx: mpsc::Sender<DiscussSubagentRecord>,
-) -> Option<OpenCodeDbLookup> {
-    let McpServer::Stdio(server) = launch_server else {
-        return None;
-    };
-    let mut args = server.args.clone();
-    let acp_index = args.iter().position(|arg| arg == "acp")?;
-    if args.iter().filter(|arg| *arg == "acp").count() != 1 {
-        return None;
-    }
-    args.truncate(acp_index);
-    args.push("db".to_string());
-    Some(OpenCodeDbLookup {
-        command: server.command.clone(),
-        args,
-        env: server
-            .env
-            .iter()
-            .map(|variable| (variable.name.clone(), variable.value.clone()))
-            .collect(),
-        parent_session_id: parent_session_id.to_string(),
-        resolved_subagent_tx,
-    })
-}
-
-fn quote_sql(value: &str) -> Option<String> {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return None;
-    }
-    Some(format!("'{}'", value.replace('\'', "''")))
-}
-
-fn build_db_query(parent_session_id: &str, capture_id: &str) -> Option<String> {
-    Some(
-        include_str!("../../queries/opencode_child_session_lookup.sql")
-            .trim()
-            .replace("{{parent_session_id}}", &quote_sql(parent_session_id)?)
-            .replace("{{capture_id}}", &quote_sql(capture_id)?),
-    )
-}
-
-async fn lookup_child_session(lookup: &OpenCodeDbLookup, capture_id: &str) -> Option<String> {
-    let query = build_db_query(&lookup.parent_session_id, capture_id)?;
-    for attempt in 0..CHILD_SESSION_LOOKUP_ATTEMPTS {
-        if attempt > 0 {
-            sleep(Duration::from_millis(50 * attempt as u64)).await;
-        }
-        let mut command = Command::new(&lookup.command);
-        command
-            .args(&lookup.args)
-            .arg(query.as_str())
-            .arg("--format")
-            .arg("json")
-            .envs(lookup.env.iter().map(|(name, value)| (name, value)))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let Ok(Ok(output)) = timeout(CHILD_SESSION_LOOKUP_TIMEOUT, command.output()).await else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) else {
-            continue;
-        };
-        if let Some(session_id) = rows
-            .first()
-            .and_then(|row| row.get("session_id"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|session_id| !session_id.is_empty())
-        {
-            return Some(session_id.to_string());
-        }
-    }
-    None
 }
 
 fn parse_subagent_state(update: &serde_json::Value) -> Option<DiscussSubagentSurfaceState> {
@@ -1555,32 +1511,57 @@ mod tests {
     }
 
     #[test]
-    fn db_query_quotes_exact_provider_ids() {
-        let query = build_db_query("parent'1", "tool'1").expect("safe SQL query");
-        assert!(query.contains("session_id = 'parent''1'"));
-        assert!(query.contains("json_extract(data, '$.callID') = 'tool''1'"));
-        assert!(build_db_query("", "tool").is_none());
-        assert!(build_db_query("parent\n", "tool").is_none());
+    fn child_updates_report_the_subagent_lifecycle_with_the_tool_call_agent() {
+        let mut state = PluginCaptureState::OpenCode(OpenCodeCaptureState::default());
+        let mut child = |status: &str| {
+            let params = serde_json::json!({"rootSessionId": "parent", "childSessionId": "child-1",
+                "parentSessionId": "parent", "depth": 1, "title": "Explore code", "type": "status", "status": status});
+            match PLUGIN.capture_extension_notification("opencode/session/child_update", &params, &mut state) {
+                Some(DiscussUtilityPayload::Subagent { subagent }) => {
+                    Some((subagent.agent_name, subagent.surface_state))
+                }
+                _ => None,
+            }
+        };
+        assert_eq!(
+            child("running"),
+            Some(("subagent".to_string(), DiscussSubagentSurfaceState::Live))
+        );
+        assert_eq!(
+            child("completed").map(|row| row.1),
+            Some(DiscussSubagentSurfaceState::Done)
+        );
+        assert_eq!(
+            child("running").map(|row| row.1),
+            Some(DiscussSubagentSurfaceState::Live)
+        );
+        assert_eq!(
+            child("interrupted").map(|row| row.1),
+            Some(DiscussSubagentSurfaceState::Error)
+        );
+
+        let PluginCaptureState::OpenCode(inner) = &mut state else {
+            unreachable!()
+        };
+        let call = serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "call-1", "title": "subagent",
+            "kind": "think", "status": "completed",
+            "rawInput": {"agent": "InternalScout", "description": "Explore code", "prompt": "look"},
+            "rawOutput": {"metadata": {"sessionID": "child-1", "status": "running"}}});
+        let Some(DiscussUtilityPayload::Subagent { subagent }) = inner.capture_update(&call) else {
+            panic!("expected the subagent's agent name from its tool call");
+        };
+        assert_eq!(subagent.capture_id, "child-1");
+        assert_eq!(subagent.agent_name, "InternalScout");
+        assert_eq!(subagent.surface_state, DiscussSubagentSurfaceState::Error);
+
+        let nested = serde_json::json!({"rootSessionId": "parent", "childSessionId": "grandchild",
+            "parentSessionId": "child-1", "depth": 2, "type": "status", "status": "running"});
+        assert!(
+            PLUGIN
+                .capture_extension_notification("opencode/session/child_update", &nested, &mut state)
+                .is_none()
+        );
     }
-
-    #[test]
-    fn db_lookup_transforms_only_supported_stdio_acp_launches() {
-        let server = McpServer::Stdio(McpServerStdio::new("OpenCode", "opencode").args(vec![
-            "--config".to_string(),
-            "test".to_string(),
-            "acp".to_string(),
-        ]));
-
-        let parent_session_id: SessionId =
-            serde_json::from_value(serde_json::json!("synthetic-parent")).expect("synthetic local ACP parent id");
-        let (resolved_subagent_tx, _resolved_subagent_rx) = mpsc::channel(4);
-        let lookup =
-            build_db_lookup(&server, &parent_session_id, resolved_subagent_tx).expect("stdio ACP launch is supported");
-
-        assert_eq!(lookup.command, PathBuf::from("opencode"));
-        assert_eq!(lookup.args, vec!["--config", "test", "db"]);
-    }
-
     #[test]
     fn install_is_idempotent_and_destroy_is_absent_noop() {
         let library = test_library::library();

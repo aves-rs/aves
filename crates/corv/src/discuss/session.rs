@@ -13,7 +13,7 @@ use agent_client_protocol::v1::schema::{
     CreateElicitationResponse, ElicitationAction, ElicitationCapabilities, ElicitationFormCapabilities,
     ElicitationScope, ImageContent, InitializeRequest, LoadSessionRequest, McpServer, Meta, NewSessionRequest,
     NewSessionResponse, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOptionValue, SessionId,
-    SessionInfo, SetSessionConfigOptionRequest, SystemPrompt, TextContent,
+    SessionInfo, SetSessionConfigOptionRequest, SubagentCapabilities, SystemPrompt, TextContent,
 };
 use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
 use agent_client_protocol::{
@@ -519,9 +519,16 @@ struct TerminalAuthExtension {
 pub fn initialize_request() -> InitializeRequest {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal-auth".to_string(), serde_json::Value::Bool(true));
+    // OpenCode's own subagent lifecycle channel (`opencode/session/child_update`); it does not
+    // implement the ACP subagents capability declared below.
+    meta.insert(
+        "opencode/child-session-updates".to_string(),
+        serde_json::Value::Bool(true),
+    );
     let capabilities = ClientCapabilities::new()
         .auth(AuthCapabilities::new().terminal(true))
         .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+        .subagents(SubagentCapabilities::new())
         .meta(meta);
     InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities)
 }
@@ -756,9 +763,16 @@ impl HandleDispatchFrom<Agent> for SessionMessageRouter {
             {
                 None
             }
-            Dispatch::Request(request, _) | Dispatch::Notification(request) => request
+            Dispatch::Request(request, _) => request
                 .params()
                 .get("sessionId")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?,
+            // OpenCode's `child_update` names its owning session `rootSessionId`.
+            Dispatch::Notification(notification) => notification
+                .params()
+                .get("sessionId")
+                .or_else(|| notification.params().get("rootSessionId"))
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?,
             Dispatch::Response(_, _) => None,

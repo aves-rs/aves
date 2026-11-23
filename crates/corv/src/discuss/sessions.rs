@@ -1435,6 +1435,13 @@ impl Actor {
         &mut self,
         discuss_session_id: DiscussSessionId,
     ) -> Result<DiscussResponse, DiscussError> {
+        // An inspector viewer has no anchor row; it reports the child session's own options.
+        if let Some((provider_name, options)) = self.inspector_config_options.get(&discuss_session_id) {
+            return Ok(DiscussResponse::ConfigOptions {
+                options: options.clone(),
+                agent_config_option_id: plugins::agent_config_option_id(plugins::for_agent(provider_name)),
+            });
+        }
         let conn = self.persistence.acquire_connection().await?;
         let row = load_discuss_session(&conn, &discuss_session_id.to_string()).await?;
         let row = row.ok_or(DiscussError::SessionNotFound { discuss_session_id })?;
@@ -1477,6 +1484,7 @@ impl Actor {
         value: String,
     ) -> Result<DiscussResponse, DiscussError> {
         let key = discuss_session_id;
+        self.revive_saved_session(discuss_session_id).await?;
 
         let command_tx = self
             .worker_registry

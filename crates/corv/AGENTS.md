@@ -49,7 +49,7 @@ Paths below are relative to `src/discuss/`. Discuss SQL migrations stay at crate
 | `asset_sources.rs` | Bounded SSRF-safe URL and GitHub file/directory fetching. |
 | `identity.rs` | Session identity bindings: `(issuer, subject)` to session, provider, agent, node execution id. |
 | `actor/tests.rs` | Relocated primary-file tests (unchanged assertions/fixtures). |
-| `queries/` | Existing SQL assets, including `todo_snapshot_update.sql`, `opencode_child_session_lookup.sql`, and the accounting, custom-asset, identity-binding and custom-MCP assets. Buffer sizing uses `aves::utils::buffers::DEFAULT_BUFFER_SIZE`. |
+| `queries/` | Existing SQL assets, including `todo_snapshot_update.sql` and the accounting, custom-asset, identity-binding and custom-MCP assets. Buffer sizing uses `aves::utils::buffers::DEFAULT_BUFFER_SIZE`. |
 
 ## Terminology
 
@@ -72,6 +72,9 @@ Paths below are relative to `src/discuss/`. Discuss SQL migrations stay at crate
 - **Duplicate plugin references.** `validate_supplied_inputs` is called by the Claude and Codex preparations only. Do not assume a universal rejection of duplicate `plugin_references`.
 - **Session activity.** The worker's turn flag is the only activity state. `DiscussBroadcast::SessionActivity` publishes each transition; `DiscussSessionInfo.active_turn` is the snapshot. The actor accepts an activity update only when the worker entry exists **and** its `JoinHandle::is_finished()` is false — registry membership alone is insufficient. A worker failure publishes no idle event.
 - **Accounting.** Ledger rows are written only at a turn's terminal boundary. The turn ordinal comes from the ledger itself at session spawn. `pricing.rs` fetches models.dev itself; the `models-dev-rs` crate is **not** used and must not be reintroduced (its `serde_json` `arbitrary_precision` feature unified workspace-wide and broke Aves Config TOML writes). `allowance.rs` uses `quota-core` in-process only: no `subc`, no daemon, `auto_use_resets` disarmed.
+- **Turn usage sidecar.** `DiscussStreamEvent::AgentMessage.turn_usage` is optional and carries real provider counts only. A dispatched turn always has its ordinal, even with missing counts (`usage_is_incomplete`). `UsageTurnAccumulator::finish` finalizes once. Late evidence updates only the retained turn, and only when turn-correlatable, through its exact ordinal and bound assistant row. Elapsed time exists only for completed turns; Corv records no TTFT.
+- **Subagent reporting.** Subagent state comes from what the provider reports on the session's own connection: ACP `subagent_update`, OpenCode `opencode/session/child_update`, Grok `x.ai/session_notification`, then tool-call fallbacks. Corv never queries a provider's separate service or scans processes. A spawn's completion is not its child's completion. Subagent states never change `active_turn`. Details: [Subagent Reporting](../../docs/concepts/subagent-reporting.md).
+- **Primary agent option.** `DiscussProviderConfig.agent_config_option_id` comes only from the plugin's private `PrimaryAgentSelection::ConfigOption`. `ConfigOptionsOutput` reuses it; no lookup operation exists.
 - **Custom content.** Built-in and custom assets resolve through one `AgentSelectionView`. Custom asset ids must not collide with built-in ids. Appended instructions are keyed by the physical installed path, so two Providers sharing one file share one instruction row.
 - **Accepted limits.** Settled behaviour in accounting, custom content and Teams is recorded in [Discuss Accepted Limits](../../docs/concepts/discuss-accepted-limits.md). Do not re-raise or "fix" it.
 

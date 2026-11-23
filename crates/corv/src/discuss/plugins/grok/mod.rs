@@ -13,15 +13,45 @@ use super::super::library::{
 use super::super::types::{
     DiscussConfigOption, DiscussConfigOptionValue, DiscussError, DiscussHarnessCostKind, DiscussUsageEvidenceSource,
 };
+use super::super::types::{DiscussSubagentSurfaceState, DiscussUtilityPayload};
 use super::super::usage::{DiscussUsageEvidence, ModelUsage, UsageCaptureEvent, capture_standard_usage};
 use super::files::{RenderedFile, write_rendered_files};
+use super::subagents::{SubagentObservation, SubagentTracker};
 use super::{
     BILLING_CACHED_READ, BILLING_CACHED_WRITE, BILLING_INPUT, BILLING_OUTPUT, BILLING_THOUGHT, BILLING_TOTAL,
     BillingCategorySemantics, ConfigSettings, ConnectionStrategy, DiscussAgentPlugin, ManagedConfig,
-    PrimaryAgentSelection, render_skill_file, resolve_agent, resolve_skill,
+    PluginCaptureState, PrimaryAgentSelection, render_skill_file, resolve_agent, resolve_skill,
 };
 
 pub const GROK_PLUGIN_NAME: &str = "grok-build";
+
+/// Grok's subagent lifecycle on the parent session: `subagent_spawned` (with `subagent_type`,
+/// `description`, `child_session_id`), `subagent_progress` while running, and `subagent_finished`
+/// with `status` `completed` | `failed` | `cancelled`.
+fn capture_subagent_notification(params: &serde_json::Value, tracker: &mut SubagentTracker) {
+    let Some(update) = params.get("update") else {
+        return;
+    };
+    let text = |key: &str| update.get(key).and_then(serde_json::Value::as_str);
+    let state = match text("sessionUpdate") {
+        Some("subagent_spawned" | "subagent_progress") => DiscussSubagentSurfaceState::Live,
+        Some("subagent_finished") => match text("status") {
+            Some("completed") => DiscussSubagentSurfaceState::Done,
+            _ => DiscussSubagentSurfaceState::Error,
+        },
+        _ => return,
+    };
+    let Some(capture_id) = text("subagent_id").or_else(|| text("child_session_id")) else {
+        return;
+    };
+    tracker.observe(SubagentObservation {
+        capture_id,
+        child_session_id: text("child_session_id"),
+        agent_name: text("subagent_type"),
+        description: text("description"),
+        state: Some(state),
+    });
+}
 
 const AGENTS_DIRECTORY: &str = ".grok/agents";
 const SKILLS_DIRECTORY: &str = ".grok/skills";
@@ -131,13 +161,26 @@ impl DiscussAgentPlugin for GrokPlugin {
         ConnectionStrategy::Isolated
     }
 
-    // Source verification: the local Grok plugin and ACP protocol sources do
-    // not define a Grok-specific `todowrite` or `subagent-spawn` tool name or
-    // payload contract, nor a provider-specific child-session/load guarantee.
-    // Keep the inherited
-    // no-op capture hooks and false child-session capability.
+    // Grok Build announces subagents through its ungated `x.ai/session_notification` extension
+    // (xai-org/grok-build `extensions/notification.rs`), not through ACP `session/update`.
+    // No child-session load guarantee is verified, so child sessions are not loaded.
     fn agent_scope_key(&self) -> &'static str {
         "plugin.grok-build"
+    }
+
+    fn capture_extension_notification(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        state: &mut PluginCaptureState,
+    ) -> Option<DiscussUtilityPayload> {
+        let PluginCaptureState::Subagents(tracker) = state else {
+            return None;
+        };
+        if method.trim_start_matches('_') == "x.ai/session_notification" || method == "x.ai/session/update" {
+            capture_subagent_notification(params, tracker);
+        }
+        tracker.next()
     }
 
     fn skill_scope_key(&self) -> &'static str {
@@ -565,6 +608,32 @@ fn grok_config_option(field: GrokConfigField, options: Vec<GrokFlattenedOption>)
 mod tests {
     use super::super::super::test_library;
     use super::*;
+
+    #[test]
+    fn subagent_notifications_report_the_lifecycle() {
+        let mut state = PluginCaptureState::Subagents(SubagentTracker::default());
+        let mut capture = |method: &str, update: serde_json::Value| match PLUGIN.capture_extension_notification(
+            method,
+            &serde_json::json!({"sessionId": "p", "update": update}),
+            &mut state,
+        ) {
+            Some(DiscussUtilityPayload::Subagent { subagent }) => Some((subagent.agent_name, subagent.surface_state)),
+            _ => None,
+        };
+        let spawned = serde_json::json!({"sessionUpdate": "subagent_spawned", "subagent_id": "c1",
+            "child_session_id": "c1", "subagent_type": "explore", "description": "Find auth"});
+        assert_eq!(
+            capture("_x.ai/session_notification", spawned),
+            Some(("explore".to_string(), DiscussSubagentSurfaceState::Live))
+        );
+        let failed = serde_json::json!({"sessionUpdate": "subagent_finished", "subagent_id": "c1", "status": "failed"});
+        assert_eq!(
+            capture("x.ai/session_notification", failed),
+            Some(("explore".to_string(), DiscussSubagentSurfaceState::Error))
+        );
+        let other = serde_json::json!({"sessionUpdate": "subagent_spawned", "subagent_id": "c2"});
+        assert_eq!(capture("session/request_permission", other), None);
+    }
     use tempfile::tempdir;
 
     #[test]

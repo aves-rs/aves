@@ -426,12 +426,13 @@ fn capture_utility_payload(
         return None;
     };
     if method != "session/update" {
-        return None;
+        return agent_plugin.capture_extension_notification(method, params, capture_state);
     }
     let update = params.get("update")?;
     let session_update = update.get("sessionUpdate")?.as_str()?;
     let agent_scope_key = agent_plugin.agent_scope_key();
     match session_update {
+        "subagent_update" => capture_state.capture_standard_subagent(update),
         "tool_call" => agent_plugin.capture_tool_call_with_state(update, agent_scope_key, capture_state),
         "tool_call_update" => agent_plugin.capture_tool_call_update_with_state(update, agent_scope_key, capture_state),
         _ => None,

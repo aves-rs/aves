@@ -126,7 +126,7 @@ pub(super) async fn run_connected_session(
         mut launch_limitations,
         stream_tx,
         discuss_session_id,
-        auth_launch_server,
+        auth_launch_server: _,
         session_name,
         agent_name,
         next_turn_position,
@@ -194,10 +194,6 @@ pub(super) async fn run_connected_session(
 
     let mut capture_state = PluginCaptureState::for_plugin(agent_plugin);
     tracing::info!(%discuss_session_id, acp_session_id = %session.session_id(), "ACP session started and ready for a prompt");
-    let (resolved_subagent_tx, mut resolved_subagent_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
-    if let PluginCaptureState::OpenCode(state) = &mut capture_state {
-        state.configure_db_lookup(&auth_launch_server, session.session_id(), resolved_subagent_tx);
-    }
     let mut buffer = AssistantTurnBuffer::default();
     let mut usage = UsageTurnAccumulator::new(discuss_session_id.to_string(), agent_name.clone(), next_usage_ordinal);
     usage.set_pricing(price_index, agent_plugin);
@@ -213,7 +209,6 @@ pub(super) async fn run_connected_session(
     let mut state = ConnectedLoopState {
         session: &mut session,
         callback_rx: &mut callback_rx,
-        resolved_subagent_rx: &mut resolved_subagent_rx,
         worker_command_rx: &mut worker_command_rx,
         mcp_claim: &mut mcp_claim,
         capture_state: &mut capture_state,
@@ -270,7 +265,6 @@ pub(super) async fn run_connected_session(
 struct ConnectedLoopState<'a> {
     session: &'a mut WorkerSession,
     callback_rx: &'a mut mpsc::Receiver<CallbackEvent>,
-    resolved_subagent_rx: &'a mut mpsc::Receiver<super::types::DiscussSubagentRecord>,
     worker_command_rx: &'a mut mpsc::Receiver<WorkerCommand>,
     mcp_claim: &'a mut Option<McpRegistrationClaim>,
     capture_state: &'a mut PluginCaptureState,
@@ -315,7 +309,6 @@ async fn pump_connected_session(
     let ConnectedLoopState {
         session,
         callback_rx,
-        resolved_subagent_rx,
         worker_command_rx,
         mcp_claim,
         capture_state,
@@ -359,6 +352,11 @@ async fn pump_connected_session(
                     agent_node_terminal_state,
                     agent_node_deadline,
                 ).await?;
+                // One update can change several subagents; the capture returned the first.
+                while let Some(subagent) = capture_state.next_subagent() {
+                    forward_subagent(subagent, stream_tx, discuss_session_id, session.session_id(), persistence_queue)
+                        .await?;
+                }
                 if agent_node_was_active && agent_node_terminal.is_none() {
                     break;
                 }
@@ -376,16 +374,6 @@ async fn pump_connected_session(
                     **agent_node_limits,
                     agent_node_terminal_state,
                 )?;
-            }
-            Some(subagent) = resolved_subagent_rx.recv() => {
-                forward_resolved_subagent(
-                    subagent,
-                    stream_tx,
-                    discuss_session_id,
-                    session.session_id(),
-                    persistence_queue,
-                )
-                .await?;
             }
             Some(callback) = callback_rx.recv() => {
                 dispatch_callback(
@@ -1082,14 +1070,13 @@ fn handle_agent_node_deadline(
     Ok(())
 }
 
-async fn forward_resolved_subagent(
-    subagent: super::types::DiscussSubagentRecord,
+async fn forward_subagent(
+    payload: DiscussUtilityPayload,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
     discuss_session_id: DiscussSessionId,
     acp_session_id: &SessionId,
     persistence_queue: &mpsc::Sender<PersistenceJob>,
 ) -> Result<(), agent_client_protocol::Error> {
-    let payload = DiscussUtilityPayload::Subagent { subagent };
     stream_tx
         .send(DiscussStreamEvent::UtilityUpdate {
             discuss_session_id,
@@ -1101,10 +1088,7 @@ async fn forward_resolved_subagent(
         })
         .await
         .map_err(|error| {
-            agent_client_protocol::Error::into_internal_error(channel_send_error(
-                "shared.resolved_subagent",
-                error.to_string(),
-            ))
+            agent_client_protocol::Error::into_internal_error(channel_send_error("shared.subagent", error.to_string()))
         })?;
     enqueue_utility_persistence(persistence_queue, Some(payload)).await;
     Ok(())
@@ -1447,9 +1431,9 @@ async fn attach_inspector(
     attached_readers: &mut AttachedInspectorReaders,
     viewer_session_id: DiscussSessionId,
     child_session_id: &SessionId,
-) -> Result<(), DiscussError> {
+) -> Result<Vec<super::types::DiscussConfigOption>, DiscussError> {
     if attached_readers.0.contains_key(&viewer_session_id) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     ensure_agents_workspace_dir(agents_workspace).await;
     let load_response = session
@@ -1461,6 +1445,9 @@ async fn attach_inspector(
         ))
         .block_task()
         .await?;
+    let child_options = agent_plugin
+        .initial_config_options(load_response.config_options.clone(), None)
+        .unwrap_or_default();
     let child_response = NewSessionResponse::new(child_session_id.clone()).config_options(load_response.config_options);
     let mut child = WorkerSession::attach(
         session.connection().clone(),
@@ -1523,7 +1510,7 @@ async fn attach_inspector(
         }
     });
     attached_readers.0.insert(viewer_session_id, join_handle);
-    Ok(())
+    Ok(child_options)
 }
 
 #[expect(

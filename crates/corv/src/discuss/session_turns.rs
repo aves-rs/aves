@@ -28,6 +28,7 @@ impl Actor {
             return Err(DiscussError::ShuttingDown);
         }
         validate_user_turn(&text, &images)?;
+        self.revive_saved_session(discuss_session_id).await?;
         let entry = self
             .worker_registry
             .get(&discuss_session_id)
@@ -234,6 +235,7 @@ impl Actor {
         parent_session_id: DiscussSessionId,
         child_session_id: String,
     ) -> Result<DiscussResponse, DiscussError> {
+        self.revive_saved_session(parent_session_id).await?;
         let parent = self
             .worker_registry
             .get(&parent_session_id)
@@ -289,6 +291,7 @@ impl Actor {
                 provider_name: parent.agent_name.clone(),
             });
         }
+        let provider_name = parent.agent_name.clone();
         let (reply, reply_rx) = oneshot::channel();
         parent
             .command_tx
@@ -300,7 +303,10 @@ impl Actor {
             })
             .await
             .map_err(|error| channel_send_error("handle_start_inspector.worker_command", error.to_string()))?;
-        reply_rx.await.map_err(|_| DiscussError::OneshotReply)??;
+        let options = reply_rx.await.map_err(|_| DiscussError::OneshotReply)??;
+        self.inspector_config_options
+            .entry(viewer_session_id)
+            .or_insert((provider_name, options));
         Ok(DiscussResponse::Success)
     }
 
@@ -314,6 +320,7 @@ impl Actor {
             });
         };
         self.disposing_inspectors.insert(binding.viewer_session_id);
+        self.inspector_config_options.remove(&viewer_session_id);
         self.cancel_pending_permissions_for_session(&viewer_session_id);
         self.cancel_pending_elicitations_for_session(&viewer_session_id);
         self.worker_capabilities.remove(&viewer_session_id);

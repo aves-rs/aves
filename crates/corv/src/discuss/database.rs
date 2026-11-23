@@ -313,6 +313,7 @@ pub(super) async fn enqueue_utility_persistence(
         DiscussUtilityPayload::Subagent { subagent } => {
             enqueue_persistence_job(queue, PersistenceJob::Subagent { subagent }).await;
         }
+        DiscussUtilityPayload::BackgroundWork { .. } => {}
     }
 }
 

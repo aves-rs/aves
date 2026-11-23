@@ -1,7 +1,7 @@
 ---
 title: Aves Engineering Navigation
 type: reference
-updated: 2026-11-17
+updated: 2026-11-21
 references:
   - AGENTS.md
   - crates/aves/AGENTS.md
@@ -64,6 +64,7 @@ Start with the nearest `AGENTS.md`; use this index to load only the relevant sup
 | [MessageNode](concepts/message-node.md) | Tyto Flow delivery node |
 | [Messaging Send and Persistence](concepts/messaging-send-and-persistence.md) | Tyto outbound send and Kea handoff |
 | [Named Config References](concepts/named-config-references.md) | Tyto connection and credential identity |
+| [Subagent Reporting](concepts/subagent-reporting.md) | How each provider reports subagents and their working state |
 | [PermissionNode](concepts/permission-node.md) | Tyto interactive Flow node |
 | [Pluggable Flow Nodes](concepts/pluggable-flow-nodes.md) | Open node-kind envelope |
 | [Selective Flow Mobility](concepts/selective-flow-mobility.md) | Replica handoff and promotion |

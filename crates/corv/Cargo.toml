@@ -36,7 +36,7 @@ tower = { workspace = true, features = ["util"] }
 aves = { path = "../aves", version = "=0.24.0" }
 
 # external
-agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp", "unstable_end_turn_token_usage", "unstable_session_set_title"] }
+agent-client-protocol = { workspace = true, features = ["process", "schemars", "unstable_mcp_over_acp", "unstable_end_turn_token_usage", "unstable_session_set_title", "unstable_subagents"] }
 async-trait = { workspace = true }
 axum08 = { workspace = true }
 base64 = { workspace = true }

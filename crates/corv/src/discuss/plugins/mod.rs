@@ -10,6 +10,7 @@ mod files;
 mod grok;
 mod launch;
 mod opencode;
+mod subagents;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -32,6 +33,7 @@ use super::types::{
 use super::usage::{DiscussUsageEvidence, UsageCaptureEvent, capture_standard_usage};
 use files::{RenderedFile, write_rendered_files};
 pub(super) use launch::{LaunchContext, LaunchPreparation, LaunchSelections, intersect_rules, merge_metadata};
+pub use subagents::SubagentTracker;
 
 /// Input category bit, shared by guaranteed and incomplete category masks.
 pub(super) const BILLING_INPUT: u8 = 1 << 0;
@@ -172,11 +174,12 @@ fn json_object(plugin: &str, document: &str) -> Result<serde_json::Value, Discus
     Ok(value)
 }
 
-/// Mutable, worker-local state used only by plugins whose utility payloads
-/// arrive over multiple ACP updates.
+/// Mutable, worker-local capture state. Every provider tracks subagents; OpenCode also keeps its
+/// tool-call correlation state.
 pub enum PluginCaptureState {
-    None,
     OpenCode(OpenCodeCaptureState),
+    /// Subagents a provider reports through standard updates, tool calls or extension notifications.
+    Subagents(SubagentTracker),
 }
 
 impl PluginCaptureState {
@@ -184,8 +187,27 @@ impl PluginCaptureState {
         if plugin.agent_scope_key() == "plugin.opencode" {
             Self::OpenCode(OpenCodeCaptureState::default())
         } else {
-            Self::None
+            Self::Subagents(SubagentTracker::default())
         }
+    }
+
+    fn subagents(&mut self) -> &mut SubagentTracker {
+        match self {
+            Self::OpenCode(state) => state.subagent_tracker(),
+            Self::Subagents(tracker) => tracker,
+        }
+    }
+
+    /// Capture an ACP `subagent_update` (the client declared `clientCapabilities.subagents`).
+    pub(crate) fn capture_standard_subagent(&mut self, update: &serde_json::Value) -> Option<DiscussUtilityPayload> {
+        let tracker = self.subagents();
+        subagents::capture_standard_update(update, tracker);
+        tracker.next()
+    }
+
+    /// A subagent change observed by the last capture beyond the one it returned.
+    pub(crate) fn next_subagent(&mut self) -> Option<DiscussUtilityPayload> {
+        self.subagents().next()
     }
 }
 
@@ -479,6 +501,20 @@ pub trait DiscussAgentPlugin: Sync {
     ) -> Option<DiscussUtilityPayload> {
         let _ = state;
         self.capture_tool_call_update(payload, agent_scope_key)
+    }
+
+    /// Classify a provider extension notification (any method other than `session/update`).
+    ///
+    /// Providers that announce subagents outside ACP `session/update` (for example an
+    /// `x.ai/session_notification`) implement this; the default reports nothing.
+    fn capture_extension_notification(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        state: &mut PluginCaptureState,
+    ) -> Option<DiscussUtilityPayload> {
+        let _ = (method, params, state);
+        None
     }
 
     /// Whether this Provider can load a child ACP session by id.

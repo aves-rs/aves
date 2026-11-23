@@ -879,6 +879,7 @@ impl Actor {
             .collect::<Vec<_>>();
         for viewer_id in &inspector_ids {
             self.inspector_bindings.remove(viewer_id);
+            self.inspector_config_options.remove(viewer_id);
             self.worker_capabilities.remove(viewer_id);
             self.cancel_pending_permissions_for_session(viewer_id);
             self.cancel_pending_elicitations_for_session(viewer_id);
@@ -1093,6 +1094,7 @@ impl Actor {
             .collect::<Vec<_>>();
         for viewer_id in &inspector_ids {
             self.inspector_bindings.remove(viewer_id);
+            self.inspector_config_options.remove(viewer_id);
             self.worker_capabilities.remove(viewer_id);
             self.cancel_pending_permissions_for_session(viewer_id);
             self.cancel_pending_elicitations_for_session(viewer_id);

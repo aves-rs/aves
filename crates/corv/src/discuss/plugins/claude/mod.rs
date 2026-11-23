@@ -6,16 +6,18 @@ use serde::Serialize;
 use super::super::library::{
     AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
 };
+use super::super::types::DiscussUtilityPayload;
 use super::super::types::{
     DiscussError, Effect, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, Operation,
     SessionLaunchConfig,
 };
 use super::files::{RenderedFile, write_rendered_files};
 use super::launch;
+use super::subagents::{SubagentObservation, SubagentTracker, tool_status_state};
 use super::{
     BILLING_INPUT, BILLING_OUTPUT, BILLING_TOTAL, BillingCategorySemantics, ConfigSettings, ConnectionStrategy,
-    DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig, PrimaryAgentSelection, render_skill_file,
-    resolve_agent,
+    DiscussAgentPlugin, LaunchContext, LaunchPreparation, ManagedConfig, PluginCaptureState, PrimaryAgentSelection,
+    render_skill_file, resolve_agent,
 };
 
 pub const CLAUDE_PLUGIN_NAME: &str = "claude-acp";
@@ -164,6 +166,32 @@ impl DiscussAgentPlugin for ClaudePlugin {
         "plugin.claude-acp"
     }
 
+    fn capture_tool_call_with_state(
+        &self,
+        payload: &serde_json::Value,
+        _agent_scope_key: &str,
+        state: &mut PluginCaptureState,
+    ) -> Option<DiscussUtilityPayload> {
+        let PluginCaptureState::Subagents(tracker) = state else {
+            return None;
+        };
+        // With `clientCapabilities.subagents` the adapter reports `subagent_update`s instead.
+        if tracker.reports_lifecycle() {
+            return None;
+        }
+        capture_agent_tool(payload, tracker);
+        tracker.next()
+    }
+
+    fn capture_tool_call_update_with_state(
+        &self,
+        payload: &serde_json::Value,
+        agent_scope_key: &str,
+        state: &mut PluginCaptureState,
+    ) -> Option<DiscussUtilityPayload> {
+        self.capture_tool_call_with_state(payload, agent_scope_key, state)
+    }
+
     fn skill_scope_key(&self) -> &'static str {
         "plugin.claude-acp"
     }
@@ -278,6 +306,38 @@ impl DiscussAgentPlugin for ClaudePlugin {
     }
 }
 
+/// claude-agent-acp reports a subagent, for a client without native subagent sessions, as its
+/// `Agent` (formerly `Task`) tool call: `_meta.claudeCode.toolName` names the tool, `rawInput`
+/// carries `subagent_type` and `description`, and the ACP status follows the subagent. Without
+/// the AIR `backgroundSubagents` capability a backgrounded subagent keeps the call in progress
+/// until it ends, so the status covers background subagents too.
+fn capture_agent_tool(update: &serde_json::Value, tracker: &mut SubagentTracker) {
+    let Some(capture_id) = update.get("toolCallId").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let claude = update.get("_meta").and_then(|meta| meta.get("claudeCode"));
+    let tool = claude
+        .and_then(|claude| claude.get("toolName"))
+        .and_then(serde_json::Value::as_str);
+    if !matches!(tool, Some("Agent" | "Task")) && !tracker.knows(capture_id) {
+        return;
+    }
+    let input = update.get("rawInput");
+    fn text<'a>(value: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+        value
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_str)
+    }
+    let response = claude.and_then(|claude| claude.get("toolResponse"));
+    tracker.observe(SubagentObservation {
+        capture_id,
+        child_session_id: None,
+        agent_name: text(input, "subagent_type").or_else(|| text(response, "subagentType")),
+        description: text(input, "description"),
+        state: tool_status_state(update.get("status").and_then(serde_json::Value::as_str)),
+    });
+}
+
 fn render_agent(
     agent: &AgentSelectionView<'_>,
     member_settings: Option<&ConfigSettings>,
@@ -312,6 +372,42 @@ mod tests {
     use super::super::super::test_library;
     use super::super::super::types::{DiscussSessionId, Rule, RuleSet};
     use super::*;
+
+    fn subagent(payload: Option<DiscussUtilityPayload>) -> super::super::super::types::DiscussSubagentRecord {
+        match payload {
+            Some(DiscussUtilityPayload::Subagent { subagent }) => subagent,
+            other => panic!("expected a subagent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_tool_calls_report_the_subagent_lifecycle() {
+        use super::super::super::types::DiscussSubagentSurfaceState::{Done, Live, Loading};
+        let mut state = PluginCaptureState::Subagents(SubagentTracker::default());
+        let start = serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "toolu_1", "kind": "think",
+            "status": "pending", "rawInput": {"description": "Explore auth", "subagent_type": "Explore"},
+            "_meta": {"claudeCode": {"toolName": "Agent"}}});
+        let first = subagent(PLUGIN.capture_tool_call_with_state(&start, "", &mut state));
+        assert_eq!((first.surface_state, first.agent_name.as_str()), (Loading, "Explore"));
+        assert_eq!(first.description.as_deref(), Some("Explore auth"));
+        let running = serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "toolu_1",
+            "status": "in_progress", "_meta": {"claudeCode": {"toolName": "Agent"}}});
+        let live = subagent(PLUGIN.capture_tool_call_update_with_state(&running, "", &mut state));
+        assert_eq!((live.surface_state, live.agent_name.as_str()), (Live, "Explore"));
+        let done =
+            serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "toolu_1", "status": "completed"});
+        assert_eq!(
+            subagent(PLUGIN.capture_tool_call_update_with_state(&done, "", &mut state)).surface_state,
+            Done
+        );
+        let other = serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "toolu_2", "status": "pending",
+            "_meta": {"claudeCode": {"toolName": "Read"}}});
+        assert!(
+            PLUGIN
+                .capture_tool_call_with_state(&other, "", &mut state)
+                .is_none()
+        );
+    }
     use std::fs;
     use tempfile::tempdir;
 

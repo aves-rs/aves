@@ -12,15 +12,67 @@ use super::super::types::{
     DiscussConfigOption, Effect, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject,
     LaunchPermissionOutcome, Operation, SessionLaunchConfig,
 };
+use super::super::types::{DiscussSubagentSurfaceState, DiscussUtilityPayload};
 use super::files::{RenderedFile, write_rendered_files};
 use super::launch::{self, LaunchContext, LaunchPreparation, LaunchSelections};
+use super::subagents::{SubagentObservation, SubagentTracker, tool_status_state};
 use super::{
     BILLING_CACHED_READ, BILLING_CACHED_WRITE, BILLING_INPUT, BILLING_OUTPUT, BILLING_THOUGHT, BILLING_TOTAL,
     BillingCategorySemantics, ConfigSettings, ConnectionStrategy, DefaultAgentPlugin, DiscussAgentPlugin,
-    ManagedConfig, PrimaryAgentSelection, destroy_default_skill, resolve_agent,
+    ManagedConfig, PluginCaptureState, PrimaryAgentSelection, destroy_default_skill, resolve_agent,
 };
 
 pub(super) const CODEX_PLUGIN_NAME: &str = "codex-acp";
+
+/// codex-acp reports collaboration, for a client without native subagent sessions, as tool calls
+/// titled after the Codex tool. Only `spawnAgent` creates a subagent (one per receiver thread);
+/// later calls (`wait`, `sendInput`, `closeAgent`, …) report each known thread's
+/// `agentsStates[thread].status`: `pendingInit` | `running` | `interrupted` | `completed` |
+/// `errored` | `shutdown` | `notFound`.
+fn capture_collab_tool(update: &serde_json::Value, tracker: &mut SubagentTracker) {
+    let Some(input) = update.get("rawInput") else {
+        return;
+    };
+    let Some(threads) = input
+        .get("receiverThreadIds")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    let spawn = update.get("title").and_then(serde_json::Value::as_str) == Some("spawnAgent");
+    let states = input.get("agentsStates");
+    let prompt = input.get("prompt").and_then(serde_json::Value::as_str);
+    for thread in threads.iter().filter_map(serde_json::Value::as_str) {
+        if !spawn && !tracker.knows(thread) {
+            continue;
+        }
+        let reported = states
+            .and_then(|states| states.get(thread))
+            .and_then(|state| state.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|status| match status {
+                "pendingInit" => Some(DiscussSubagentSurfaceState::Loading),
+                "running" => Some(DiscussSubagentSurfaceState::Live),
+                "completed" | "shutdown" => Some(DiscussSubagentSurfaceState::Done),
+                "interrupted" | "errored" | "notFound" => Some(DiscussSubagentSurfaceState::Error),
+                _ => None,
+            });
+        // A finished spawn hands the thread off running unless its state says otherwise.
+        let state = reported.or_else(|| {
+            spawn.then(|| match update.get("status").and_then(serde_json::Value::as_str) {
+                Some("completed") => Some(DiscussSubagentSurfaceState::Live),
+                other => tool_status_state(other),
+            })?
+        });
+        tracker.observe(SubagentObservation {
+            capture_id: thread,
+            child_session_id: None,
+            agent_name: None,
+            description: if spawn { prompt } else { None },
+            state,
+        });
+    }
+}
 
 const AGENTS_DIRECTORY: &str = ".codex/agents";
 
@@ -154,6 +206,32 @@ impl DiscussAgentPlugin for CodexPlugin {
         "plugin.codex-acp"
     }
 
+    fn capture_tool_call_with_state(
+        &self,
+        payload: &serde_json::Value,
+        _agent_scope_key: &str,
+        state: &mut PluginCaptureState,
+    ) -> Option<DiscussUtilityPayload> {
+        let PluginCaptureState::Subagents(tracker) = state else {
+            return None;
+        };
+        // With `clientCapabilities.subagents` the adapter reports `subagent_update`s instead.
+        if tracker.reports_lifecycle() {
+            return None;
+        }
+        capture_collab_tool(payload, tracker);
+        tracker.next()
+    }
+
+    fn capture_tool_call_update_with_state(
+        &self,
+        payload: &serde_json::Value,
+        agent_scope_key: &str,
+        state: &mut PluginCaptureState,
+    ) -> Option<DiscussUtilityPayload> {
+        self.capture_tool_call_with_state(payload, agent_scope_key, state)
+    }
+
     fn skill_scope_key(&self) -> &'static str {
         "plugin.default"
     }
@@ -266,6 +344,34 @@ mod tests {
     use super::super::super::test_library;
     use super::super::super::types::{DiscussConfigOptionValue, DiscussSessionId, Rule, RuleSet};
     use super::*;
+
+    #[test]
+    fn collaboration_tool_calls_report_spawned_threads() {
+        let mut state = PluginCaptureState::Subagents(SubagentTracker::default());
+        let mut capture = |payload: serde_json::Value| match PLUGIN
+            .capture_tool_call_with_state(&payload, "", &mut state)
+        {
+            Some(DiscussUtilityPayload::Subagent { subagent }) => Some((subagent.capture_id, subagent.surface_state)),
+            _ => None,
+        };
+        let spawn = serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "item_1", "title": "spawnAgent",
+            "status": "completed", "rawInput": {"prompt": "Map auth", "receiverThreadIds": ["thread-a"],
+            "agentsStates": {"thread-a": {"status": "running", "message": null}}}});
+        assert_eq!(
+            capture(spawn),
+            Some(("thread-a".to_string(), DiscussSubagentSurfaceState::Live))
+        );
+        let unknown = serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "item_2", "title": "wait",
+            "rawInput": {"receiverThreadIds": ["thread-b"], "agentsStates": {"thread-b": {"status": "running"}}}});
+        assert_eq!(capture(unknown), None);
+        let wait = serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "item_3", "title": "wait",
+            "status": "completed", "rawInput": {"receiverThreadIds": ["thread-a"],
+            "agentsStates": {"thread-a": {"status": "errored", "message": "boom"}}}});
+        assert_eq!(
+            capture(wait),
+            Some(("thread-a".to_string(), DiscussSubagentSurfaceState::Error))
+        );
+    }
     use agent_client_protocol::v1::schema::{McpServer, McpServerStdio, NewSessionRequest};
     use tempfile::tempdir;
 

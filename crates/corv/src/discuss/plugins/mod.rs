@@ -437,6 +437,11 @@ pub(super) fn default_workspace_copy_source(provider_name: &str) -> Option<&'sta
 
 /// Provider-neutral contract used by the Discuss actor.
 pub trait DiscussAgentPlugin: Sync {
+    /// Recognize a nonstandard missing-session reply after session/load has matched the ID.
+    fn is_missing_saved_session(&self, _error: &agent_client_protocol::Error, _session_id: &str) -> bool {
+        false
+    }
+
     /// Capture standard ACP usage, with provider-specific extensions as overrides.
     fn capture_usage_evidence(&self, event: &UsageCaptureEvent<'_>) -> Option<DiscussUsageEvidence> {
         capture_standard_usage(event)

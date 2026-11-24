@@ -916,7 +916,9 @@ async fn run_session_worker_with_reporting(
             terminal_auth_methods,
         } = error;
         let error = *error;
-        tracing::warn!(?error, "Discuss session worker stopped");
+        if !matches!(error, DiscussError::ProviderSessionNotFound) {
+            tracing::warn!(?error, "Discuss session worker stopped");
+        }
         let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
         if pending_elicitation_cancel_tx
             .send(PendingElicitationCancel {

@@ -61,6 +61,9 @@ pub enum DiscussError {
         /// The error message.
         message: String,
     },
+    /// The provider definitively rejected a saved session ID as missing.
+    #[error("The saved provider session no longer exists")]
+    ProviderSessionNotFound,
 
     /// The Provider requires an authenticated local session before it can start.
     #[error("Provider authentication is required")]
@@ -468,6 +471,7 @@ impl DiscussError {
             DiscussError::OneshotReply => "OneshotReply",
             DiscussError::SessionCancelled { .. } => "SessionCancelled",
             DiscussError::ProtocolError { .. } => "ProtocolError",
+            DiscussError::ProviderSessionNotFound => "ProviderSessionNotFound",
             DiscussError::AuthenticationRequired => "AuthenticationRequired",
             DiscussError::WorkerTokenServiceUnavailable => "WorkerTokenServiceUnavailable",
             DiscussError::AgentNodeTokenRequired => "AgentNodeTokenRequired",
@@ -613,11 +617,15 @@ impl From<AcpError> for DiscussError {
     fn from(err: AcpError) -> Self {
         if err.code == AcpErrorCode::AUTH_REQUIRED {
             DiscussError::AuthenticationRequired
+        } else if err.code == AcpErrorCode::RESOURCE_NOT_FOUND && err.message == PROVIDER_SESSION_MISSING {
+            DiscussError::ProviderSessionNotFound
         } else {
             DiscussError::ProtocolError { message: err.message }
         }
     }
 }
+
+pub(super) const PROVIDER_SESSION_MISSING: &str = "The saved provider session no longer exists";
 
 impl From<BusControlError> for DiscussError {
     fn from(error: BusControlError) -> Self {

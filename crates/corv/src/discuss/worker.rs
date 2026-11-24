@@ -35,7 +35,7 @@ use super::database::{
     should_persist_assistant_turn, spawn_persistence_queue,
 };
 use super::elicitation::content_to_sdk_answer;
-use super::error::DiscussError;
+use super::error::{DiscussError, PROVIDER_SESSION_MISSING};
 use super::launch_types::LaunchLimitation;
 use super::mcp_direct::McpAcpShim;
 use super::mcp_relay::{McpHttpLease, descriptors_for_registration, endpoint_to_acp_descriptor};
@@ -882,6 +882,7 @@ async fn open_worker_session(
     ensure_agents_workspace_dir(agents_workspace).await;
     tracing::debug!(%discuss_session_id, provider = %agent_name, cwd = %agents_workspace.display(), mcp_servers = options.mcp_servers.len(), "Opening configured ACP session");
     let close_supported = options.close_supported;
+    let reconnecting = options.reconnect_session_id.is_some();
     let configured = open_configured_session(
         connection,
         agent_name,
@@ -894,8 +895,16 @@ async fn open_worker_session(
     .await
     .map_err(|error| {
         // The ACP boundary reduces this to a bare internal error; record the typed cause here.
-        tracing::warn!(%discuss_session_id, provider = %agent_name, %error, "Configured ACP session open failed");
-        AcpError::into_internal_error(error)
+        if matches!(error, DiscussError::ProviderSessionNotFound) {
+            AcpError::new(agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND, PROVIDER_SESSION_MISSING)
+        } else {
+            if reconnecting {
+                tracing::debug!(%discuss_session_id, provider = %agent_name, %error, "Configured ACP session open failed");
+            } else {
+                tracing::warn!(%discuss_session_id, provider = %agent_name, %error, "Configured ACP session open failed");
+            }
+            AcpError::into_internal_error(error)
+        }
     })?;
     let session = configured.session;
     tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), "ACP session configuration completed");

@@ -163,6 +163,12 @@ struct SessionConfigOwnership {
 }
 
 impl DiscussAgentPlugin for OpenCodePlugin {
+    fn is_missing_saved_session(&self, error: &agent_client_protocol::Error, session_id: &str) -> bool {
+        let message = error.message.strip_prefix("Invalid params: ").unwrap_or(&error.message);
+        error.code == agent_client_protocol::ErrorCode::INVALID_PARAMS
+            && message.strip_prefix("session not found: ") == Some(session_id)
+    }
+
     /// OpenCode's ACP usage reports non-cached input and visible output; cache and reasoning
     /// counts are separate and omitted when zero (`acp/translate.ts`, `session/usage.ts`).
     fn billing_semantics(&self) -> BillingCategorySemantics {

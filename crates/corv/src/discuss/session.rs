@@ -1156,12 +1156,31 @@ pub(super) async fn open_configured_session(
             )?;
             let response = connection
                 .send_request(
-                    load_session_request(session_id, options.cwd.clone(), &options.mcp_servers)
+                    load_session_request(session_id.clone(), options.cwd.clone(), &options.mcp_servers)
                         .system_prompt(open.system_prompt)
                         .meta(open.meta),
                 )
                 .block_task()
-                .await?;
+                .await
+                .map_err(|error| {
+                    // ACP v1 distinguishes a missing session from other missing resources by sessionId.
+                    let session_id_status = match error.data.as_ref().and_then(|data| data.get("sessionId")) {
+                        None => "missing",
+                        Some(value) if value.as_str() == Some(session_id.0.as_ref()) => "matches",
+                        Some(_) => "differs",
+                    };
+                    let acp_code = error.code.value();
+                    if session_id_status == "matches"
+                        && (error.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
+                            || agent_plugin.is_missing_saved_session(&error, session_id.0.as_ref()))
+                    {
+                        tracing::info!(provider = provider_name, acp_code, session_id_status, "Saved ACP session no longer exists");
+                        DiscussError::ProviderSessionNotFound
+                    } else {
+                        tracing::warn!(provider = provider_name, acp_code, session_id_status, "ACP session load failed");
+                        error.into()
+                    }
+                })?;
             session.modes = response.modes.map(Into::into);
             (session, response.config_options, None)
         } else {

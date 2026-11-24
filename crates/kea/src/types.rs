@@ -44,6 +44,24 @@ pub type KnowledgeSearchOutcome = VaultKnowledgeSearchResponse;
 /// Complete lightweight Obsidian vault tree entry list.
 pub type VaultKnowledgeTree = Vec<VaultKnowledgeTreeEntry>;
 
+/// State of the per-vault similarity index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+pub enum VaultIndexState {
+    /// The index has not been built or was invalidated.
+    NotBuilt,
+    /// A current similarity index is cached.
+    Ready,
+}
+
+/// Uncapped count of admitted documents and current similarity-index state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+pub struct VaultStats {
+    /// Number of admitted documents.
+    pub document_count: u64,
+    /// Current similarity index state.
+    pub index_state: VaultIndexState,
+}
+
 /// Knowledge document operation result.
 pub(super) type KnowledgeResult<T> = Result<T, KnowledgeError>;
 
@@ -182,7 +200,7 @@ pub struct VaultUpdateKnowledgeRequest {
     pub tags: Option<Vec<String>>,
 }
 
-/// Filters for Knowledge notes, applied after semantic ranking when querying.
+/// Filters for Knowledge notes, applied after ranking when querying.
 ///
 /// All fields are optional. Date lower bounds
 /// (`*_after`) are inclusive RFC3339 timestamps; upper bounds (`*_before`) are
@@ -216,6 +234,18 @@ pub struct VaultListKnowledgeRequest {
     pub filters: VaultKnowledgeFilters,
     /// Maximum number of records to return.
     pub limit: u32,
+}
+
+/// Search strategy for a vault.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+pub enum SearchMode {
+    /// Rank by term similarity.
+    #[default]
+    Similarity,
+    /// Match exact front-matter filters.
+    FrontMatter,
+    /// Match words with typo tolerance.
+    FullText,
 }
 
 /// Directory-backed note search request.
@@ -404,6 +434,12 @@ impl KnowledgeConfig {
 /// boundaries without carrying raw external error types.
 #[derive(Error, Debug, Clone, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 pub enum KnowledgeError {
+    /// The requested named vault has not been registered.
+    #[error("vault not registered: {vault_id}")]
+    VaultNotRegistered { vault_id: String },
+    /// The registered named vault could not be opened.
+    #[error("vault unavailable: {vault_id}: {message}")]
+    VaultUnavailable { vault_id: String, message: String },
     /// A data key was not found by exact lookup or deletion.
     #[error("knowledge data not found: {key}")]
     DataNotFound { key: String },
@@ -546,6 +582,16 @@ impl KnowledgeError {
     /// Stable client-facing error code and safe structured details.
     pub fn rpc_identity(&self) -> (&'static str, Map<String, Value>) {
         match self {
+            KnowledgeError::VaultNotRegistered { vault_id } => {
+                let mut details = Map::new();
+                details.insert("vault_id".to_owned(), Value::String(vault_id.clone()));
+                ("VaultNotRegistered", details)
+            }
+            KnowledgeError::VaultUnavailable { vault_id, .. } => {
+                let mut details = Map::new();
+                details.insert("vault_id".to_owned(), Value::String(vault_id.clone()));
+                ("VaultUnavailable", details)
+            }
             KnowledgeError::DataNotFound { key } => {
                 let mut details = Map::new();
                 details.insert("key".to_owned(), Value::String(key.clone()));

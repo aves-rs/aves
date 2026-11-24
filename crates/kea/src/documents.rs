@@ -14,13 +14,14 @@ use turbovault_vault::VaultManager;
 use aves::flow::{FlowWorkspaceSourceError, FlowWorkspaceSourceService};
 use aves::utils::time::{system_time_to_rfc3339, timestamp_in_bounds};
 
+use super::full_text::FullText;
 use super::types::{
     DeleteKnowledgeRequest, DeleteKnowledgeResult, GetKnowledgeRequest, KnowledgeConfig, KnowledgeContentType,
-    KnowledgeError, KnowledgeRecord, KnowledgeRecordList, KnowledgeRecordLookup, KnowledgeResult,
-    KnowledgeSearchOutcome, ListKnowledgeRequest, ResolvedCreateKnowledgeRequest, SearchKnowledgeRequest,
-    UpdateKnowledgeRequest, VaultCreateKnowledgeRequest, VaultKnowledge, VaultKnowledgeFilters,
-    VaultKnowledgeSearchResponse, VaultKnowledgeSearchResult, VaultKnowledgeTree, VaultKnowledgeTreeEntry,
-    VaultKnowledgeTreeEntryKind, VaultListKnowledgeRequest, VaultSearchKnowledgeRequest,
+    KnowledgeError, KnowledgeRecord, KnowledgeRecordList, KnowledgeRecordLookup, KnowledgeResult, ListKnowledgeRequest,
+    ResolvedCreateKnowledgeRequest, SearchMode, UpdateKnowledgeRequest, VaultCreateKnowledgeRequest, VaultIndexState,
+    VaultKnowledge, VaultKnowledgeFilters, VaultKnowledgeSearchResponse, VaultKnowledgeSearchResult,
+    VaultKnowledgeTree, VaultKnowledgeTreeEntry, VaultKnowledgeTreeEntryKind, VaultListKnowledgeRequest,
+    VaultSearchKnowledgeRequest, VaultStats,
 };
 
 const BACKEND: &str = "obsidian";
@@ -59,7 +60,7 @@ pub(super) async fn open_documents(config_dir: &Path, config: &KnowledgeConfig) 
                 message: error.to_string(),
             })?;
     }
-    let mut notes = Documents::new_with_config(&root, config)?;
+    let mut notes = Documents::new_in_config_dir(&root, config, config_dir)?;
     let change_rx = Some(notes.start_change_monitor());
     Ok(DocumentRuntime { notes, change_rx })
 }
@@ -162,6 +163,7 @@ pub(super) struct Documents {
     manager: Arc<VaultManager>,
     semantic_index: Arc<SemanticIndexCache>,
     semantic_build: Mutex<()>,
+    full_text: Arc<FullText>,
     vault_path: PathBuf,
     trash_path: PathBuf,
     config: KnowledgeConfig,
@@ -178,12 +180,42 @@ impl Drop for Documents {
 
 impl Documents {
     #[cfg(test)]
-    fn new(root: &Path) -> KnowledgeResult<Self> {
-        Self::new_with_config(root, &KnowledgeConfig::default())
+    pub(super) fn full_text_is_open(&self) -> bool {
+        self.full_text.is_open()
+    }
+    #[cfg(test)]
+    pub(super) fn monitor_abort_handle(&self) -> Option<tokio::task::AbortHandle> {
+        self.change_monitor
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle)
     }
 
-    /// Open an existing Markdown directory without requiring Obsidian metadata.
-    fn new_with_config(root: &Path, config: &KnowledgeConfig) -> KnowledgeResult<Self> {
+    pub(super) async fn stats(&self) -> KnowledgeResult<VaultStats> {
+        self.manager.ensure_fresh().await;
+        let mut count = 0;
+        for note in self.manager.scan_vault_with_metadata()? {
+            let path = self.relative_path(&note.path)?;
+            if self.config.excludes_path(&self.vault_path, &path) {
+                continue;
+            }
+            match self.read_vault_record(&path).await {
+                Ok(Some(_)) => count += 1,
+                Ok(None)
+                | Err(KnowledgeError::InvalidBackendConfig { .. })
+                | Err(KnowledgeError::InvalidTextEncoding { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(VaultStats {
+            document_count: count,
+            index_state: if self.semantic_index.current().is_some() {
+                VaultIndexState::Ready
+            } else {
+                VaultIndexState::NotBuilt
+            },
+        })
+    }
+    fn new_in_config_dir(root: &Path, config: &KnowledgeConfig, config_dir: &Path) -> KnowledgeResult<Self> {
         let vault_path = validate_vault_path(&root.to_string_lossy())?;
         let trash_path = validate_root_component(&config.trash_path)?;
         let mut server_config = ServerConfig::new();
@@ -220,19 +252,13 @@ impl Documents {
 
         let manager = Arc::new(VaultManager::new(server_config)?);
         let semantic_index = Arc::new(SemanticIndexCache::default());
-        let weak_index = Arc::downgrade(&semantic_index);
-        manager.set_change_listener(Arc::new(move |_changes| {
-            let index = weak_index.upgrade();
-            Box::pin(async move {
-                if let Some(index) = index {
-                    index.invalidate();
-                }
-            })
-        }));
+        let full_text = Arc::new(FullText::new(config_dir, &vault_path));
+        Self::set_change_listener(&manager, &semantic_index, &full_text, None);
         Ok(Self {
             manager,
             semantic_index,
             semantic_build: Mutex::new(()),
+            full_text,
             config: config.clone(),
             vault_path,
             trash_path,
@@ -457,8 +483,16 @@ impl Documents {
         &self,
         request: &VaultSearchKnowledgeRequest,
     ) -> KnowledgeResult<VaultKnowledgeSearchResponse> {
+        self.search_mode(SearchMode::Similarity, request).await
+    }
+
+    pub(super) async fn search_mode(
+        &self,
+        mode: SearchMode,
+        request: &VaultSearchKnowledgeRequest,
+    ) -> KnowledgeResult<VaultKnowledgeSearchResponse> {
         let query = request.query.trim();
-        let results = if query.is_empty() {
+        let results = if mode == SearchMode::FrontMatter || (mode == SearchMode::Similarity && query.is_empty()) {
             self.list_records(&VaultListKnowledgeRequest {
                 query: None,
                 filters: request.filters.clone(),
@@ -469,10 +503,24 @@ impl Documents {
             .map(|knowledge| VaultKnowledgeSearchResult { knowledge, score: 1.0 })
             .collect()
         } else {
-            let index = self.semantic_engine().await?;
+            let candidates: Vec<(String, f64)> = if mode == SearchMode::Similarity {
+                let index = self.semantic_engine().await?;
+                index
+                    .semantic_search(query, index.document_count())
+                    .into_iter()
+                    .map(|candidate| (candidate.path, candidate.score))
+                    .collect()
+            } else {
+                self.full_text
+                    .search(&self.manager, query, normalize_limit(request.limit))
+                    .await?
+                    .into_iter()
+                    .map(|candidate| (candidate.path, candidate.score))
+                    .collect()
+            };
             let mut results = Vec::new();
-            for candidate in index.semantic_search(query, index.document_count()) {
-                let path = Path::new(&candidate.path);
+            for (candidate_path, score) in candidates {
+                let path = Path::new(&candidate_path);
                 if self.config.excludes_path(&self.vault_path, path) {
                     continue;
                 }
@@ -488,7 +536,7 @@ impl Documents {
                 if matches_filters(&record, &request.filters) {
                     results.push(VaultKnowledgeSearchResult {
                         knowledge: record,
-                        score: candidate.score,
+                        score,
                     });
                     if results.len() >= normalize_limit(request.limit) {
                         break;
@@ -551,19 +599,42 @@ impl Documents {
 }
 
 impl Documents {
-    fn start_change_monitor(&mut self) -> mpsc::UnboundedReceiver<()> {
-        let (change_tx, change_rx) = mpsc::unbounded_channel();
-        let weak_index = Arc::downgrade(&self.semantic_index);
-        self.manager.set_change_listener(Arc::new(move |_changes| {
+    fn set_change_listener(
+        manager: &VaultManager,
+        semantic_index: &Arc<SemanticIndexCache>,
+        full_text: &Arc<FullText>,
+        change_tx: Option<mpsc::UnboundedSender<()>>,
+    ) {
+        let weak_index = Arc::downgrade(semantic_index);
+        let weak_full_text = Arc::downgrade(full_text);
+        manager.set_change_listener(Arc::new(move |changes| {
             let index = weak_index.upgrade();
+            let full_text = weak_full_text.upgrade();
             let change_tx = change_tx.clone();
             Box::pin(async move {
                 if let Some(index) = index {
                     index.invalidate();
                 }
-                let _ = change_tx.send(());
+                if let Some(full_text) = full_text {
+                    full_text
+                        .changes(
+                            changes
+                                .into_iter()
+                                .map(|(path, present, _)| (path, present))
+                                .collect(),
+                        )
+                        .await;
+                }
+                if let Some(change_tx) = change_tx {
+                    let _ = change_tx.send(());
+                }
             })
         }));
+    }
+
+    fn start_change_monitor(&mut self) -> mpsc::UnboundedReceiver<()> {
+        let (change_tx, change_rx) = mpsc::unbounded_channel();
+        Self::set_change_listener(&self.manager, &self.semantic_index, &self.full_text, Some(change_tx));
         let manager = Arc::downgrade(&self.manager);
         self.change_monitor = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -750,10 +821,6 @@ impl Documents {
 
     pub(super) async fn list_tree(&self) -> KnowledgeResult<VaultKnowledgeTree> {
         self.discover_tree()
-    }
-
-    pub(super) async fn search(&self, request: SearchKnowledgeRequest) -> KnowledgeResult<KnowledgeSearchOutcome> {
-        self.search_records(&request).await
     }
 }
 
@@ -988,7 +1055,7 @@ mod tests {
     use super::*;
 
     fn documents(root: &Path) -> Documents {
-        Documents::new(root).expect("open directory")
+        Documents::new_in_config_dir(root, &KnowledgeConfig::default(), root).expect("open directory")
     }
 
     fn create_request(title: &str, path: Option<&str>) -> ResolvedCreateKnowledgeRequest {
@@ -1041,11 +1108,14 @@ mod tests {
             .await
             .expect("write an unrelated note");
         let searched = plugin
-            .search(VaultSearchKnowledgeRequest {
-                query: "saved".to_owned(),
-                filters: VaultKnowledgeFilters::default(),
-                limit: 10,
-            })
+            .search_mode(
+                SearchMode::Similarity,
+                &VaultSearchKnowledgeRequest {
+                    query: "saved".to_owned(),
+                    filters: VaultKnowledgeFilters::default(),
+                    limit: 10,
+                },
+            )
             .await
             .expect("search notes");
         assert_eq!(searched.results.len(), 2);
@@ -1126,7 +1196,10 @@ mod tests {
     #[test]
     fn configured_root_must_exist_and_unsafe_relative_paths_are_rejected() {
         let root = tempdir().expect("tempdir");
-        assert!(Documents::new(&root.path().join("missing")).is_err());
+        assert!(
+            Documents::new_in_config_dir(&root.path().join("missing"), &KnowledgeConfig::default(), root.path())
+                .is_err()
+        );
         assert!(normalize_relative_path("../escape.md").is_err());
     }
 
@@ -1160,7 +1233,7 @@ mod tests {
             excluded_paths: vec!["large-cache".to_owned(), "private".to_owned()],
             allowed_extensions: vec!["md".to_owned(), "txt".to_owned()],
         };
-        let plugin = Documents::new_with_config(root.path(), &config).expect("open configured vault");
+        let plugin = Documents::new_in_config_dir(root.path(), &config, root.path()).expect("open configured vault");
 
         let listed = plugin
             .list(VaultListKnowledgeRequest {
@@ -1224,7 +1297,7 @@ mod tests {
             ],
             ..KnowledgeConfig::default()
         };
-        let plugin = Documents::new_with_config(root.path(), &config).expect("open vault");
+        let plugin = Documents::new_in_config_dir(root.path(), &config, root.path()).expect("open vault");
         let listed = plugin
             .list(VaultListKnowledgeRequest {
                 query: None,

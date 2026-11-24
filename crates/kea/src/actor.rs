@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -18,14 +19,13 @@ use aves::utils::time::system_time_to_rfc3339;
 use aves::utils::uuid::SpectaUuid;
 
 use super::data::DataStore;
-use super::documents::{Documents, open_documents};
+use super::documents::{DocumentRuntime, Documents, open_documents};
 use super::messages::{KnowledgeRequest, KnowledgeRequestPayload, KnowledgeResponse};
 use super::types::{
     CanvasDashboard, CanvasDashboardDeleteResult, CanvasDashboardLookup, CanvasDashboardSummary,
     CanvasDashboardSummaryList, CreateCanvasDashboardRequest, CreateKnowledgeRequest, DeleteCanvasDashboardRequest,
-    DeleteKnowledgeRequest, GetCanvasDashboardRequest, GetKnowledgeRequest, KnowledgeConfig, KnowledgeError,
-    ListCanvasDashboardsRequest, ResolvedCreateKnowledgeRequest, UpdateCanvasDashboardRequest,
-    VaultCreateKnowledgeRequest,
+    GetCanvasDashboardRequest, GetKnowledgeRequest, KnowledgeConfig, KnowledgeError, ListCanvasDashboardsRequest,
+    ResolvedCreateKnowledgeRequest, UpdateCanvasDashboardRequest, VaultCreateKnowledgeRequest,
 };
 
 enum ResolvedCreateWork {
@@ -35,6 +35,11 @@ enum ResolvedCreateWork {
         root: PathBuf,
         sources: Vec<(PathBuf, PathBuf)>,
     },
+}
+
+struct RegisteredVault {
+    root: PathBuf,
+    runtime: Option<DocumentRuntime>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -50,6 +55,8 @@ pub(super) struct Actor {
 
     /// Active TurboVault directory.
     notes: Documents,
+
+    vaults: HashMap<String, RegisteredVault>,
 
     /// Receiver for knowledge requests.
     receiver: mpsc::Receiver<KnowledgeRequest>,
@@ -93,6 +100,7 @@ impl Actor {
         Self {
             config_dir,
             notes: runtime.notes,
+            vaults: HashMap::new(),
             receiver,
             knowledge_config,
             shared_root,
@@ -108,6 +116,24 @@ impl Actor {
         let KnowledgeRequest { payload, reply_to, .. } = request;
 
         let result: Result<KnowledgeResponse, KnowledgeError> = match payload {
+            KnowledgeRequestPayload::RegisterVault { vault_id, root } => {
+                self.register_vault(vault_id, root);
+                Ok(KnowledgeResponse::VaultRegistered)
+            }
+            KnowledgeRequestPayload::UnregisterVault { vault_id } => {
+                if self.vaults.remove(&vault_id).is_some() {
+                    Ok(KnowledgeResponse::VaultUnregistered)
+                } else {
+                    Err(KnowledgeError::VaultNotRegistered { vault_id })
+                }
+            }
+            KnowledgeRequestPayload::GetVaultStats { vault } => match self.documents(vault.as_deref()).await {
+                Ok(notes) => notes
+                    .stats()
+                    .await
+                    .map(|stats| KnowledgeResponse::VaultStatsFound { stats }),
+                Err(error) => Err(error),
+            },
             KnowledgeRequestPayload::KnowledgeConfigChanged => {
                 self.reload_knowledge_config().await;
                 return;
@@ -116,29 +142,51 @@ impl Actor {
                 self.data.maintain_db().await;
                 Ok(KnowledgeResponse::RuntimeStopped)
             }
-            KnowledgeRequestPayload::CreateKnowledge { request } => self.handle_create_knowledge(request).await,
-            KnowledgeRequestPayload::GetKnowledge { request } => self.handle_get_knowledge(request).await,
-            KnowledgeRequestPayload::UpdateKnowledge { request } => self
-                .notes
-                .update(request)
-                .await
-                .map(|knowledge| KnowledgeResponse::KnowledgeUpdated { knowledge }),
-            KnowledgeRequestPayload::DeleteKnowledge { request } => self.handle_delete_knowledge(request).await,
-            KnowledgeRequestPayload::ListKnowledge { request } => self
-                .notes
-                .list(request)
-                .await
-                .map(KnowledgeResponse::KnowledgeListed),
-            KnowledgeRequestPayload::ListKnowledgeTree => self
-                .notes
-                .list_tree()
-                .await
-                .map(|entries| KnowledgeResponse::KnowledgeTreeListed { entries }),
-            KnowledgeRequestPayload::SearchKnowledge { request } => self
-                .notes
-                .search(request)
-                .await
-                .map(KnowledgeResponse::KnowledgeSearched),
+            KnowledgeRequestPayload::CreateKnowledge { request, vault } => {
+                self.create_knowledge(request, vault.as_deref()).await
+            }
+            KnowledgeRequestPayload::GetKnowledge { request, vault } => {
+                self.get_knowledge(request, vault.as_deref()).await
+            }
+            KnowledgeRequestPayload::UpdateKnowledge { request, vault } => match self.documents(vault.as_deref()).await
+            {
+                Ok(notes) => notes
+                    .update(request)
+                    .await
+                    .map(|knowledge| KnowledgeResponse::KnowledgeUpdated { knowledge }),
+                Err(error) => Err(error),
+            },
+            KnowledgeRequestPayload::DeleteKnowledge { request, vault } => match self.documents(vault.as_deref()).await
+            {
+                Ok(notes) => notes
+                    .delete(request)
+                    .await
+                    .map(|result| KnowledgeResponse::KnowledgeDeleted { result }),
+                Err(error) => Err(error),
+            },
+            KnowledgeRequestPayload::ListKnowledge { request, vault } => match self.documents(vault.as_deref()).await {
+                Ok(notes) => notes
+                    .list(request)
+                    .await
+                    .map(KnowledgeResponse::KnowledgeListed),
+                Err(error) => Err(error),
+            },
+            KnowledgeRequestPayload::ListKnowledgeTree { vault } => match self.documents(vault.as_deref()).await {
+                Ok(notes) => notes
+                    .list_tree()
+                    .await
+                    .map(|entries| KnowledgeResponse::KnowledgeTreeListed { entries }),
+                Err(error) => Err(error),
+            },
+            KnowledgeRequestPayload::SearchKnowledge { vault, mode, request } => {
+                match self.documents(vault.as_deref()).await {
+                    Ok(notes) => notes
+                        .search_mode(mode, &request)
+                        .await
+                        .map(KnowledgeResponse::KnowledgeSearched),
+                    Err(error) => Err(error),
+                }
+            }
             KnowledgeRequestPayload::UpsertData { request } => self
                 .data
                 .upsert(request)
@@ -287,13 +335,37 @@ impl Actor {
         }
     }
 
+    #[cfg(test)]
     async fn handle_create_knowledge(
         &mut self,
         request: CreateKnowledgeRequest,
     ) -> Result<KnowledgeResponse, KnowledgeError> {
-        match self.resolve_create_inputs(request).await? {
-            ResolvedCreateWork::Single(request) => self
-                .notes
+        self.create_knowledge(request, None).await
+    }
+
+    async fn create_knowledge(
+        &mut self,
+        request: CreateKnowledgeRequest,
+        vault: Option<&str>,
+    ) -> Result<KnowledgeResponse, KnowledgeError> {
+        if let Some(id) = vault
+            && !self.vaults.contains_key(id)
+        {
+            return Err(KnowledgeError::VaultNotRegistered {
+                vault_id: id.to_owned(),
+            });
+        }
+        let work = self.resolve_create_inputs(request).await?;
+        let notes = self.documents(vault).await?;
+        Self::create_in_documents(notes, work).await
+    }
+
+    async fn create_in_documents(
+        notes: &Documents,
+        work: ResolvedCreateWork,
+    ) -> Result<KnowledgeResponse, KnowledgeError> {
+        match work {
+            ResolvedCreateWork::Single(request) => notes
                 .create(request)
                 .await
                 .map(|knowledge| KnowledgeResponse::KnowledgeCreated { knowledge }),
@@ -330,7 +402,7 @@ impl Actor {
                         content,
                         source_relative_path: source_relative_path.clone(),
                     };
-                    match self.notes.create(resolved).await {
+                    match notes.create(resolved).await {
                         Ok(knowledge) => {
                             if first.is_none() {
                                 first = Some(knowledge);
@@ -353,6 +425,58 @@ impl Actor {
                     })
             }
         }
+    }
+
+    fn register_vault(&mut self, vault_id: String, root: PathBuf) {
+        if self
+            .vaults
+            .get(&vault_id)
+            .is_some_and(|entry| entry.root == root)
+        {
+            return;
+        }
+        self.vaults
+            .insert(vault_id, RegisteredVault { root, runtime: None });
+    }
+
+    async fn documents(&mut self, vault: Option<&str>) -> Result<&Documents, KnowledgeError> {
+        let Some(vault_id) = vault else { return Ok(&self.notes) };
+        let entry = self
+            .vaults
+            .get_mut(vault_id)
+            .ok_or_else(|| KnowledgeError::VaultNotRegistered {
+                vault_id: vault_id.to_owned(),
+            })?;
+        if entry.runtime.is_none() {
+            let mut config = self.knowledge_config.clone();
+            config.root = Some(entry.root.clone());
+            let mut runtime = open_documents(&self.config_dir, &config)
+                .await
+                .map_err(|error| KnowledgeError::VaultUnavailable {
+                    vault_id: vault_id.to_owned(),
+                    message: error.to_string(),
+                })?;
+            // Named vaults have no global broadcast; dropping the receiver prevents an unbounded queue.
+            runtime.change_rx = None;
+            entry.runtime = Some(runtime);
+        }
+        Ok(&entry.runtime.as_ref().expect("runtime opened").notes)
+    }
+
+    async fn get_knowledge(
+        &mut self,
+        request: GetKnowledgeRequest,
+        vault: Option<&str>,
+    ) -> Result<KnowledgeResponse, KnowledgeError> {
+        let notes = self.documents(vault).await?;
+        let knowledge = notes
+            .get(request.clone())
+            .await?
+            .ok_or(KnowledgeError::KnowledgeNotFound {
+                backend: "obsidian".to_owned(),
+                identifier: request,
+            })?;
+        Ok(KnowledgeResponse::KnowledgeFound { knowledge })
     }
 
     async fn resolve_create_inputs(
@@ -461,6 +585,7 @@ impl Actor {
         })
     }
 
+    #[cfg(test)]
     async fn handle_get_knowledge(
         &mut self,
         request: GetKnowledgeRequest,
@@ -476,9 +601,10 @@ impl Actor {
         Ok(KnowledgeResponse::KnowledgeFound { knowledge })
     }
 
+    #[cfg(test)]
     async fn handle_delete_knowledge(
         &mut self,
-        request: DeleteKnowledgeRequest,
+        request: super::types::DeleteKnowledgeRequest,
     ) -> Result<KnowledgeResponse, KnowledgeError> {
         let result = self.notes.delete(request).await?;
         Ok(KnowledgeResponse::KnowledgeDeleted { result })

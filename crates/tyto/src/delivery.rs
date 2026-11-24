@@ -305,6 +305,7 @@ impl Actor {
                         dispatch_create_knowledge(
                             &context,
                             CreateKnowledgeInput {
+                                vault: None,
                                 request: CreateKnowledgeRequest {
                                     backend_id: Some(backend_id),
                                     title,

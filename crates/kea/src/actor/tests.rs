@@ -13,13 +13,15 @@ use super::super::documents::open_documents;
 use super::super::messages::{KnowledgeRequest, KnowledgeRequestPayload, KnowledgeResponse};
 use super::super::types::{
     CreateCanvasDashboardRequest, GetCanvasDashboardRequest, KnowledgeConfig, KnowledgeContentType, KnowledgeError,
-    UpsertDataRequest, VaultCreateKnowledgeRequest, VaultKnowledgeFilters, VaultListKnowledgeRequest,
+    SearchMode, UpsertDataRequest, VaultCreateKnowledgeRequest, VaultKnowledgeFilters, VaultListKnowledgeRequest,
+    VaultSearchKnowledgeRequest,
 };
 use super::Actor;
 
 #[test]
 fn create_note_request_serializes_direct_vault_shape_and_input_file() {
     let payload = KnowledgeRequestPayload::CreateKnowledge {
+        vault: None,
         request: VaultCreateKnowledgeRequest {
             backend_id: Some("research/note.md".to_owned()),
             title: "Note".to_owned(),
@@ -91,6 +93,595 @@ fn note(title: &str, content: Option<String>, input_file: Option<PathBuf>) -> Va
         frontmatter: Map::new(),
         tags: Vec::new(),
     }
+}
+
+async fn request(actor: &mut Actor, payload: KnowledgeRequestPayload) -> Result<KnowledgeResponse, KnowledgeError> {
+    let (reply_to, reply) = tokio::sync::oneshot::channel();
+    actor
+        .handle_message(KnowledgeRequest { payload, reply_to })
+        .await;
+    reply.await.expect("actor reply")
+}
+
+#[test]
+fn search_mode_defaults_to_similarity_on_the_wire() {
+    let payload: KnowledgeRequestPayload = serde_json::from_value(json!({"SearchKnowledge": {
+        "request": {"query": "term", "filters": {}, "limit": 10}
+    }}))
+    .expect("default mode");
+    assert!(matches!(
+        payload,
+        KnowledgeRequestPayload::SearchKnowledge {
+            mode: SearchMode::Similarity,
+            vault: None,
+            ..
+        }
+    ));
+    let input: super::super::messages::SearchKnowledgeInput = serde_json::from_value(json!({
+        "request": {"query": "term", "filters": {}, "limit": 10}
+    }))
+    .expect("generated input defaults");
+    assert!(input.vault.is_none());
+    assert_eq!(input.mode, SearchMode::Similarity);
+}
+
+#[tokio::test]
+async fn front_matter_matches_exact_values_without_using_query() {
+    let (_directory, mut actor) = actor(KnowledgeConfig::default()).await;
+    let mut first = note("First", Some("text".to_owned()), None);
+    first.frontmatter.insert("kind".to_owned(), json!("guide"));
+    actor.handle_create_knowledge(first).await.expect("first");
+    actor
+        .handle_create_knowledge(note("Second", Some("text".to_owned()), None))
+        .await
+        .expect("second");
+    let filters = VaultKnowledgeFilters {
+        frontmatter: Some(Map::from_iter([("kind".to_owned(), json!("guide"))])),
+        ..Default::default()
+    };
+    let search = VaultSearchKnowledgeRequest {
+        query: "ignored".to_owned(),
+        filters,
+        limit: 10,
+    };
+    let result = actor
+        .notes
+        .search_mode(SearchMode::FrontMatter, &search)
+        .await
+        .expect("search");
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(result.results[0].knowledge.path, "first.md");
+}
+
+#[tokio::test]
+async fn search_modes_are_vault_scoped_and_full_text_is_lazy() {
+    let (directory, mut actor) = actor(KnowledgeConfig::default()).await;
+    let root = directory.path().join("named");
+    fs::create_dir_all(&root).await.expect("root");
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::RegisterVault {
+            vault_id: "named".to_owned(),
+            root,
+        },
+    )
+    .await
+    .expect("register");
+    for (vault, title, content) in [
+        (None, "Global", "common globalword"),
+        (Some("named".to_owned()), "Named", "common namedword"),
+    ] {
+        let mut target = note(title, Some(content.to_owned()), None);
+        target
+            .frontmatter
+            .insert("kind".to_owned(), json!("target"));
+        request(
+            &mut actor,
+            KnowledgeRequestPayload::CreateKnowledge {
+                vault: vault.clone(),
+                request: target,
+            },
+        )
+        .await
+        .expect("create note");
+        request(
+            &mut actor,
+            KnowledgeRequestPayload::CreateKnowledge {
+                vault,
+                request: note("Other", Some("unrelated words".to_owned()), None),
+            },
+        )
+        .await
+        .expect("create other note");
+    }
+    assert!(!actor.notes.full_text_is_open());
+    assert!(
+        !actor.vaults["named"]
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .notes
+            .full_text_is_open()
+    );
+    for mode in [SearchMode::Similarity, SearchMode::FrontMatter, SearchMode::FullText] {
+        for (vault, expected) in [(None, "global.md"), (Some("named".to_owned()), "named.md")] {
+            let query = VaultSearchKnowledgeRequest {
+                query: "common".to_owned(),
+                filters: if mode == SearchMode::FrontMatter {
+                    VaultKnowledgeFilters {
+                        frontmatter: Some(Map::from_iter([("kind".to_owned(), json!("target"))])),
+                        ..Default::default()
+                    }
+                } else {
+                    VaultKnowledgeFilters::default()
+                },
+                limit: 100,
+            };
+            let KnowledgeResponse::KnowledgeSearched(result) = request(
+                &mut actor,
+                KnowledgeRequestPayload::SearchKnowledge {
+                    vault,
+                    mode,
+                    request: query.clone(),
+                },
+            )
+            .await
+            .expect("search") else {
+                panic!("search response")
+            };
+            assert_eq!(result.results.len(), 1);
+            assert_eq!(result.results[0].knowledge.path, expected);
+            if mode == SearchMode::Similarity && expected == "global.md" {
+                let KnowledgeResponse::KnowledgeSearched(legacy) = request(
+                    &mut actor,
+                    KnowledgeRequestPayload::SearchKnowledge {
+                        request: query,
+                        vault: None,
+                        mode: SearchMode::Similarity,
+                    },
+                )
+                .await
+                .expect("legacy search") else {
+                    panic!("search response")
+                };
+                assert_eq!(result, legacy);
+            }
+        }
+    }
+    assert!(actor.notes.full_text_is_open());
+    assert!(
+        actor.vaults["named"]
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .notes
+            .full_text_is_open()
+    );
+    let query = VaultSearchKnowledgeRequest {
+        query: "common".to_owned(),
+        filters: VaultKnowledgeFilters::default(),
+        limit: 10,
+    };
+    assert!(matches!(
+        request(
+            &mut actor,
+            KnowledgeRequestPayload::SearchKnowledge {
+                vault: Some("missing".to_owned()),
+                mode: SearchMode::Similarity,
+                request: query
+            }
+        )
+        .await,
+        Err(KnowledgeError::VaultNotRegistered { .. })
+    ));
+}
+
+#[tokio::test]
+async fn full_text_tracks_create_and_delete() {
+    let (_directory, mut actor) = actor(KnowledgeConfig::default()).await;
+    let query = VaultSearchKnowledgeRequest {
+        query: "uniqueword".to_owned(),
+        filters: VaultKnowledgeFilters::default(),
+        limit: 10,
+    };
+    actor
+        .notes
+        .search_mode(SearchMode::FullText, &query)
+        .await
+        .expect("open index");
+    actor
+        .handle_create_knowledge(note("Fresh", Some("uniqueword".to_owned()), None))
+        .await
+        .expect("create");
+    assert_eq!(
+        actor
+            .notes
+            .search_mode(SearchMode::FullText, &query)
+            .await
+            .expect("search")
+            .results
+            .len(),
+        1
+    );
+    actor
+        .handle_delete_knowledge("fresh.md".to_owned())
+        .await
+        .expect("delete");
+    assert!(
+        actor
+            .notes
+            .search_mode(SearchMode::FullText, &query)
+            .await
+            .expect("search")
+            .results
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn named_vault_lifecycle_is_lazy_isolated_and_retryable() {
+    let (directory, mut actor) = actor(KnowledgeConfig::default()).await;
+    let first = directory.path().join("first");
+    let second = directory.path().join("second");
+    let missing = directory.path().join("missing");
+    fs::create_dir_all(&first).await.expect("first root");
+    fs::create_dir_all(&second).await.expect("second root");
+    for (id, root) in [("a", first.clone()), ("b", second.clone()), ("bad", missing.clone())] {
+        request(
+            &mut actor,
+            KnowledgeRequestPayload::RegisterVault {
+                vault_id: id.to_owned(),
+                root,
+            },
+        )
+        .await
+        .expect("register");
+    }
+    assert!(actor.vaults["a"].runtime.is_none());
+    assert!(matches!(
+        request(
+            &mut actor,
+            KnowledgeRequestPayload::GetVaultStats {
+                vault: Some("absent".to_owned())
+            }
+        )
+        .await,
+        Err(KnowledgeError::VaultNotRegistered { .. })
+    ));
+    assert!(matches!(
+        request(
+            &mut actor,
+            KnowledgeRequestPayload::GetVaultStats {
+                vault: Some("bad".to_owned())
+            }
+        )
+        .await,
+        Err(KnowledgeError::VaultUnavailable { .. })
+    ));
+    assert!(actor.vaults["bad"].runtime.is_none());
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::CreateKnowledge {
+            vault: Some("a".to_owned()),
+            request: note("Same", Some("first".to_owned()), None),
+        },
+    )
+    .await
+    .expect("create first");
+    let first_monitor = actor.vaults["a"]
+        .runtime
+        .as_ref()
+        .expect("opened")
+        .notes
+        .monitor_abort_handle()
+        .expect("monitor");
+    let opened = &actor.vaults["a"].runtime.as_ref().expect("opened").notes as *const _;
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::GetVaultStats {
+            vault: Some("a".to_owned()),
+        },
+    )
+    .await
+    .expect("reuse");
+    assert_eq!(
+        opened,
+        &actor.vaults["a"].runtime.as_ref().expect("opened").notes as *const _
+    );
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::CreateKnowledge {
+            vault: Some("b".to_owned()),
+            request: note("Same", Some("second".to_owned()), None),
+        },
+    )
+    .await
+    .expect("create second");
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::CreateKnowledge {
+            vault: None,
+            request: note("Same", Some("global".to_owned()), None),
+        },
+    )
+    .await
+    .expect("create global");
+    for (id, expected) in [("a", "first"), ("b", "second")] {
+        let KnowledgeResponse::KnowledgeFound { knowledge } = request(
+            &mut actor,
+            KnowledgeRequestPayload::GetKnowledge {
+                vault: Some(id.to_owned()),
+                request: "same.md".to_owned(),
+            },
+        )
+        .await
+        .expect("read named") else {
+            panic!("expected note")
+        };
+        assert_eq!(knowledge.content, expected);
+    }
+    let KnowledgeResponse::KnowledgeFound { knowledge } = request(
+        &mut actor,
+        KnowledgeRequestPayload::GetKnowledge {
+            vault: None,
+            request: "same.md".to_owned(),
+        },
+    )
+    .await
+    .expect("read global") else {
+        panic!("expected global note")
+    };
+    assert_eq!(knowledge.content, "global");
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::RegisterVault {
+            vault_id: "a".to_owned(),
+            root: first,
+        },
+    )
+    .await
+    .expect("register same root");
+    assert_eq!(
+        opened,
+        &actor.vaults["a"]
+            .runtime
+            .as_ref()
+            .expect("still open")
+            .notes as *const _
+    );
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::RegisterVault {
+            vault_id: "a".to_owned(),
+            root: second,
+        },
+    )
+    .await
+    .expect("replace");
+    tokio::task::yield_now().await;
+    assert!(first_monitor.is_finished());
+    assert!(actor.vaults["a"].runtime.is_none());
+    let KnowledgeResponse::KnowledgeFound { knowledge } = request(
+        &mut actor,
+        KnowledgeRequestPayload::GetKnowledge {
+            vault: Some("a".to_owned()),
+            request: "same.md".to_owned(),
+        },
+    )
+    .await
+    .expect("reopened") else {
+        panic!("expected note")
+    };
+    assert_eq!(knowledge.content, "second");
+    let second_monitor = actor.vaults["a"]
+        .runtime
+        .as_ref()
+        .expect("reopened")
+        .notes
+        .monitor_abort_handle()
+        .expect("monitor");
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::UnregisterVault {
+            vault_id: "a".to_owned(),
+        },
+    )
+    .await
+    .expect("unregister");
+    tokio::task::yield_now().await;
+    assert!(second_monitor.is_finished());
+    assert!(matches!(
+        request(
+            &mut actor,
+            KnowledgeRequestPayload::GetVaultStats {
+                vault: Some("a".to_owned())
+            }
+        )
+        .await,
+        Err(KnowledgeError::VaultNotRegistered { .. })
+    ));
+    fs::create_dir_all(missing)
+        .await
+        .expect("create missing root");
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::GetVaultStats {
+            vault: Some("bad".to_owned()),
+        },
+    )
+    .await
+    .expect("retry open");
+}
+
+#[tokio::test]
+async fn named_create_uses_existing_collision_and_path_rules() {
+    let (directory, mut actor) = actor(KnowledgeConfig::default()).await;
+    let root = directory.path().join("vault");
+    fs::create_dir_all(&root).await.expect("root");
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::RegisterVault {
+            vault_id: "a".to_owned(),
+            root,
+        },
+    )
+    .await
+    .expect("register");
+    let mut note_request = note("Same", Some("first".to_owned()), None);
+    note_request.backend_id = Some("nested/note.md".to_owned());
+    let KnowledgeResponse::KnowledgeCreated { knowledge: first } = request(
+        &mut actor,
+        KnowledgeRequestPayload::CreateKnowledge {
+            vault: Some("a".to_owned()),
+            request: note_request.clone(),
+        },
+    )
+    .await
+    .expect("first") else {
+        panic!("created")
+    };
+    let KnowledgeResponse::KnowledgeCreated { knowledge: second } = request(
+        &mut actor,
+        KnowledgeRequestPayload::CreateKnowledge {
+            vault: Some("a".to_owned()),
+            request: note_request.clone(),
+        },
+    )
+    .await
+    .expect("second") else {
+        panic!("created")
+    };
+    assert_eq!(first.backend_id, "nested/note.md");
+    assert_eq!(second.backend_id, "nested/note-1.md");
+    note_request.backend_id = Some("../escape.md".to_owned());
+    assert!(
+        request(
+            &mut actor,
+            KnowledgeRequestPayload::CreateKnowledge {
+                vault: Some("a".to_owned()),
+                request: note_request
+            }
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn named_vault_stats_count_beyond_list_limit() {
+    let (directory, mut actor) = actor(KnowledgeConfig::default()).await;
+    let root = directory.path().join("many");
+    fs::create_dir_all(&root).await.expect("root");
+    for index in 0..105 {
+        fs::write(root.join(format!("{index}.md")), "content")
+            .await
+            .expect("write");
+        fs::write(
+            directory
+                .path()
+                .join("knowledge")
+                .join(format!("{index}.md")),
+            "content",
+        )
+        .await
+        .expect("write global");
+    }
+    request(
+        &mut actor,
+        KnowledgeRequestPayload::RegisterVault {
+            vault_id: "many".to_owned(),
+            root,
+        },
+    )
+    .await
+    .expect("register");
+    for vault in [None, Some("many".to_owned())] {
+        let KnowledgeResponse::VaultStatsFound { stats } =
+            request(&mut actor, KnowledgeRequestPayload::GetVaultStats { vault })
+                .await
+                .expect("stats")
+        else {
+            panic!("stats response")
+        };
+        assert_eq!(stats.document_count, 105);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_named_requests_are_serialized_and_unregister_removes_the_runtime() {
+    let (directory, mut actor) = actor(KnowledgeConfig::default()).await;
+    let root = directory.path().join("concurrent");
+    fs::create_dir_all(&root).await.expect("root");
+    let (sender, receiver) = mpsc::channel(16);
+    actor.receiver = receiver;
+    let task = tokio::spawn(super::run_actor(actor));
+
+    let (reply_to, reply) = tokio::sync::oneshot::channel();
+    sender
+        .send(KnowledgeRequest {
+            payload: KnowledgeRequestPayload::RegisterVault {
+                vault_id: "a".to_owned(),
+                root,
+            },
+            reply_to,
+        })
+        .await
+        .expect("register request");
+    assert!(matches!(
+        reply.await.expect("reply").expect("registered"),
+        KnowledgeResponse::VaultRegistered
+    ));
+
+    let mut replies = Vec::new();
+    for _ in 0..8 {
+        let (reply_to, reply) = tokio::sync::oneshot::channel();
+        sender
+            .send(KnowledgeRequest {
+                payload: KnowledgeRequestPayload::GetVaultStats {
+                    vault: Some("a".to_owned()),
+                },
+                reply_to,
+            })
+            .await
+            .expect("stats request");
+        replies.push(reply);
+    }
+    for reply in replies {
+        let KnowledgeResponse::VaultStatsFound { stats } = reply.await.expect("reply").expect("stats") else {
+            panic!("expected stats");
+        };
+        assert_eq!(stats.document_count, 0);
+    }
+    let (reply_to, reply) = tokio::sync::oneshot::channel();
+    sender
+        .send(KnowledgeRequest {
+            payload: KnowledgeRequestPayload::UnregisterVault {
+                vault_id: "a".to_owned(),
+            },
+            reply_to,
+        })
+        .await
+        .expect("unregister request");
+    assert!(matches!(
+        reply.await.expect("reply").expect("unregistered"),
+        KnowledgeResponse::VaultUnregistered
+    ));
+    let (reply_to, reply) = tokio::sync::oneshot::channel();
+    sender
+        .send(KnowledgeRequest {
+            payload: KnowledgeRequestPayload::GetVaultStats {
+                vault: Some("a".to_owned()),
+            },
+            reply_to,
+        })
+        .await
+        .expect("stats request");
+    assert!(matches!(
+        reply.await.expect("reply"),
+        Err(KnowledgeError::VaultNotRegistered { .. })
+    ));
+    drop(sender);
+    task.abort();
 }
 
 #[tokio::test]

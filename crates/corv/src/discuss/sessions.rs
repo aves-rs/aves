@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::str::FromStr;
 
-use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::DeleteSessionRequest;
-use agent_client_protocol::{AcpAgent, Agent, Client};
 use serde_json::{from_str as json_from_str, to_string as json_to_string};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -13,16 +10,16 @@ use super::actor::{Actor, PROVIDER_CHILD_REAP_DEADLINE, SpawnSessionOptions, cha
 use super::agent_nodes::TaskSessionStart;
 use super::error::DiscussError;
 use super::identity::{Binding, flow_node_subject, persist_binding};
-use super::launch_types::AcpProvider;
 use super::mcp::clear_mcp_scope;
 use super::messages::{DiscussResponse, EnsureAttachedSessionOutcome};
-use super::session::{initialize_request, revoke_worker_jti};
+use super::session::revoke_worker_jti;
 use super::storage::{
     delete_discuss_session, load_discuss_session, present_acp_session_id, rename_discuss_session,
     update_session_launch_context, update_session_setup_kind,
 };
 use super::supervisor::ProviderSupervisorResources;
 use super::types::{CustomMcpScope, DiscussSessionId, DiscussSessionSetup, TaskSessionStarted, WorkerCommand};
+
 impl Actor {
     pub(super) async fn start_task_session(
         &mut self,
@@ -78,7 +75,6 @@ impl Actor {
                 session_config_overrides: config_overrides,
                 acp_session_id: None,
                 announce_desktop_association: false,
-                transient_connectivity: false,
                 session_cwd: Some(session_cwd),
                 application_mcp_enabled: Some(application_mcp_enabled),
                 node_token: Some(node_token.clone()),
@@ -204,7 +200,7 @@ impl Actor {
         if cwd_changed && live_worker.is_some_and(|entry| entry.active_turn) {
             return Err(DiscussError::SessionBusy { discuss_session_id });
         }
-        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
+        if let Some(entry) = self.remove_worker(&discuss_session_id).await {
             let _ = entry.command_tx.send(WorkerCommand::Stop).await;
             drop(entry.command_tx);
             let mut join_handle = entry.join_handle;
@@ -244,7 +240,6 @@ impl Actor {
                 session_config_overrides: BTreeMap::new(),
                 acp_session_id: None,
                 announce_desktop_association: true,
-                transient_connectivity: false,
                 session_cwd: None,
                 application_mcp_enabled: None,
                 node_token: None,
@@ -310,15 +305,8 @@ impl Actor {
                             tracing::warn!(%discuss_session_id, ?result, "ACP session delete failed");
                         }
                     }
-                } else if let Some(provider) = self.agents.get(&row.agent_name) {
-                    let result = timeout(
-                        PROVIDER_CHILD_REAP_DEADLINE,
-                        delete_provider_session_short_lived(provider, session_id),
-                    )
-                    .await;
-                    if let result @ (Err(_) | Ok(Err(_))) = result {
-                        tracing::warn!(%discuss_session_id, ?result, "ACP session delete failed");
-                    }
+                } else {
+                    tracing::debug!(%discuss_session_id, provider = %row.agent_name, "No running provider connection; the provider keeps its copy of the removed chat");
                 }
             }
         }
@@ -328,16 +316,12 @@ impl Actor {
         delete_discuss_session(&tx, &discuss_session_id.to_string()).await?;
         tx.commit().await?;
 
-        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
+        if let Some(entry) = self.remove_worker(&discuss_session_id).await {
             let _ = entry.command_tx.send(WorkerCommand::Stop).await;
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
             if let Some(supervisor) = self.provider_supervisors.get_mut(&entry.agent_name) {
                 supervisor.disassociate_chat(&discuss_session_id);
             }
-        }
-        if let Some(pending) = self.pending_provider_tests.remove(&discuss_session_id) {
-            let reply = self.restore_provider_test_snapshot(pending, false).await;
-            let _ = reply.send(Err(DiscussError::SessionCancelled { discuss_session_id }));
         }
         self.worker_capabilities.remove(&discuss_session_id);
         self.cancel_pending_permissions_for_session(&discuss_session_id);
@@ -372,28 +356,4 @@ impl Actor {
         }
         Ok(DiscussResponse::Success)
     }
-}
-
-async fn delete_provider_session_short_lived(provider: &AcpProvider, session_id: String) -> Result<(), DiscussError> {
-    let agent_key = json_to_string(provider.server())?;
-    let agent = AcpAgent::from_str(&agent_key)?;
-    Client
-        .v1()
-        .name("acp-session-delete")
-        .connect_with(agent, move |cx: ConnectionTo<Agent>| async move {
-            let initialized = cx.send_request(initialize_request()).block_task().await?;
-            if initialized
-                .agent_capabilities
-                .session_capabilities
-                .delete
-                .is_some()
-            {
-                cx.send_request(DeleteSessionRequest::new(session_id))
-                    .block_task()
-                    .await?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(DiscussError::from)
 }

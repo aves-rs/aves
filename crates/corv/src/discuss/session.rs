@@ -145,7 +145,6 @@ pub(super) struct WorkerSessionParams {
     pub(super) pending_elicitation_tx: mpsc::Sender<PendingElicitationRegistration>,
     pub(super) pending_elicitation_cancel_tx: mpsc::Sender<PendingElicitationCancel>,
     pub(super) announce_desktop_association: bool,
-    pub(super) transient_connectivity: bool,
     pub(super) callback_router: Arc<Mutex<CallbackRouter>>,
     pub(super) callback_routes: Option<Arc<Mutex<CallbackRouteRegistry>>>,
     pub(super) shared_connection: Option<ConnectionTo<Agent>>,
@@ -161,8 +160,6 @@ pub(super) struct WorkerReady {
     pub(super) discuss_session_id: DiscussSessionId,
     pub(super) acp_session_id: SessionId,
     pub(super) announce_desktop_association: bool,
-    pub(super) transient_connectivity: bool,
-    pub(super) config_options: Option<Vec<DiscussConfigOption>>,
     pub(super) supports_config_updates: bool,
 }
 
@@ -973,11 +970,10 @@ impl WorkerSession {
             .send_request_to(Agent, PromptRequest::new(self.session_id.clone(), blocks))
             .on_receiving_result({
                 let update_tx = self.update_tx.clone();
+                // An error returned here ends the whole connection, which a shared Provider's other
+                // sessions also use: a rejected prompt, or one whose worker is gone, stays this session's.
                 async move |result| {
-                    let response = result?;
-                    update_tx
-                        .send(SessionMessage::PromptResponse(Ok(response)))
-                        .map_err(|_| AcpError::internal_error())?;
+                    let _ = update_tx.send(SessionMessage::PromptResponse(result));
                     Ok(())
                 }
             })
@@ -1219,7 +1215,7 @@ pub(super) async fn open_configured_session(
         let agent_id = agent.id.to_string();
         let selection = primary_agent_option_selection(&provider_options, config_id, &agent_id).ok_or_else(|| {
             DiscussError::Validation {
-                message: format!("Provider does not advertise assigned Agent `{agent_id}`"),
+                message: format!("Provider has no Agent option for assigned Agent `{agent_id}`"),
             }
         })?;
         tracing::debug!(provider = provider_name, acp_session_id = %session.session_id(), agent = %agent_id, "Selecting primary Agent");

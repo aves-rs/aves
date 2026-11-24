@@ -1,6 +1,4 @@
-use std::collections::BTreeMap;
 use std::process::Stdio;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,8 +17,8 @@ use turso::Connection;
 use aves::utils::retry::{RetryBackoff, sleep_with_backoff};
 
 use super::actor::{
-    Actor, PROVIDER_CHILD_REAP_DEADLINE, PendingProviderTest, ProviderRestartReady, SharedConnectionReady,
-    SharedProviderEvent, SpawnSessionOptions, channel_send_error,
+    Actor, PROVIDER_CHILD_REAP_DEADLINE, ProviderRestartReady, SharedConnectionReady, SharedProviderEvent,
+    channel_send_error,
 };
 use super::boot::persist_discuss_agents;
 use super::config::{config_options_from_json, config_settings_from_json, config_settings_from_value};
@@ -36,12 +34,12 @@ use super::storage::{
     CustomInstallationKind, DISCUSS_AGENT_CONFIG_UPSERT_SQL, DiscussAgentConfigRow, delete_custom_installation,
     delete_discuss_agent_config, delete_discuss_session, delete_discuss_team_installation, list_custom_installations,
     list_discuss_team_installations, list_discuss_team_installations_by_provider, list_recent_discuss_sessions,
-    load_discuss_agent_config, present_acp_session_id, upsert_discuss_agent_config,
+    load_discuss_agent_config, upsert_discuss_agent_config,
 };
 use super::supervisor::{CallbackRouteRegistry, CallbackRouter, ProviderSupervisor, ProviderSupervisorResources};
 use super::types::{
-    CleanupWarning, CustomMcpScope, DiscussAuthState, DiscussConfigOption, DiscussProviderConfig, DiscussSessionId,
-    ProviderRuntimeState, WorkerCommand, auth_status_from_response,
+    CleanupWarning, CustomMcpScope, DiscussAuthState, DiscussProviderConfig, DiscussSessionId, ProviderRuntimeState,
+    WorkerCommand, auth_status_from_response,
 };
 
 /// Connection plus native-ACP MCP, HTTP MCP and session system-prompt support.
@@ -258,108 +256,72 @@ impl Actor {
         Ok(DiscussResponse::Success)
     }
 
+    /// Saves a provider. When it is new, or its launch command changed, its options are read over
+    /// its running shared connection with `session/options` — no session is opened. A failed read
+    /// restores the previous provider. A provider without that connection is saved unchecked.
     pub(super) async fn handle_add_provider_request(
         &mut self,
         provider_name: String,
         provider_spec: AcpProvider,
-        reply_to: oneshot::Sender<Result<DiscussResponse, DiscussError>>,
-        force_connectivity: bool,
-    ) -> Result<(), DiscussError> {
-        if let Err(error) = provider_spec
-            .validate_workspace_copy_sources()
-            .and_then(|()| self.validate_new_managed_document(&provider_name, &provider_spec))
-        {
-            let _ = reply_to.send(Err(error));
-            return Ok(());
-        }
+        force_check: bool,
+    ) -> Result<DiscussResponse, DiscussError> {
         let previous_provider = self.agents.get(&provider_name).cloned();
-        let requires_connectivity = force_connectivity
+        let check = force_check
             || previous_provider
                 .as_ref()
                 .is_none_or(|previous| to_value(previous.server()).ok() != to_value(provider_spec.server()).ok());
-
-        if requires_connectivity {
-            let conn = self.persistence.acquire_connection().await?;
-            let previous_config = load_discuss_agent_config(&conn, &provider_name).await?;
-            let discuss_session_id = DiscussSessionId::new();
-            self.agents
-                .insert(provider_name.clone(), provider_spec.clone());
-            self.pending_provider_tests.insert(
-                discuss_session_id,
-                PendingProviderTest {
-                    provider_name: provider_name.clone(),
-                    candidate: provider_spec,
-                    previous_provider,
-                    previous_config,
-                    reply_to,
-                },
-            );
-            if let Err(error) = self
-                .spawn_session(
-                    discuss_session_id,
-                    &provider_name,
-                    SpawnSessionOptions {
-                        launch_config: None,
-                        name: Some("Provider connectivity check".to_string()),
-                        setup: None,
-                        session_config_overrides: BTreeMap::new(),
-                        acp_session_id: None,
-                        announce_desktop_association: false,
-                        transient_connectivity: true,
-                        session_cwd: None,
-                        application_mcp_enabled: None,
-                        node_token: None,
-                        flow_mcp_endpoints: None,
-                    },
-                )
-                .await
-            {
-                if let Some(pending) = self.pending_provider_tests.remove(&discuss_session_id) {
-                    let original = error.clone();
-                    let reply = self.restore_provider_test_snapshot(pending, false).await;
-                    let _ = reply.send(Err(original));
-                }
-                return Ok(());
-            }
-            return Ok(());
+        let conn = self.persistence.acquire_connection().await?;
+        let previous_config = load_discuss_agent_config(&conn, &provider_name).await?;
+        let defaults = config_settings_from_value(provider_spec.default_session_config());
+        let response = self
+            .handle_add_provider(provider_name.clone(), provider_spec)
+            .await?;
+        if !check {
+            return Ok(response);
         }
-
-        let result = self.handle_add_provider(provider_name, provider_spec).await;
-        let _ = reply_to.send(result);
-        Ok(())
+        let read = match self.shared_session_options(&provider_name).await {
+            Some(Ok(options)) => upsert_discuss_agent_config(&conn, &provider_name, Some(&options), &defaults).await,
+            Some(Err(error)) => Err(error),
+            None => return Ok(response),
+        };
+        if let Err(error) = read {
+            self.revert_provider(&provider_name, previous_provider, previous_config.as_ref())
+                .await;
+            return Err(error);
+        }
+        Ok(response)
     }
 
-    pub(super) async fn restore_provider_test_snapshot(
+    /// Puts back the provider and its saved options as they were before a failed save.
+    async fn revert_provider(
         &mut self,
-        pending: PendingProviderTest,
-        persist_agents: bool,
-    ) -> oneshot::Sender<Result<DiscussResponse, DiscussError>> {
-        let PendingProviderTest {
-            provider_name,
-            previous_provider,
-            previous_config,
-            reply_to,
-            ..
-        } = pending;
-
+        provider_name: &str,
+        previous_provider: Option<AcpProvider>,
+        previous_config: Option<&DiscussAgentConfigRow>,
+    ) {
         match previous_provider {
             Some(provider) => {
-                self.agents.insert(provider_name.clone(), provider);
+                let _ = self.install_managed_config(provider_name, &provider);
+                self.agents.insert(provider_name.to_owned(), provider);
             }
             None => {
-                self.agents.remove(&provider_name);
+                self.cancel_provider_restart(provider_name);
+                self.stop_provider_resources(provider_name).await;
+                self.provider_supervisors.remove(provider_name);
+                self.agents.remove(provider_name);
+                let _ = plugins::for_agent(provider_name).remove_config(&self.agents_workspace);
+                self.publish_provider_runtime(provider_name).await;
             }
         }
-        if persist_agents && let Err(error) = self.persist_agents().await {
-            tracing::warn!(target: "application_acp", ?error, "could not restore Provider config after transient connectivity failure");
+        if let Err(error) = self.persist_agents().await {
+            tracing::warn!(target: "application_acp", ?error, provider_name, "could not restore Provider config after a failed save");
         }
         if let Err(error) = self
-            .restore_provider_config(&provider_name, previous_config.as_ref())
+            .restore_provider_config(provider_name, previous_config)
             .await
         {
-            tracing::warn!(target: "application_acp", ?error, "could not restore Provider menu after transient connectivity failure");
+            tracing::warn!(target: "application_acp", ?error, provider_name, "could not restore Provider options after a failed save");
         }
-        reply_to
     }
 
     async fn restore_provider_config(
@@ -386,74 +348,6 @@ impl Actor {
             }
         }
         Ok(())
-    }
-
-    pub(super) async fn finish_provider_test(
-        &mut self,
-        discuss_session_id: DiscussSessionId,
-        result: Result<Option<Vec<DiscussConfigOption>>, DiscussError>,
-    ) {
-        let Some(pending) = self.pending_provider_tests.remove(&discuss_session_id) else {
-            return;
-        };
-        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
-            let _ = entry.command_tx.send(WorkerCommand::Stop).await;
-            revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
-        }
-
-        match result {
-            Ok(config_options) => {
-                if let Err(error) = self.install_managed_config(&pending.provider_name, &pending.candidate) {
-                    let reply = self.restore_provider_test_snapshot(pending, false).await;
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-                let defaults = config_settings_from_value(pending.candidate.default_session_config());
-                let persist_result = async {
-                    self.persist_agents().await?;
-                    let conn = self.persistence.acquire_connection().await?;
-                    upsert_discuss_agent_config(&conn, &pending.provider_name, config_options.as_deref(), &defaults)
-                        .await
-                }
-                .await;
-                if let Err(error) = persist_result {
-                    if let Some(previous) = &pending.previous_provider {
-                        let _ = self.install_managed_config(&pending.provider_name, previous);
-                    } else {
-                        let _ = plugins::for_agent(&pending.provider_name).remove_config(&self.agents_workspace);
-                    }
-                    let reply = self.restore_provider_test_snapshot(pending, true).await;
-                    let _ = reply.send(Err(error));
-                } else {
-                    let provider_was_new = pending.previous_provider.is_none();
-                    if provider_was_new {
-                        let provider_name = pending.provider_name.clone();
-                        let plugin = plugins::for_agent(&provider_name);
-                        self.provider_supervisors.insert(
-                            provider_name.clone(),
-                            ProviderSupervisor::new(provider_name.clone(), plugin.connection_strategy()),
-                        );
-                        if self.server_running {
-                            match self.start_provider_supervisor(&provider_name, false).await {
-                                Ok(true) => self.publish_provider_runtime(&provider_name).await,
-                                Ok(false) => {}
-                                Err(error) => tracing::warn!(
-                                    target: "application_acp",
-                                    ?error,
-                                    provider_name,
-                                    "new Provider was persisted but its runtime could not start"
-                                ),
-                            }
-                        }
-                    }
-                    let _ = pending.reply_to.send(Ok(DiscussResponse::Success));
-                }
-            }
-            Err(error) => {
-                let reply = self.restore_provider_test_snapshot(pending, false).await;
-                let _ = reply.send(Err(error));
-            }
-        }
     }
 
     /// Simple list for all installed providers.
@@ -819,7 +713,8 @@ impl Actor {
         {
             return;
         }
-        self.clear_dead_shared_provider_generation(&event.provider_name, event.generation)
+        let live_sessions = self
+            .clear_dead_shared_provider_generation(&event.provider_name, event.generation)
             .await;
         let claim = self
             .provider_supervisors
@@ -849,6 +744,7 @@ impl Actor {
                             .send(ProviderRestartReady {
                                 provider_name,
                                 generation,
+                                live_sessions,
                             })
                             .await;
                     }
@@ -871,9 +767,14 @@ impl Actor {
 
     /// Remove every actor-owned resource belonging to an exited shared
     /// connection before automatic recovery creates its replacement.
-    async fn clear_dead_shared_provider_generation(&mut self, provider_name: &str, generation: u64) {
+    /// Returns the sessions whose workers were live, for the restart to reopen.
+    async fn clear_dead_shared_provider_generation(
+        &mut self,
+        provider_name: &str,
+        generation: u64,
+    ) -> Vec<DiscussSessionId> {
         if self.shared_provider_generations.get(provider_name).copied() != Some(generation) {
-            return;
+            return Vec::new();
         }
 
         let session_ids = self
@@ -883,7 +784,19 @@ impl Actor {
             .map(|(session_id, _)| *session_id)
             .collect::<Vec<_>>();
         for session_id in &session_ids {
-            if let Some(entry) = self.worker_registry.remove(session_id) {
+            if let Some(entry) = self.remove_worker(session_id).await {
+                if entry.active_turn
+                    && let Some(acp_session_id) = entry.acp_session_id.clone()
+                {
+                    let _ = self
+                        .broadcast_tx
+                        .send(DiscussResponse::SessionWarning {
+                            discuss_session_id: *session_id,
+                            acp_session_id,
+                            warning: "The Provider connection exited before this turn finished".to_string(),
+                        })
+                        .await;
+                }
                 entry.join_handle.abort();
                 let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, entry.join_handle).await;
                 revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
@@ -950,6 +863,7 @@ impl Actor {
             watcher.abort();
             let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, watcher).await;
         }
+        session_ids
     }
 
     pub(super) async fn handle_shared_provider_restart_ready(&mut self, event: ProviderRestartReady) {
@@ -982,7 +896,11 @@ impl Actor {
         if supervisor.complete_auto_restart().is_err() {
             return;
         }
-        self.recover_provider_sessions(&event.provider_name).await;
+        for discuss_session_id in event.live_sessions {
+            if let Err(error) = self.revive_saved_session(discuss_session_id).await {
+                tracing::warn!(target: "application_acp", %discuss_session_id, ?error, "skipping unrecoverable Provider session");
+            }
+        }
         self.publish_provider_runtime(&event.provider_name).await;
     }
 
@@ -998,8 +916,6 @@ impl Actor {
         if !self.start_provider_supervisor(provider_name, true).await? {
             return Ok(DiscussResponse::Success);
         }
-        self.publish_provider_runtime(provider_name).await;
-        self.recover_provider_sessions(provider_name).await;
         self.publish_provider_runtime(provider_name).await;
         Ok(DiscussResponse::Success)
     }
@@ -1035,49 +951,6 @@ impl Actor {
         Ok(DiscussResponse::Success)
     }
 
-    pub(super) async fn recover_provider_sessions(&mut self, provider_name: &str) {
-        let Ok(conn) = self.persistence.acquire_connection().await else {
-            return;
-        };
-        let Ok(rows) = list_recent_discuss_sessions(&conn).await else {
-            return;
-        };
-
-        for row in rows
-            .into_iter()
-            .filter(|row| !row.is_task_session && row.agent_name == provider_name)
-        {
-            let Some(acp_session_id) = present_acp_session_id(row.acp_session_id.as_deref()) else {
-                continue;
-            };
-            let Ok(discuss_session_id) = DiscussSessionId::from_str(&row.discuss_session_id) else {
-                continue;
-            };
-            if let Err(error) = self
-                .spawn_session(
-                    discuss_session_id,
-                    provider_name,
-                    SpawnSessionOptions {
-                        launch_config: None,
-                        name: Some(row.session_name),
-                        setup: None,
-                        session_config_overrides: BTreeMap::new(),
-                        acp_session_id: Some(acp_session_id),
-                        announce_desktop_association: false,
-                        transient_connectivity: false,
-                        session_cwd: None,
-                        application_mcp_enabled: None,
-                        node_token: None,
-                        flow_mcp_endpoints: None,
-                    },
-                )
-                .await
-            {
-                tracing::warn!(target: "application_acp", ?error, provider_name, "skipping unrecoverable Provider session");
-            }
-        }
-    }
-
     async fn stop_provider_resources(&mut self, provider_name: &str) {
         let session_ids = self
             .worker_registry
@@ -1087,7 +960,7 @@ impl Actor {
             .collect::<Vec<_>>();
 
         for session_id in &session_ids {
-            if let Some(entry) = self.worker_registry.remove(session_id) {
+            if let Some(entry) = self.remove_worker(session_id).await {
                 entry.join_handle.abort();
                 let _ = time::timeout(PROVIDER_CHILD_REAP_DEADLINE, entry.join_handle).await;
                 revoke_worker_jti(
@@ -1120,20 +993,6 @@ impl Actor {
         }
         self.disposing_inspectors
             .retain(|id| !inspector_ids.contains(id));
-
-        let pending_tests = self
-            .pending_provider_tests
-            .iter()
-            .filter(|(_, pending)| pending.provider_name == provider_name)
-            .map(|(session_id, _)| *session_id)
-            .collect::<Vec<_>>();
-        for session_id in pending_tests {
-            if let Some(pending) = self.pending_provider_tests.remove(&session_id) {
-                let _ = pending.reply_to.send(Err(DiscussError::ProviderNotRunning {
-                    provider_name: provider_name.to_string(),
-                }));
-            }
-        }
 
         self.stop_provider_supervisor_resources(provider_name).await;
     }
@@ -1430,17 +1289,11 @@ impl Actor {
         }
 
         for session_id in live_session_ids {
-            self.worker_registry.remove(&session_id);
+            self.remove_worker(&session_id).await;
             if let Some(supervisor) = self.provider_supervisors.get_mut(provider_name) {
                 supervisor.disassociate_chat(&session_id);
             }
             self.worker_capabilities.remove(&session_id);
-            if let Some(pending) = self.pending_provider_tests.remove(&session_id) {
-                let reply = self.restore_provider_test_snapshot(pending, false).await;
-                let _ = reply.send(Err(DiscussError::SessionCancelled {
-                    discuss_session_id: session_id,
-                }));
-            }
             self.cancel_pending_permissions_for_session(&session_id);
         }
 

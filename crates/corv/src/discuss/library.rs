@@ -130,7 +130,7 @@ impl ResolvedAgent {
     pub(crate) fn selection_view(&self) -> AgentSelectionView<'_> {
         match self {
             Self::Builtin(agent) => AgentSelectionView::from_builtin(agent),
-            Self::Custom(agent) => AgentSelectionView::from_custom(agent),
+            Self::Custom(agent) => AgentSelectionView::from_custom(agent, None),
         }
     }
 }
@@ -159,6 +159,8 @@ pub(crate) struct AgentSelectionView<'a> {
     pub(crate) id: &'a AgentId,
     pub(crate) description: &'a str,
     pub(crate) body: &'a str,
+    /// The agent's place in the team being materialized; `None` when installed on its own.
+    pub(crate) role: Option<AgentRole>,
 }
 
 impl<'a> AgentSelectionView<'a> {
@@ -168,15 +170,17 @@ impl<'a> AgentSelectionView<'a> {
             id: &agent.id,
             description: agent.description,
             body: agent.body,
+            role: Some(agent.role),
         }
     }
 
-    /// Borrows selection fields from a custom definition.
-    pub(crate) fn from_custom(agent: &'a CustomAgentDefinition) -> Self {
+    /// Borrows selection fields from a custom definition, with its role in the team being materialized.
+    pub(crate) fn from_custom(agent: &'a CustomAgentDefinition, role: Option<AgentRole>) -> Self {
         Self {
             id: &agent.id,
             description: &agent.description,
             body: &agent.body,
+            role,
         }
     }
 }

@@ -11,7 +11,8 @@ use super::super::launch_types::{
     Effect, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, Operation, SessionLaunchConfig,
 };
 use super::super::library::{
-    AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
+    AgentId, AgentRole, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
+    SkillDefinition, SkillId,
 };
 use super::super::types::DiscussUtilityPayload;
 use super::files::{RenderedFile, write_rendered_files};
@@ -232,9 +233,10 @@ impl DiscussAgentPlugin for ClaudePlugin {
         &self,
         root: &Path,
         agent: &CustomAgentDefinition,
+        role: Option<AgentRole>,
         member_settings: Option<&ConfigSettings>,
     ) -> Result<(), DiscussError> {
-        let file = render_agent(&AgentSelectionView::from_custom(agent), member_settings)?;
+        let file = render_agent(&AgentSelectionView::from_custom(agent, role), member_settings)?;
         write_rendered_files(CLAUDE_PLUGIN_NAME, root, &[file])
     }
 

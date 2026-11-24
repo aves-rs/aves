@@ -32,8 +32,8 @@ use super::launch_types::{
     LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, LaunchPermissionOutcome, SessionLaunchConfig,
 };
 use super::library::{
-    AgentDefinition, AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
-    SkillBundleFile, SkillDefinition, SkillId, TeamDefinition,
+    AgentDefinition, AgentId, AgentRole, AgentSelectionView, AssetLibrary, CustomAgentDefinition,
+    CustomSkillDefinition, SkillBundleFile, SkillDefinition, SkillId, TeamDefinition,
 };
 use super::types::{DiscussConfigOption, DiscussConfigOptionValue, DiscussMemberOverrides, DiscussUtilityPayload};
 use super::usage::{DiscussUsageEvidence, UsageCaptureEvent, capture_standard_usage};
@@ -413,6 +413,7 @@ pub(super) fn agent_config_option_id(plugin: &dyn DiscussAgentPlugin) -> Option<
         id: &id,
         description: "",
         body: "",
+        role: None,
     };
     match plugin.primary_agent_selection(&agent) {
         PrimaryAgentSelection::ConfigOption(id) => Some(id.to_owned()),
@@ -771,14 +772,16 @@ pub trait DiscussAgentPlugin: Sync {
     /// Remove one canonical Skill bundle.
     fn destroy_skill(&self, root: &Path, skill: &SkillDefinition) -> Result<(), DiscussError>;
 
-    /// Materialize an owned agent using the default workspace layout.
+    /// Materialize an owned agent using the default workspace layout; `role` is its place in the team being
+    /// materialized, `None` when installed on its own.
     fn install_custom_agent(
         &self,
         root: &Path,
         agent: &CustomAgentDefinition,
+        role: Option<AgentRole>,
         member_settings: Option<&ConfigSettings>,
     ) -> Result<(), DiscussError> {
-        let file = render_agent_file(&AgentSelectionView::from_custom(agent), member_settings)?;
+        let file = render_agent_file(&AgentSelectionView::from_custom(agent, role), member_settings)?;
         write_rendered_files(DEFAULT_PLUGIN_NAME, root, &[file])
     }
 

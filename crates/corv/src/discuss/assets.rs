@@ -1125,7 +1125,7 @@ impl InstallAsset {
         match self {
             Self::Agent(agent, _) => {
                 actor
-                    .materialize_member(plugin, &actor.agents_workspace, agent, None)
+                    .materialize_member(plugin, &actor.agents_workspace, agent, None, None)
                     .await
             }
             Self::Skill(skill, _) => {

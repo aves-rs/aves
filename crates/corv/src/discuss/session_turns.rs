@@ -1,11 +1,8 @@
-use std::str::FromStr;
-
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, ArchiveSessionRequest, PermissionOptionId, SessionId, UnarchiveSessionRequest,
 };
-use agent_client_protocol::{AcpAgent, Agent, Client, Error as AcpError};
-use serde_json::to_string as json_to_string;
+use agent_client_protocol::{Agent, Error as AcpError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::{spawn, time::timeout};
 
@@ -13,10 +10,9 @@ use super::actor::{Actor, CANCEL_TURN_DEADLINE, channel_send_error, validate_use
 use super::database::persist_elicitation_turn_inner;
 use super::elicitation::validate_elicitation_content;
 use super::error::DiscussError;
-use super::launch_types::AcpProvider;
 use super::messages::DiscussResponse;
 use super::plugins;
-use super::session::{initialize_request, revoke_worker_jti};
+use super::session::revoke_worker_jti;
 use super::storage::{
     ElicitationPersistenceInput, load_discuss_session, load_session_modes, present_acp_session_id, update_session_modes,
 };
@@ -60,24 +56,6 @@ async fn forward_archive(
         }
     }
     Ok(())
-}
-
-async fn archive_provider_session_short_lived(
-    provider: &AcpProvider,
-    session_id: String,
-    archived: bool,
-) -> Result<(), DiscussError> {
-    let agent_key = json_to_string(provider.server())?;
-    let agent = AcpAgent::from_str(&agent_key)?;
-    Client
-        .v1()
-        .name("acp-session-archive")
-        .connect_with(agent, move |cx: ConnectionTo<Agent>| async move {
-            let initialized = cx.send_request(initialize_request()).block_task().await?;
-            forward_archive(&cx, &initialized.agent_capabilities, session_id, archived).await
-        })
-        .await
-        .map_err(DiscussError::from)
 }
 
 impl Actor {
@@ -139,8 +117,8 @@ impl Actor {
                     .map(|supervisor| &supervisor.resources)
                 {
                     forward_archive(connection, capabilities, session_id, archived).await?;
-                } else if let Some(provider) = self.agents.get(&row.agent_name) {
-                    archive_provider_session_short_lived(provider, session_id, archived).await?;
+                } else {
+                    tracing::debug!(%discuss_session_id, provider = %row.agent_name, archived, "No running provider connection; archive state kept locally only");
                 }
             }
         }
@@ -350,7 +328,9 @@ impl Actor {
         if !self.server_running {
             return Err(DiscussError::ShuttingDown);
         }
+        // A cancel always leaves the session idle, even when no live turn is left to stop.
         let Some(entry) = self.worker_registry.get(&discuss_session_id) else {
+            self.publish_turn_ended(discuss_session_id).await;
             return Ok(DiscussResponse::Success);
         };
         let command_tx = entry.command_tx.clone();
@@ -365,6 +345,7 @@ impl Actor {
                 channel_send_error("handle_cancel_turn.worker_command", "worker command channel closed"),
             )
             .await;
+            self.publish_turn_ended(discuss_session_id).await;
             return Ok(DiscussResponse::Success);
         }
         match timeout(CANCEL_TURN_DEADLINE, reply_rx).await {
@@ -382,7 +363,7 @@ impl Actor {
                 .await;
             }
         }
-
+        self.publish_turn_ended(discuss_session_id).await;
         Ok(DiscussResponse::Success)
     }
 
@@ -401,7 +382,7 @@ impl Actor {
         } else {
             Ok(())
         };
-        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
+        if let Some(entry) = self.remove_worker(&discuss_session_id).await {
             let _ = entry.command_tx.send(WorkerCommand::Stop).await;
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "session cancellation").await;
         }
@@ -523,7 +504,7 @@ impl Actor {
     /// Remove a cancellation worker that can no longer acknowledge commands and
     /// publish the same terminal failure path used by normal worker failures.
     async fn recover_cancel_turn_worker(&mut self, discuss_session_id: DiscussSessionId, error: DiscussError) {
-        if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
+        if let Some(entry) = self.remove_worker(&discuss_session_id).await {
             entry.join_handle.abort();
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "cancel-turn recovery").await;
         }

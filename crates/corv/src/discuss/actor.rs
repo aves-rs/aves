@@ -5,10 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::Agent;
-use agent_client_protocol::v1::{
-    ConnectionTo,
-    schema::{AgentCapabilities, SessionId},
-};
+use agent_client_protocol::v1::{ConnectionTo, schema::AgentCapabilities};
 use semver::Version;
 use serde_json::from_str;
 use tokio::select;
@@ -47,7 +44,7 @@ use super::session::{
     SessionCapabilitiesCache, WorkerReady, revoke_worker_jti,
 };
 use super::storage::{
-    CustomInstallationKind, DiscussAgentConfigRow, DiscussPersistence, load_discuss_agent_config, load_discuss_session,
+    CustomInstallationKind, DiscussPersistence, load_discuss_agent_config, load_discuss_session,
     load_discuss_team_installation, present_acp_session_id, upsert_discuss_agent_config,
 };
 use super::supervisor::{CallbackRouteRegistry, ProviderSupervisor};
@@ -69,16 +66,10 @@ pub(super) struct SpawnSessionOptions {
     pub(super) session_config_overrides: BTreeMap<String, String>,
     pub(super) acp_session_id: Option<String>,
     pub(super) announce_desktop_association: bool,
-    pub(super) transient_connectivity: bool,
     pub(super) session_cwd: Option<PathBuf>,
     pub(super) application_mcp_enabled: Option<bool>,
     pub(super) node_token: Option<Jwt>,
     pub(super) flow_mcp_endpoints: Option<Vec<BusMcpEndpoint>>,
-}
-
-pub(super) struct TransientWorkerEvent {
-    pub(super) discuss_session_id: DiscussSessionId,
-    pub(super) result: Result<(SessionId, Option<Vec<DiscussConfigOption>>), DiscussError>,
 }
 
 pub(super) struct SharedProviderEvent {
@@ -89,6 +80,8 @@ pub(super) struct SharedProviderEvent {
 pub(super) struct ProviderRestartReady {
     pub(super) provider_name: String,
     pub(super) generation: u64,
+    /// Sessions that had a live worker when the connection exited; only these are reopened.
+    pub(super) live_sessions: Vec<DiscussSessionId>,
 }
 
 /// Result of establishing the one connection owned by a shared Provider.
@@ -98,14 +91,6 @@ pub(super) struct SharedConnectionReady {
     pub(super) exit_rx: oneshot::Receiver<()>,
     pub(super) capabilities: AgentCapabilities,
     pub(super) callback_routes: Arc<Mutex<CallbackRouteRegistry>>,
-}
-
-pub(super) struct PendingProviderTest {
-    pub(super) provider_name: String,
-    pub(super) candidate: AcpProvider,
-    pub(super) previous_provider: Option<AcpProvider>,
-    pub(super) previous_config: Option<DiscussAgentConfigRow>,
-    pub(super) reply_to: oneshot::Sender<Result<DiscussResponse, DiscussError>>,
 }
 
 /// Discuss actor that owns session state.
@@ -189,11 +174,6 @@ pub(super) struct Actor {
     /// Sender for ready-worker notifications, cloned into each worker.
     pub(super) worker_ready_tx: mpsc::Sender<WorkerReady>,
 
-    /// Receiver for internal transient provider connectivity results.
-    pub(super) transient_worker_rx: mpsc::Receiver<TransientWorkerEvent>,
-
-    /// Sender cloned into transient workers.
-    pub(super) transient_worker_tx: mpsc::Sender<TransientWorkerEvent>,
     pub(super) import_completion_tx: mpsc::Sender<ImportCompletion>,
     pub(super) import_completion_rx: mpsc::Receiver<ImportCompletion>,
     pub(super) next_import_key: u64,
@@ -232,9 +212,6 @@ pub(super) struct Actor {
 
     /// Pending elicitation requests keyed by `(discuss_session_id, elicitation_request_id)`.
     pub(super) pending_elicitations: HashMap<(DiscussSessionId, ElicitationRequestId), PendingElicitation>,
-
-    /// Deferred AddProvider replies keyed by their transient worker identity.
-    pub(super) pending_provider_tests: HashMap<DiscussSessionId, PendingProviderTest>,
 
     /// Authoritative lifecycle state for ACP sessions.
     pub(super) server_running: bool,
@@ -351,7 +328,6 @@ impl Actor {
             mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
         let (activity_update_tx, activity_update_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
-        let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (import_completion_tx, import_completion_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (pending_permission_cancel_tx, pending_permission_cancel_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -406,8 +382,6 @@ impl Actor {
             activity_update_tx,
             worker_ready_rx,
             worker_ready_tx,
-            transient_worker_rx,
-            transient_worker_tx,
             import_completion_tx,
             import_completion_rx,
             next_import_key: 0,
@@ -422,7 +396,6 @@ impl Actor {
             pending_elicitation_cancel_rx,
             pending_elicitation_cancel_tx,
             pending_elicitations: HashMap::new(),
-            pending_provider_tests: HashMap::new(),
             server_running: false,
             price_index: PriceIndex::default(),
             allowance_snapshot: None,
@@ -457,28 +430,24 @@ impl Actor {
             provider_spec,
         } = &payload
         {
-            if let Err(error) = self
-                .handle_add_provider_request(provider_name.clone(), provider_spec.clone(), reply_to, false)
-                .await
-            {
-                tracing::debug!(target: "application_acp", ?error, "provider request failed");
-            }
+            let result = self
+                .handle_add_provider_request(provider_name.clone(), provider_spec.clone(), false)
+                .await;
+            let _ = reply_to.send(result);
             return;
         }
 
         if let DiscussRequestPayload::RefreshProviderConfig { provider_name } = &payload {
-            let Some(provider_spec) = self.agents.get(provider_name).cloned() else {
-                let _ = reply_to.send(Err(DiscussError::UnknownAgent {
+            let result = match self.agents.get(provider_name).cloned() {
+                Some(provider_spec) => {
+                    self.handle_add_provider_request(provider_name.clone(), provider_spec, true)
+                        .await
+                }
+                None => Err(DiscussError::UnknownAgent {
                     agent_key: provider_name.clone(),
-                }));
-                return;
+                }),
             };
-            if let Err(error) = self
-                .handle_add_provider_request(provider_name.clone(), provider_spec, reply_to, true)
-                .await
-            {
-                tracing::debug!(target: "application_acp", ?error, "provider config refresh failed");
-            }
+            let _ = reply_to.send(result);
             return;
         }
 
@@ -812,7 +781,6 @@ impl Actor {
                             session_config_overrides,
                             acp_session_id: None,
                             announce_desktop_association: true,
-                            transient_connectivity: false,
                             session_cwd,
                             application_mcp_enabled,
                             node_token: None,
@@ -842,7 +810,6 @@ impl Actor {
                         session_config_overrides: BTreeMap::new(),
                         acp_session_id: None,
                         announce_desktop_association: true,
-                        transient_connectivity: false,
                         session_cwd,
                         application_mcp_enabled,
                         node_token: None,
@@ -871,7 +838,6 @@ impl Actor {
                         session_config_overrides: BTreeMap::new(),
                         acp_session_id: Some(provider_session_id),
                         announce_desktop_association: true,
-                        transient_connectivity: false,
                         session_cwd,
                         application_mcp_enabled,
                         node_token: None,
@@ -1035,9 +1001,6 @@ impl Actor {
             match self.start_provider_supervisor(&provider_name, true).await {
                 Ok(true) => {
                     self.publish_provider_runtime(&provider_name).await;
-                    if was_running {
-                        self.recover_provider_sessions(&provider_name).await;
-                    }
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -1059,6 +1022,33 @@ impl Actor {
                 .await;
         }
         Ok(DiscussResponse::Success)
+    }
+
+    /// Removes a session's worker entry. A turn it had in flight can never finish, so subscribers
+    /// are told the turn ended instead of waiting on a stop reason that will not arrive.
+    pub(super) async fn remove_worker(&mut self, discuss_session_id: &DiscussSessionId) -> Option<WorkerEntry> {
+        let entry = self.worker_registry.remove(discuss_session_id)?;
+        if entry.active_turn {
+            self.publish_turn_ended(*discuss_session_id).await;
+        }
+        Some(entry)
+    }
+
+    /// Marks a session's turn as over and broadcasts it, whether or not a worker is live.
+    pub(super) async fn publish_turn_ended(&mut self, discuss_session_id: DiscussSessionId) {
+        if let Some(entry) = self.worker_registry.get_mut(&discuss_session_id) {
+            entry.active_turn = false;
+        }
+        if let Err(error) = self
+            .broadcast_tx
+            .send(DiscussResponse::SessionActivity {
+                discuss_session_id,
+                active: false,
+            })
+            .await
+        {
+            tracing::warn!(%discuss_session_id, %error, "Failed to broadcast the end of a dropped turn");
+        }
     }
 
     /// Reattaches a saved, non-task session that has no live worker, so worker-bound commands
@@ -1104,7 +1094,6 @@ impl Actor {
                 session_config_overrides: BTreeMap::new(),
                 acp_session_id: Some(acp_session_id),
                 announce_desktop_association: false,
-                transient_connectivity: false,
                 session_cwd: None,
                 application_mcp_enabled: None,
                 node_token: None,
@@ -1291,15 +1280,6 @@ impl Actor {
             revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
         }
         self.worker_capabilities.clear();
-        let pending_tests: Vec<_> = self
-            .pending_provider_tests
-            .drain()
-            .map(|(_, pending)| pending)
-            .collect();
-        for pending in pending_tests {
-            let reply = self.restore_provider_test_snapshot(pending, false).await;
-            let _ = reply.send(Err(DiscussError::ShuttingDown));
-        }
 
         if was_running {
             self.publish_server_status(DiscussResponse::ServerStopped)
@@ -1390,13 +1370,18 @@ pub(super) async fn run_actor(mut actor: Actor) {
                 }
             }
             Some((discuss_session_id, active)) = actor.activity_update_rx.recv() => {
-                if let Some(entry) = actor.worker_registry.get_mut(&discuss_session_id).filter(|entry| !entry.join_handle.is_finished()) {
-                    entry.active_turn = active;
-                    if let Err(error) = actor.broadcast_tx.send(DiscussResponse::SessionActivity { discuss_session_id, active }).await {
-                        tracing::warn!(%discuss_session_id, %error, "Failed to broadcast session activity");
+                match actor.worker_registry.get_mut(&discuss_session_id) {
+                    Some(entry) if !entry.join_handle.is_finished() => {
+                        entry.active_turn = active;
+                        if let Err(error) = actor.broadcast_tx.send(DiscussResponse::SessionActivity { discuss_session_id, active }).await {
+                            tracing::warn!(%discuss_session_id, %error, "Failed to broadcast session activity");
+                        }
                     }
-                } else {
-                    tracing::debug!(%discuss_session_id, "Ignoring activity from absent or finished worker");
+                    // A stopped worker's turn is over; only that ending is still worth reporting.
+                    Some(entry) if !active && entry.active_turn => {
+                        actor.publish_turn_ended(discuss_session_id).await;
+                    }
+                    _ => tracing::debug!(%discuss_session_id, "Ignoring activity from absent or finished worker"),
                 }
             }
             Some(event) = actor.shared_provider_event_rx.recv() => {
@@ -1405,14 +1390,8 @@ pub(super) async fn run_actor(mut actor: Actor) {
             Some(event) = actor.provider_restart_ready_rx.recv() => {
                 actor.handle_shared_provider_restart_ready(event).await;
             }
-            Some(WorkerReady { discuss_session_id, acp_session_id, announce_desktop_association, transient_connectivity, config_options, supports_config_updates }) = actor.worker_ready_rx.recv() => {
+            Some(WorkerReady { discuss_session_id, acp_session_id, announce_desktop_association, supports_config_updates }) = actor.worker_ready_rx.recv() => {
                 if !actor.server_running {
-                    continue;
-                }
-                if transient_connectivity {
-                    actor
-                        .finish_provider_test(discuss_session_id, Ok(config_options))
-                        .await;
                     continue;
                 }
                 // Update the worker entry with the provider ACP session id.
@@ -1432,11 +1411,6 @@ pub(super) async fn run_actor(mut actor: Actor) {
                 {
                     tracing::warn!(target: "application_acp", ?error, "could not announce ready Discuss desktop association");
                 }
-            }
-            Some(TransientWorkerEvent { discuss_session_id, result }) = actor.transient_worker_rx.recv() => {
-                actor
-                    .finish_provider_test(discuss_session_id, result.map(|(_, options)| options))
-                    .await;
             }
             // Pending permission registration from a worker. The worker sends
             // this before publishing the stream event so the actor's registry

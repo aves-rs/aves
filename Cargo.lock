@@ -7729,8 +7729,8 @@ dependencies = [
 
 [[package]]
 name = "quota-core"
-version = "0.3.1"
-source = "git+https://github.com/cortexkit/insula?tag=v0.3.1#97b7fa28b042fac49ef8a89a2884421ec33161fa"
+version = "0.4.0"
+source = "git+https://github.com/cortexkit/insula?tag=v0.4.0#e87a49a6c1ca2912677e717d478b65c5909bc626"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

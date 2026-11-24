@@ -14,7 +14,7 @@ use aves::bus::BusMcpEndpoint;
 use aves::runtime::ServiceReader;
 use aves::utils::buffers::DEFAULT_BUFFER_SIZE;
 
-use super::actor::{Actor, SpawnSessionOptions, TransientWorkerEvent};
+use super::actor::{Actor, SpawnSessionOptions};
 use super::config::{config_options_from_json, config_settings_from_json, config_settings_from_value};
 use super::database::persist_session_anchor_inner;
 use super::error::DiscussError;
@@ -127,7 +127,6 @@ struct SessionWorkerInputs<'a> {
     node_token: Option<Jwt>,
     agent_defaults: ConfigSettings,
     announce_desktop_association: bool,
-    transient_connectivity: bool,
     shared: SharedWorkerResources,
 }
 
@@ -153,12 +152,11 @@ struct ResolvedLaunchInputs {
 }
 
 impl Actor {
-    fn ensure_provider_accepts_session(&self, key: &str, transient_connectivity: bool) -> Result<(), DiscussError> {
-        if !transient_connectivity
-            && !self
-                .provider_supervisors
-                .get(key)
-                .is_some_and(ProviderSupervisor::accepts_work)
+    fn ensure_provider_accepts_session(&self, key: &str) -> Result<(), DiscussError> {
+        if !self
+            .provider_supervisors
+            .get(key)
+            .is_some_and(ProviderSupervisor::accepts_work)
         {
             return Err(DiscussError::ProviderNotRunning {
                 provider_name: key.to_string(),
@@ -180,7 +178,7 @@ impl Actor {
             .get(&discuss_session_id)
             .is_some_and(|entry| entry.command_tx.is_closed())
         {
-            if let Some(entry) = self.worker_registry.remove(&discuss_session_id) {
+            if let Some(entry) = self.remove_worker(&discuss_session_id).await {
                 revoke_worker_jti(self.auth_service.as_ref(), entry.worker_jti, "transient").await;
                 if let Some(supervisor) = self.provider_supervisors.get_mut(&entry.agent_name) {
                     supervisor.disassociate_chat(&discuss_session_id);
@@ -219,7 +217,7 @@ impl Actor {
                 agent_key: key.to_string(),
             });
         };
-        self.ensure_provider_accepts_session(key, options.transient_connectivity)?;
+        self.ensure_provider_accepts_session(key)?;
         let launch = self
             .resolve_launch_inputs(discuss_session_id, &options)
             .await?;
@@ -228,7 +226,6 @@ impl Actor {
             setup,
             session_config_overrides,
             announce_desktop_association,
-            transient_connectivity,
             node_token,
             flow_mcp_endpoints,
             ..
@@ -242,7 +239,7 @@ impl Actor {
             mut session_settings,
             restored_setup,
         ) = self
-            .load_session_restore_state(discuss_session_id, transient_connectivity, reconnect)
+            .load_session_restore_state(discuss_session_id, reconnect)
             .await?;
         // Restore the setup before materializing the session's launch configuration.
         let setup = if reconnect { restored_setup } else { setup };
@@ -268,19 +265,17 @@ impl Actor {
         let shared = self.shared_worker_resources(key, prepared.isolated_configured);
         let configured_defaults = config_settings_from_value(agent_spec.default_session_config());
         let (next_usage_ordinal, agent_defaults) = self
-            .session_agent_defaults(discuss_session_id, key, configured_defaults, transient_connectivity)
+            .session_agent_defaults(discuss_session_id, key, configured_defaults)
             .await?;
-        if !transient_connectivity {
-            self.persist_session_launch(
-                discuss_session_id,
-                key,
-                &session_name,
-                node_token.is_some(),
-                &prepared,
-                &launch,
-            )
-            .await?;
-        }
+        self.persist_session_launch(
+            discuss_session_id,
+            key,
+            &session_name,
+            node_token.is_some(),
+            &prepared,
+            &launch,
+        )
+        .await?;
         if !reconnect {
             session_settings.extend(prepared.setup_settings);
         }
@@ -312,7 +307,6 @@ impl Actor {
             node_token,
             agent_defaults,
             announce_desktop_association,
-            transient_connectivity,
             shared,
         })
         .await
@@ -324,15 +318,6 @@ impl Actor {
         discuss_session_id: DiscussSessionId,
         options: &SpawnSessionOptions,
     ) -> Result<ResolvedLaunchInputs, DiscussError> {
-        if options.transient_connectivity {
-            return Ok(ResolvedLaunchInputs {
-                reconnect_acp_session_id: None,
-                provider_title: None,
-                launch_config: options.launch_config.clone(),
-                session_cwd: options.session_cwd.clone(),
-                application_mcp_enabled: options.application_mcp_enabled,
-            });
-        }
         // NewSession is keyed only by the caller-owned id. Resolve the provider recovery id from
         // the persisted anchor rather than accepting one from Zeus or Hades.
         let acp_session_id = self
@@ -413,13 +398,9 @@ impl Actor {
         discuss_session_id: DiscussSessionId,
         key: &str,
         configured_defaults: ConfigSettings,
-        transient_connectivity: bool,
     ) -> Result<(i64, ConfigSettings), DiscussError> {
         let conn = self.persistence.acquire_connection().await?;
         let next_usage_ordinal = next_usage_ordinal(&conn, &discuss_session_id.to_string()).await?;
-        if transient_connectivity {
-            return Ok((next_usage_ordinal, configured_defaults));
-        }
         let agent_defaults = load_discuss_agent_config(&conn, key)
             .await?
             .map(|row| config_settings_from_json(&row.default_config_json))
@@ -475,7 +456,6 @@ impl Actor {
         let discuss_session_id = inputs.discuss_session_id;
         let key = inputs.key;
         let announce_desktop_association = inputs.announce_desktop_association;
-        let transient_connectivity = inputs.transient_connectivity;
         if inputs.node_token.is_some() {
             inputs.shared.shared_mcp_registrations = None;
         }
@@ -485,7 +465,6 @@ impl Actor {
                 key,
                 inputs.assigned_agent_name.as_deref(),
                 inputs.node_token.take(),
-                transient_connectivity,
             )
             .await?;
 
@@ -515,7 +494,6 @@ impl Actor {
             workspace_for_reporting,
             self.auth_service.clone(),
             worker_jti,
-            transient_connectivity.then(|| self.transient_worker_tx.clone()),
             self.pending_elicitation_cancel_tx.clone(),
             self.stream_tx.clone(),
         ));
@@ -532,7 +510,7 @@ impl Actor {
                 desktop_association_requested: announce_desktop_association,
             },
         );
-        if !transient_connectivity && let Some(supervisor) = self.provider_supervisors.get_mut(key) {
+        if let Some(supervisor) = self.provider_supervisors.get_mut(key) {
             supervisor.associate_chat(discuss_session_id);
             if let ProviderSupervisorResources::Isolated { child_sessions, .. } = &mut supervisor.resources {
                 child_sessions.insert(discuss_session_id);
@@ -550,7 +528,6 @@ impl Actor {
         key: &str,
         assigned_agent_name: Option<&str>,
         node_token: Option<Jwt>,
-        transient_connectivity: bool,
     ) -> Result<(Jwt, Option<Uuid>), DiscussError> {
         if let Some(node_token) = node_token {
             return Ok((node_token, None));
@@ -562,19 +539,18 @@ impl Actor {
         )
         .await?;
         let subject = worker_subject(discuss_session_id);
-        if !transient_connectivity
-            && let Err(error) = persist_binding(
-                &self.persistence,
-                Binding {
-                    token: &worker_auth.token,
-                    subject: &subject,
-                    session_id: discuss_session_id,
-                    provider: assigned_agent_name.map(|_| key),
-                    agent: assigned_agent_name,
-                    node_id: None,
-                },
-            )
-            .await
+        if let Err(error) = persist_binding(
+            &self.persistence,
+            Binding {
+                token: &worker_auth.token,
+                subject: &subject,
+                session_id: discuss_session_id,
+                provider: assigned_agent_name.map(|_| key),
+                agent: assigned_agent_name,
+                node_id: None,
+            },
+        )
+        .await
         {
             revoke_worker_jti(self.auth_service.as_ref(), Some(worker_auth.jti), "identity binding").await;
             return Err(error);
@@ -638,7 +614,6 @@ impl Actor {
             pending_elicitation_tx: self.pending_elicitation_tx.clone(),
             pending_elicitation_cancel_tx: self.pending_elicitation_cancel_tx.clone(),
             announce_desktop_association: inputs.announce_desktop_association,
-            transient_connectivity: inputs.transient_connectivity,
             callback_router,
             callback_routes,
             shared_connection,
@@ -786,7 +761,6 @@ impl Actor {
     async fn load_session_restore_state(
         &self,
         discuss_session_id: DiscussSessionId,
-        transient_connectivity: bool,
         reconnect: bool,
     ) -> Result<
         (
@@ -798,9 +772,7 @@ impl Actor {
         ),
         DiscussError,
     > {
-        Ok(if transient_connectivity {
-            (false, 0, Vec::new(), ConfigSettings::new(), None)
-        } else if reconnect {
+        Ok(if reconnect {
             let conn = self.persistence.acquire_connection().await?;
             let turns = load_discuss_chat_turns_window(&conn, &discuss_session_id.to_string()).await?;
             let row = load_discuss_session(&conn, &discuss_session_id.to_string()).await?;
@@ -922,14 +894,16 @@ async fn run_session_worker_with_reporting(
     agents_workspace: PathBuf,
     auth_service: Option<ServiceReader<dyn AuthSudoService>>,
     worker_jti: Option<Uuid>,
-    transient_worker_tx: Option<mpsc::Sender<TransientWorkerEvent>>,
     pending_elicitation_cancel_tx: mpsc::Sender<PendingElicitationCancel>,
     stream_tx: mpsc::Sender<DiscussStreamEvent>,
 ) {
     tracing::info!(%discuss_session_id, provider = %agent_name, cwd = %agents_workspace.display(), "Discuss session worker started");
+    let activity_update_tx = params.activity_update_tx.clone();
     let result = run_session_worker(agent, params).await;
 
     tracing::info!(%discuss_session_id, failed = result.is_err(), "Discuss session worker stopped");
+    // A stopped worker finishes no turn; the actor reports the end only if one was in flight.
+    let _ = activity_update_tx.send((discuss_session_id, false)).await;
 
     if let Err(failure) = &result {
         tracing::debug!(%discuss_session_id, error = %failure.error, "Discuss session worker failure");
@@ -943,39 +917,30 @@ async fn run_session_worker_with_reporting(
         } = error;
         let error = *error;
         tracing::warn!(?error, "Discuss session worker stopped");
-        if let Some(transient_worker_tx) = transient_worker_tx {
-            let _ = transient_worker_tx
-                .send(TransientWorkerEvent {
-                    discuss_session_id,
-                    result: Err(error),
-                })
-                .await;
-        } else {
-            let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
-            if pending_elicitation_cancel_tx
-                .send(PendingElicitationCancel {
-                    discuss_session_id,
-                    elicitation_request_id: None,
-                    cancellation_ack,
-                })
-                .await
-                .is_ok()
-            {
-                let _ = cancellation_ack_rx.await;
-            }
-            if let Err(send_error) = stream_tx
-                .send(DiscussStreamEvent::SessionFailed {
-                    discuss_session_id,
-                    error,
-                    terminal_auth_methods,
-                })
-                .await
-            {
-                tracing::warn!(
-                    ?send_error,
-                    "Discuss session failure could not reach the desktop bridge"
-                );
-            }
+        let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
+        if pending_elicitation_cancel_tx
+            .send(PendingElicitationCancel {
+                discuss_session_id,
+                elicitation_request_id: None,
+                cancellation_ack,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = cancellation_ack_rx.await;
+        }
+        if let Err(send_error) = stream_tx
+            .send(DiscussStreamEvent::SessionFailed {
+                discuss_session_id,
+                error,
+                terminal_auth_methods,
+            })
+            .await
+        {
+            tracing::warn!(
+                ?send_error,
+                "Discuss session failure could not reach the desktop bridge"
+            );
         }
     }
 }

@@ -712,10 +712,21 @@ impl Actor {
                 provider_name,
                 member_overrides,
                 theme_color,
-            } => {
-                self.handle_install_team(leader_id, provider_name, member_overrides, theme_color)
+                root,
+            } => match root {
+                Some(root) if self.agents.contains_key(&provider_name) => self
+                    .materialize_custom_team_at_root(&provider_name, &root, &leader_id, None)
                     .await
-            }
+                    .map(|()| DiscussResponse::InstallTeam { warnings: Vec::new() }),
+                Some(_) => Err(DiscussError::WorkspaceInvalidAssetId {
+                    asset_id: provider_name,
+                    violation: "provider is not installed".to_string(),
+                }),
+                None => {
+                    self.handle_install_team(leader_id, provider_name, member_overrides, theme_color)
+                        .await
+                }
+            },
             DiscussRequestPayload::EditTeam {
                 leader_id,
                 provider_name,

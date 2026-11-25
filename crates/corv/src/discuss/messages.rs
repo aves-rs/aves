@@ -578,6 +578,9 @@ pub enum DiscussRequestPayload {
         member_overrides: DiscussMemberOverrides,
         /// User-selected theme color for the Team mark.
         theme_color: Option<AgentThemeColor>,
+        /// Write the team's files under this directory instead, without recording an installation.
+        #[serde(default)]
+        root: Option<PathBuf>,
     },
 
     /// Edit an installed team's provider and/or config selections.

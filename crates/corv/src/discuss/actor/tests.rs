@@ -6233,6 +6233,7 @@ fn discuss_team_requests_serde_roundtrip() {
                 std::collections::BTreeMap::from([("model".to_string(), "gpt-5".to_string())]),
             )]),
             theme_color: Some(AgentThemeColor::Warning),
+            root: None,
         },
         DiscussRequestPayload::EditTeam {
             leader_id: "chief-of-staff".to_string(),

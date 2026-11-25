@@ -1174,10 +1174,20 @@ pub(super) async fn open_configured_session(
                         && (error.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
                             || agent_plugin.is_missing_saved_session(&error, session_id.0.as_ref()))
                     {
-                        tracing::info!(provider = provider_name, acp_code, session_id_status, "Saved ACP session no longer exists");
+                        tracing::info!(
+                            provider = provider_name,
+                            acp_code,
+                            session_id_status,
+                            "Saved ACP session no longer exists"
+                        );
                         DiscussError::ProviderSessionNotFound
                     } else {
-                        tracing::warn!(provider = provider_name, acp_code, session_id_status, "ACP session load failed");
+                        tracing::warn!(
+                            provider = provider_name,
+                            acp_code,
+                            session_id_status,
+                            "ACP session load failed"
+                        );
                         error.into()
                     }
                 })?;

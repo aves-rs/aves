@@ -164,7 +164,10 @@ struct SessionConfigOwnership {
 
 impl DiscussAgentPlugin for OpenCodePlugin {
     fn is_missing_saved_session(&self, error: &agent_client_protocol::Error, session_id: &str) -> bool {
-        let message = error.message.strip_prefix("Invalid params: ").unwrap_or(&error.message);
+        let message = error
+            .message
+            .strip_prefix("Invalid params: ")
+            .unwrap_or(&error.message);
         error.code == agent_client_protocol::ErrorCode::INVALID_PARAMS
             && message.strip_prefix("session not found: ") == Some(session_id)
     }

@@ -599,13 +599,16 @@ fn primary_agent_option_selects_plugin_named_option_before_other_preferences() {
 }
 
 #[test]
-fn primary_agent_option_rejects_unadvertised_agent_or_option() {
+fn primary_agent_option_sends_unlisted_agent_but_rejects_unadvertised_option() {
     let mut mode = config_option("mode", "build", &["build", "chief-of-staff"]);
     mode.category = "mode".to_string();
 
     assert_eq!(
-        primary_agent_option_selection(std::slice::from_ref(&mode), "mode", "unknown-agent"),
-        None
+        primary_agent_option_selection(std::slice::from_ref(&mode), "mode", "unlisted-agent"),
+        Some(ConfigPreferenceSelection {
+            config_id: "mode".to_string(),
+            value: "unlisted-agent".to_string(),
+        })
     );
     assert_eq!(primary_agent_option_selection(&[mode], "agent", "chief-of-staff"), None);
 }
@@ -696,7 +699,6 @@ async fn make_actor(
         mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
     let (activity_update_tx, activity_update_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
-    let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (import_completion_tx, import_completion_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_cancel_tx, pending_permission_cancel_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -754,8 +756,6 @@ async fn make_actor(
         activity_update_tx,
         worker_ready_rx,
         worker_ready_tx,
-        transient_worker_rx,
-        transient_worker_tx,
         import_completion_tx,
         import_completion_rx,
         next_import_key: 0,
@@ -770,7 +770,6 @@ async fn make_actor(
         pending_elicitation_cancel_rx,
         pending_elicitation_cancel_tx,
         pending_elicitations: HashMap::new(),
-        pending_provider_tests: HashMap::new(),
         server_running: true,
         price_index: Default::default(),
         allowance_snapshot: None,
@@ -2020,59 +2019,22 @@ async fn boot_team_upgrade_restores_distinct_member_overrides_and_canonical_snap
     assert_eq!(upgraded.members_json, members_json);
 }
 
+/// Saving a provider never opens a session to check it; with no shared connection it is saved as is.
 #[tokio::test]
-async fn deferred_provider_upsert_success_persists_menu_and_stops_transient_worker() {
+async fn saving_a_provider_opens_no_session() {
     let (bus_requester, mut mock) = MockBus::new(8);
     let (broadcast_tx, _) = mpsc::channel(1);
     let (_, receiver) = mpsc::channel(1);
     let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
     actor.auth_service = Some(test_auth_service());
     let candidate = make_local_mcp_server("cat");
-    let (reply_tx, reply_rx) = oneshot::channel();
-
-    actor
-        .handle_add_provider_request("deferred".to_string(), candidate, reply_tx, false)
-        .await
-        .expect("stage provider connectivity test");
-    let session_id = actor
-        .pending_provider_tests
-        .keys()
-        .next()
-        .expect("pending test")
-        .clone();
-    assert_eq!(
-        actor.worker_registry.len(),
-        1,
-        "deferred path must retain the transient worker until completion"
-    );
 
     let (actor_tx, actor_rx) = oneshot::channel();
     tokio::spawn(async move {
-        actor
-            .worker_ready_tx
-            .send(WorkerReady {
-                discuss_session_id: session_id,
-                acp_session_id: SessionId::from("transient-ready"),
-                announce_desktop_association: false,
-                transient_connectivity: true,
-                config_options: Some(vec![config_option("model", "gpt-5", &["gpt-5"])]),
-                supports_config_updates: true,
-            })
-            .await
-            .expect("send transient ready event");
-        let WorkerReady {
-            discuss_session_id,
-            config_options,
-            ..
-        } = actor
-            .worker_ready_rx
-            .recv()
-            .await
-            .expect("receive transient ready event");
-        actor
-            .finish_provider_test(discuss_session_id, Ok(config_options))
+        let result = actor
+            .handle_add_provider_request("fresh".to_string(), candidate, false)
             .await;
-        assert!(actor_tx.send(actor).is_ok(), "return actor");
+        assert!(actor_tx.send((actor, result)).is_ok(), "return actor");
     });
     let request = mock
         .expect_request::<ConfigDomain, ConfigRequest>(Duration::from_millis(500))
@@ -2084,141 +2046,13 @@ async fn deferred_provider_upsert_success_persists_menu_and_stops_transient_work
         }),
     );
 
-    assert!(matches!(
-        reply_rx.await.expect("deferred reply"),
-        Ok(DiscussResponse::Success)
-    ));
-    let actor = actor_rx.await.expect("actor");
-    assert!(actor.pending_provider_tests.is_empty());
+    let (actor, result) = actor_rx.await.expect("actor");
+    assert!(matches!(result, Ok(DiscussResponse::Success)));
     assert!(
         actor.worker_registry.is_empty(),
-        "transient worker must be stopped and removed"
+        "no session may be opened to check a provider"
     );
-    let conn = actor
-        .persistence
-        .acquire_connection()
-        .await
-        .expect("connection");
-    let config = load_discuss_agent_config(&conn, "deferred")
-        .await
-        .expect("load config")
-        .expect("config row");
-    assert!(
-        config
-            .config_options_json
-            .expect("captured menu")
-            .contains("gpt-5")
-    );
-    assert!(actor.agents.contains_key("deferred"));
-}
-
-#[tokio::test]
-async fn forced_provider_refresh_stages_connectivity_for_an_unchanged_server() {
-    let (bus_requester, _mock) = MockBus::new(8);
-    let (broadcast_tx, _) = mpsc::channel(1);
-    let (_, receiver) = mpsc::channel(1);
-    let provider = make_local_mcp_server("cat");
-    let mut actor = make_actor(
-        receiver,
-        HashMap::from([("existing".to_string(), provider.server().clone())]),
-        bus_requester,
-        broadcast_tx,
-    )
-    .await;
-    actor.auth_service = Some(test_auth_service());
-    let (reply_tx, _reply_rx) = oneshot::channel();
-
-    actor
-        .handle_add_provider_request("existing".to_string(), provider, reply_tx, true)
-        .await
-        .expect("stage forced Provider config refresh");
-
-    assert_eq!(actor.pending_provider_tests.len(), 1);
-    assert_eq!(actor.worker_registry.len(), 1);
-    for (_, entry) in actor.worker_registry.drain() {
-        let _ = entry.command_tx.send(WorkerCommand::Stop).await;
-    }
-}
-
-#[tokio::test]
-async fn deferred_provider_upsert_error_restores_provider_and_menu_and_propagates_original_error() {
-    let (bus_requester, _mock) = MockBus::new(8);
-    let (broadcast_tx, _) = mpsc::channel(1);
-    let (_, receiver) = mpsc::channel(1);
-    let previous = make_local_mcp_server("old-command");
-    let mut actor = make_actor(
-        receiver,
-        HashMap::from([("existing".to_string(), previous.server().clone())]),
-        bus_requester,
-        broadcast_tx,
-    )
-    .await;
-    actor.auth_service = Some(test_auth_service());
-    let conn = actor
-        .persistence
-        .acquire_connection()
-        .await
-        .expect("connection");
-    let previous_options = vec![config_option("old", "old", &[])];
-    let previous_options_json = serde_json::to_string(&previous_options).expect("previous menu JSON");
-    upsert_discuss_agent_config(
-        &conn,
-        "existing",
-        Some(&previous_options),
-        &ConfigSettings::from([("default".to_string(), "saved".to_string())]),
-    )
-    .await
-    .expect("seed previous menu");
-
-    let candidate = make_local_mcp_server("new-command");
-    let (reply_tx, reply_rx) = oneshot::channel();
-    actor
-        .handle_add_provider_request("existing".to_string(), candidate, reply_tx, false)
-        .await
-        .expect("stage provider connectivity test");
-    let session_id = actor
-        .pending_provider_tests
-        .keys()
-        .next()
-        .expect("pending test")
-        .clone();
-    let original_error = DiscussError::Validation {
-        message: "connection refused".to_string(),
-    };
-    actor
-        .transient_worker_tx
-        .send(TransientWorkerEvent {
-            discuss_session_id: session_id,
-            result: Err(original_error),
-        })
-        .await
-        .expect("send transient error event");
-    let event = actor
-        .transient_worker_rx
-        .recv()
-        .await
-        .expect("receive transient error event");
-    actor
-        .finish_provider_test(event.discuss_session_id, event.result.map(|(_, options)| options))
-        .await;
-
-    assert!(
-        matches!(reply_rx.await.expect("deferred reply"), Err(DiscussError::Validation { message }) if message == "connection refused")
-    );
-    assert!(actor.pending_provider_tests.is_empty());
-    assert!(actor.worker_registry.is_empty());
-    assert_eq!(
-        serde_json::to_value(actor.agents["existing"].server()).expect("old server JSON"),
-        serde_json::to_value(previous.server()).expect("old server JSON")
-    );
-    let config = load_discuss_agent_config(&conn, "existing")
-        .await
-        .expect("load restored config")
-        .expect("config row");
-    assert_eq!(
-        config.config_options_json.as_deref(),
-        Some(previous_options_json.as_str())
-    );
+    assert!(actor.agents.contains_key("fresh"));
 }
 
 fn pending_permission(option_ids: &[&str]) -> (PendingPermission, oneshot::Receiver<DiscussPermissionOption>) {
@@ -3471,7 +3305,6 @@ async fn spawn_session_returns_error_for_unknown_agent_key() {
                 session_config_overrides: std::collections::BTreeMap::new(),
                 acp_session_id: None,
                 announce_desktop_association: true,
-                transient_connectivity: false,
                 session_cwd: None,
                 application_mcp_enabled: None,
                 node_token: None,
@@ -3716,7 +3549,6 @@ async fn make_migrated_actor(
         mpsc::channel::<(DiscussSessionId, SessionCapabilitiesCache)>(DEFAULT_BUFFER_SIZE);
     let (activity_update_tx, activity_update_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (worker_ready_tx, worker_ready_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
-    let (transient_worker_tx, transient_worker_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (import_completion_tx, import_completion_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_tx, pending_permission_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
     let (pending_permission_cancel_tx, pending_permission_cancel_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
@@ -3759,8 +3591,6 @@ async fn make_migrated_actor(
         activity_update_tx,
         worker_ready_rx,
         worker_ready_tx,
-        transient_worker_rx,
-        transient_worker_tx,
         import_completion_tx,
         import_completion_rx,
         next_import_key: 0,
@@ -3775,7 +3605,6 @@ async fn make_migrated_actor(
         pending_elicitation_cancel_rx,
         pending_elicitation_cancel_tx,
         pending_elicitations: HashMap::new(),
-        pending_provider_tests: HashMap::new(),
         server_running: true,
         price_index: Default::default(),
         allowance_snapshot: None,
@@ -4713,6 +4542,31 @@ async fn assistant_turn_persists_at_stop_boundary_and_loads_after_reseed() {
     assert_eq!(parts[1]["update"]["toolCallId"], "tool-1");
     assert_eq!(parts[2]["kind"], "thought");
     assert_eq!(parts[3]["kind"], "text");
+}
+
+/// With no live worker a load returns the saved transcript and contacts no provider.
+#[tokio::test]
+async fn load_without_a_worker_returns_saved_history_without_the_provider() {
+    let (persistence, _temp) = persistence_with_notnull_schema().await;
+    let discuss_session_id = DiscussSessionId::new();
+    let sid = discuss_session_id.to_string();
+    persist_session_open(&persistence, &sid, "acp-saved").await;
+    persist_initial_turn(&persistence, &sid, "acp-saved", "user text").await;
+
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, _) = mpsc::channel(1);
+    let (mut actor, _reboot_temp) = make_migrated_actor(bus_requester, broadcast_tx).await;
+    actor.persistence = persistence.clone();
+    let response = actor
+        .handle_load_session(discuss_session_id)
+        .await
+        .expect("saved history loads without a provider");
+
+    let DiscussResponse::SessionLoad { turns, .. } = response else {
+        panic!("expected a session load");
+    };
+    assert_eq!(turns.len(), 1);
+    assert!(actor.worker_registry.is_empty());
 }
 
 #[test]
@@ -5841,8 +5695,6 @@ async fn warm_worker_readiness_does_not_emit_premature_desktop_association() {
             discuss_session_id: warm_id,
             acp_session_id: SessionId::from("provider-warm"),
             announce_desktop_association: false,
-            transient_connectivity: false,
-            config_options: None,
             supports_config_updates: false,
         })
         .await
@@ -5856,8 +5708,6 @@ async fn warm_worker_readiness_does_not_emit_premature_desktop_association() {
             discuss_session_id: new_id,
             acp_session_id: SessionId::from("provider-new"),
             announce_desktop_association: true,
-            transient_connectivity: false,
-            config_options: None,
             supports_config_updates: false,
         })
         .await
@@ -5906,7 +5756,6 @@ async fn desktop_attach_reuses_ready_warmed_worker() {
                 session_config_overrides: std::collections::BTreeMap::new(),
                 acp_session_id: Some("provider-session".to_string()),
                 announce_desktop_association: true,
-                transient_connectivity: false,
                 session_cwd: None,
                 application_mcp_enabled: None,
                 node_token: None,
@@ -5959,7 +5808,6 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
                 session_config_overrides: std::collections::BTreeMap::new(),
                 acp_session_id: Some("provider-session".to_string()),
                 announce_desktop_association: true,
-                transient_connectivity: false,
                 session_cwd: None,
                 application_mcp_enabled: None,
                 node_token: None,
@@ -5985,8 +5833,6 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
             discuss_session_id,
             acp_session_id: SessionId::from("provider-session"),
             announce_desktop_association: false,
-            transient_connectivity: false,
-            config_options: None,
             supports_config_updates: false,
         })
         .await
@@ -6387,6 +6233,7 @@ fn discuss_team_requests_serde_roundtrip() {
                 std::collections::BTreeMap::from([("model".to_string(), "gpt-5".to_string())]),
             )]),
             theme_color: Some(AgentThemeColor::Warning),
+            root: None,
         },
         DiscussRequestPayload::EditTeam {
             leader_id: "chief-of-staff".to_string(),
@@ -7223,4 +7070,47 @@ async fn remove_session_removes_locally_when_provider_delete_fails() {
             .expect("load")
             .is_none()
     );
+}
+
+/// Removing a worker mid-turn tells subscribers the turn ended; an idle worker reports nothing.
+#[tokio::test]
+async fn removing_a_worker_mid_turn_publishes_the_turn_end() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, mut broadcasts) = mpsc::channel(4);
+    let (_, receiver) = mpsc::channel(1);
+    let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
+    let busy = DiscussSessionId::new();
+    let idle = DiscussSessionId::new();
+    for (id, active_turn) in [(busy, true), (idle, false)] {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let mut entry = test_worker_entry(command_tx, tokio::spawn(async {}));
+        entry.active_turn = active_turn;
+        actor.worker_registry.insert(id, entry);
+    }
+
+    assert!(actor.remove_worker(&idle).await.is_some());
+    assert!(broadcasts.try_recv().is_err());
+    assert!(actor.remove_worker(&busy).await.is_some());
+    assert!(matches!(
+        broadcasts.try_recv(),
+        Ok(DiscussResponse::SessionActivity { discuss_session_id, active: false }) if discuss_session_id == busy
+    ));
+}
+
+/// Cancelling a session with no live turn still leaves subscribers with an idle session.
+#[tokio::test]
+async fn cancel_without_a_live_turn_publishes_idle() {
+    let (bus_requester, _mock) = MockBus::new(8);
+    let (broadcast_tx, mut broadcasts) = mpsc::channel(4);
+    let (_, receiver) = mpsc::channel(1);
+    let mut actor = make_actor(receiver, HashMap::new(), bus_requester, broadcast_tx).await;
+    let discuss_session_id = DiscussSessionId::new();
+
+    let result = actor.handle_cancel_turn(discuss_session_id).await;
+
+    assert!(matches!(result, Ok(DiscussResponse::Success)));
+    assert!(matches!(
+        broadcasts.try_recv(),
+        Ok(DiscussResponse::SessionActivity { discuss_session_id: id, active: false }) if id == discuss_session_id
+    ));
 }

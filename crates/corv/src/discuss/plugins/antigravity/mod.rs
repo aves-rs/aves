@@ -12,8 +12,8 @@ use serde_json::Value;
 use super::super::error::DiscussError;
 use super::super::launch_types::{SessionCliLogin, SessionLaunchConfig};
 use super::super::library::{
-    AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
-    TeamDefinition,
+    AgentId, AgentRole, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
+    SkillDefinition, SkillId, TeamDefinition,
 };
 use super::files::{RenderedFile, write_rendered_files};
 use super::{
@@ -156,9 +156,10 @@ impl DiscussAgentPlugin for AntigravityPlugin {
         &self,
         root: &Path,
         agent: &CustomAgentDefinition,
+        role: Option<AgentRole>,
         member_settings: Option<&ConfigSettings>,
     ) -> Result<(), DiscussError> {
-        let file = render_agent(&AgentSelectionView::from_custom(agent), member_settings)?;
+        let file = render_agent(&AgentSelectionView::from_custom(agent, role), member_settings)?;
         write_rendered_files(ANTIGRAVITY_PLUGIN_NAME, root, &[file])
     }
 

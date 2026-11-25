@@ -10,8 +10,8 @@ use serde_json::{Map, Value};
 
 use super::super::error::DiscussError;
 use super::super::library::{
-    AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition, SkillDefinition, SkillId,
-    TeamDefinition,
+    AgentId, AgentRole, AgentSelectionView, AssetLibrary, CustomAgentDefinition, CustomSkillDefinition,
+    SkillDefinition, SkillId, TeamDefinition,
 };
 use super::super::report_types::{DiscussHarnessCostKind, DiscussUsageEvidenceSource};
 use super::super::types::{DiscussConfigOption, DiscussConfigOptionValue};
@@ -306,9 +306,10 @@ impl DiscussAgentPlugin for GrokPlugin {
         &self,
         root: &Path,
         agent: &CustomAgentDefinition,
+        role: Option<AgentRole>,
         member_settings: Option<&ConfigSettings>,
     ) -> Result<(), DiscussError> {
-        let file = render_agent(&AgentSelectionView::from_custom(agent), member_settings)?;
+        let file = render_agent(&AgentSelectionView::from_custom(agent, role), member_settings)?;
         write_rendered_files(GROK_PLUGIN_NAME, root, &[file])
     }
 

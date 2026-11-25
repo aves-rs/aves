@@ -1,6 +1,7 @@
 //! Typed RPC, actor, and broadcast messages for the Knowledge domain.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tokio::sync::oneshot;
 
 use aves::bus::BusRpcContext;
@@ -12,8 +13,8 @@ use super::types::{
     CreateCanvasDashboardRequest, CreateKnowledgeRequest, DataList, DataObject, DeleteCanvasDashboardRequest,
     DeleteKnowledgeRequest, DeleteKnowledgeResult, GetCanvasDashboardRequest, GetKnowledgeRequest, KnowledgeError,
     KnowledgeRecord, KnowledgeRecordList, KnowledgeSearchOutcome, ListCanvasDashboardsRequest, ListDataRequest,
-    ListKnowledgeRequest, SearchKnowledgeRequest, UpdateCanvasDashboardRequest, UpdateKnowledgeRequest,
-    UpsertDataRequest, VaultKnowledgeTree,
+    ListKnowledgeRequest, SearchKnowledgeRequest, SearchMode, UpdateCanvasDashboardRequest, UpdateKnowledgeRequest,
+    UpsertDataRequest, VaultKnowledgeTree, VaultStats,
 };
 
 /// Knowledge domain request wrapper.
@@ -31,33 +32,74 @@ pub struct KnowledgeRequest {
 #[aves::bus_requests(marker = KnowledgeDomain, context = BusRpcContext, root_error = KnowledgeError, domain_error = KnowledgeError)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KnowledgeRequestPayload {
+    /// Register an application-validated vault root without opening it.
+    #[operation(name = "registerVault", kind = "mutation", response = VaultRegisteredOutput, response_variant = "VaultRegistered")]
+    RegisterVault { vault_id: String, root: PathBuf },
+    /// Remove a registered vault and close its runtime.
+    #[operation(name = "unregisterVault", kind = "mutation", response = VaultUnregisteredOutput, response_variant = "VaultUnregistered")]
+    UnregisterVault { vault_id: String },
+    /// Count admitted documents and report the index state.
+    #[operation(name = "getVaultStats", kind = "query", response = VaultStatsFoundOutput, response_variant = "VaultStatsFound")]
+    GetVaultStats {
+        #[serde(default)]
+        vault: Option<String>,
+    },
     /// Create a Markdown note in the active directory.
     #[operation(name = "createKnowledge", kind = "mutation", response = KnowledgeCreatedOutput, response_variant = "KnowledgeCreated")]
-    CreateKnowledge { request: CreateKnowledgeRequest },
+    CreateKnowledge {
+        request: CreateKnowledgeRequest,
+        #[serde(default)]
+        vault: Option<String>,
+    },
 
     /// List the directory's lightweight navigation tree.
     #[operation(name = "listKnowledgeTree", kind = "query", response = KnowledgeTreeListedOutput, response_variant = "KnowledgeTreeListed")]
-    ListKnowledgeTree,
+    ListKnowledgeTree {
+        #[serde(default)]
+        vault: Option<String>,
+    },
 
     /// List knowledge with optional filters and query text.
     #[operation(name = "listKnowledge", kind = "query", response = KnowledgeListedOutput, response_variant = "KnowledgeListed")]
-    ListKnowledge { request: ListKnowledgeRequest },
+    ListKnowledge {
+        request: ListKnowledgeRequest,
+        #[serde(default)]
+        vault: Option<String>,
+    },
 
     /// Get a note by its relative path.
     #[operation(name = "getKnowledge", kind = "query", response = KnowledgeFoundOutput, response_variant = "KnowledgeFound")]
-    GetKnowledge { request: GetKnowledgeRequest },
+    GetKnowledge {
+        request: GetKnowledgeRequest,
+        #[serde(default)]
+        vault: Option<String>,
+    },
 
     /// Update an existing directory note.
     #[operation(name = "updateKnowledge", kind = "mutation", response = KnowledgeUpdatedOutput, response_variant = "KnowledgeUpdated")]
-    UpdateKnowledge { request: UpdateKnowledgeRequest },
+    UpdateKnowledge {
+        request: UpdateKnowledgeRequest,
+        #[serde(default)]
+        vault: Option<String>,
+    },
 
     /// Delete a note by its relative path.
     #[operation(name = "deleteKnowledge", kind = "mutation", response = KnowledgeDeletedOutput, response_variant = "KnowledgeDeleted")]
-    DeleteKnowledge { request: DeleteKnowledgeRequest },
+    DeleteKnowledge {
+        request: DeleteKnowledgeRequest,
+        #[serde(default)]
+        vault: Option<String>,
+    },
 
     /// Search directory notes with TurboVault.
     #[operation(name = "searchKnowledge", kind = "query", response = KnowledgeSearchedOutput, response_variant = "KnowledgeSearched")]
-    SearchKnowledge { request: SearchKnowledgeRequest },
+    SearchKnowledge {
+        request: SearchKnowledgeRequest,
+        #[serde(default)]
+        vault: Option<String>,
+        #[serde(default)]
+        mode: SearchMode,
+    },
 
     /// Replace the JSON object at an exact, case-sensitive key or create it.
     #[operation(name = "upsertData", kind = "mutation", response = DataUpsertedOutput, response_variant = "DataUpserted")]
@@ -108,6 +150,12 @@ pub enum KnowledgeRequestPayload {
 #[aves::bus_responses]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KnowledgeResponse {
+    /// Vault registration acknowledgement.
+    VaultRegistered,
+    /// Vault removal acknowledgement.
+    VaultUnregistered,
+    /// Vault statistics.
+    VaultStatsFound { stats: VaultStats },
     /// Internal signal that the directory's visible records changed.
     #[serde(skip)]
     KnowledgeRecordsChanged,

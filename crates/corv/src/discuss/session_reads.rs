@@ -1,28 +1,22 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::str::FromStr;
 
-use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{SessionId, SessionOptionsRequest};
-use agent_client_protocol::{AcpAgent, Agent, Client};
-use serde_json::to_string as json_to_string;
 use tokio::sync::oneshot;
-use turso::Connection;
 
 use super::actor::Actor;
-use super::config::{config_options_from_json, config_settings_from_json, provider_config_options_json};
+use super::config::{config_options_from_json, provider_config_options_json};
 use super::error::DiscussError;
-use super::launch_types::AcpProvider;
 use super::messages::DiscussResponse;
 use super::plugins;
-use super::session::{ensure_agents_workspace_dir, initialize_request, load_session_request};
 use super::storage::{
     DiscussSessionRow, LoadedSessionRefresh, list_recent_discuss_sessions, load_discuss_agent_config,
     load_discuss_chat_turns_window, load_discuss_session, load_discuss_subagents, merge_refresh_discuss_session,
-    present_acp_session_id, provider_updated_at_ms, upsert_discuss_agent_config,
+    present_acp_session_id, provider_updated_at_ms,
 };
-use super::supervisor::{ProviderSupervisor, ProviderSupervisorResources};
+use super::supervisor::ProviderSupervisorResources;
 use super::types::{DiscussChatTurnRecord, DiscussConfigOption, DiscussSessionId, DiscussSessionInfo, WorkerCommand};
+
 impl Actor {
     /// List local ACP chat sessions ordered by most recent interaction.
     ///
@@ -99,7 +93,7 @@ impl Actor {
                     .await
                     .is_err()
                 {
-                    self.worker_registry.remove(&discuss_session_id);
+                    self.remove_worker(&discuss_session_id).await;
                     self.worker_capabilities.remove(&discuss_session_id);
                 } else if let Ok(Ok(provider_sessions)) = reply_rx.await {
                     // Merge provider-listed freshness metadata onto already-local
@@ -172,18 +166,11 @@ impl Actor {
             })
             .collect();
 
-        let acp_session_id = present_acp_session_id(row.acp_session_id.as_deref());
-        if self.worker_registry.contains_key(&discuss_session_id) {
-            if let Some(acp_session_id) = acp_session_id.as_deref()
-                && let Some(refreshed) = self
-                    .refresh_from_live_worker(discuss_session_id, acp_session_id)
-                    .await?
-            {
-                row = refreshed;
-            }
-        } else if let Some(acp_session_id) = acp_session_id
+        // Without a live worker the saved row is the answer; the reconnect that follows refreshes it.
+        if self.worker_registry.contains_key(&discuss_session_id)
+            && let Some(acp_session_id) = present_acp_session_id(row.acp_session_id.as_deref())
             && let Some(refreshed) = self
-                .refresh_from_provider_load(&conn, discuss_session_id, &row.agent_name, acp_session_id)
+                .refresh_from_live_worker(discuss_session_id, &acp_session_id)
                 .await?
         {
             row = refreshed;
@@ -224,7 +211,7 @@ impl Actor {
             .await
             .is_err()
         {
-            self.worker_registry.remove(&discuss_session_id);
+            self.remove_worker(&discuss_session_id).await;
             self.worker_capabilities.remove(&discuss_session_id);
             return Ok(None);
         }
@@ -240,57 +227,6 @@ impl Actor {
                 display_title: None,
                 latest_config_options_json: refreshed_options_json,
                 last_interaction_at: now_ms,
-            },
-        )
-        .await
-        .map(Some)
-    }
-
-    /// With no live worker, load the provider session over a short-lived connection and persist
-    /// the options it reports. A provider without `load` leaves the row as it is.
-    async fn refresh_from_provider_load(
-        &self,
-        conn: &Connection,
-        discuss_session_id: DiscussSessionId,
-        agent_name: &str,
-        acp_session_id: String,
-    ) -> Result<Option<DiscussSessionRow>, DiscussError> {
-        if !self
-            .provider_supervisors
-            .get(agent_name)
-            .is_some_and(ProviderSupervisor::accepts_work)
-        {
-            return Err(DiscussError::ProviderNotRunning {
-                provider_name: agent_name.to_string(),
-            });
-        }
-        let Some(agent_spec) = self.agents.get(agent_name) else {
-            return Err(DiscussError::SessionNotFound { discuss_session_id });
-        };
-        let Some(options) = load_provider_session_short_lived(
-            agent_name,
-            agent_spec,
-            SessionId::from(acp_session_id),
-            self.agents_workspace.clone(),
-        )
-        .await?
-        else {
-            return Ok(None);
-        };
-        let options_json = json_to_string(&options)?;
-        let defaults = load_discuss_agent_config(conn, agent_name)
-            .await?
-            .map(|config| config_settings_from_json(&config.default_config_json))
-            .transpose()?
-            .unwrap_or_default();
-        upsert_discuss_agent_config(conn, agent_name, Some(&options), &defaults).await?;
-        self.refresh_loaded_session_row(
-            discuss_session_id,
-            LoadedSessionRefresh {
-                acp_session_id: None,
-                display_title: None,
-                latest_config_options_json: Some(options_json),
-                last_interaction_at: chrono::Utc::now().timestamp_millis(),
             },
         )
         .await
@@ -392,37 +328,9 @@ impl Actor {
 
         if options.is_empty()
             && !self.worker_registry.contains_key(&discuss_session_id)
-            && let Some(ProviderSupervisorResources::Shared {
-                connection: Some(connection),
-                capabilities,
-                ..
-            }) = self
-                .provider_supervisors
-                .get(&row.agent_name)
-                .map(|supervisor| &supervisor.resources)
-            && capabilities.session_capabilities.options.is_some()
+            && let Some(shared) = self.shared_session_options(&row.agent_name).await
         {
-            let response = connection
-                .send_request(SessionOptionsRequest::new(self.agents_workspace.clone()))
-                .block_task()
-                .await?;
-            options = plugins::for_agent(&row.agent_name)
-                .initial_config_options(response.config_options, response.meta.as_ref())
-                .unwrap_or_default();
-        } else if options.is_empty()
-            && !self.worker_registry.contains_key(&discuss_session_id)
-            && let Some(provider) = self.agents.get(&row.agent_name)
-            && !matches!(
-                self.provider_supervisors
-                    .get(&row.agent_name)
-                    .map(|supervisor| &supervisor.resources),
-                Some(ProviderSupervisorResources::Shared {
-                    connection: Some(_),
-                    ..
-                })
-            )
-        {
-            options = provider_options_short_lived(&row.agent_name, provider, self.agents_workspace.clone()).await?;
+            options = shared?;
         }
 
         let agent_config_option_id = plugins::agent_config_option_id(plugins::for_agent(&row.agent_name));
@@ -431,90 +339,35 @@ impl Actor {
             agent_config_option_id,
         })
     }
-}
 
-async fn provider_options_short_lived(
-    agent_name: &str,
-    agent_spec: &AcpProvider,
-    agents_workspace: PathBuf,
-) -> Result<Vec<DiscussConfigOption>, DiscussError> {
-    let agent_plugin = plugins::for_agent(agent_name);
-    let agent_key = json_to_string(agent_spec.server())?;
-    let agent = AcpAgent::from_str(&agent_key)?;
-    ensure_agents_workspace_dir(&agents_workspace).await;
-    Client
-        .v1()
-        .name("acp-session-options")
-        .connect_with(agent, move |cx: ConnectionTo<Agent>| async move {
-            let initialized = cx.send_request(initialize_request()).block_task().await?;
-            if initialized
-                .agent_capabilities
-                .session_capabilities
-                .options
-                .is_none()
-            {
-                return Ok(Vec::new());
-            }
-            let response = cx
-                .send_request(SessionOptionsRequest::new(agents_workspace))
-                .block_task()
-                .await?;
-            Ok(agent_plugin
+    /// Reads a provider's options over its running shared connection with `session/options`,
+    /// which opens no session. `None` when there is no such connection or it lacks the method.
+    pub(super) async fn shared_session_options(
+        &self,
+        provider_name: &str,
+    ) -> Option<Result<Vec<DiscussConfigOption>, DiscussError>> {
+        let Some(ProviderSupervisorResources::Shared {
+            connection: Some(connection),
+            capabilities,
+            ..
+        }) = self
+            .provider_supervisors
+            .get(provider_name)
+            .map(|supervisor| &supervisor.resources)
+        else {
+            return None;
+        };
+        capabilities.session_capabilities.options.as_ref()?;
+        let response = connection
+            .send_request(SessionOptionsRequest::new(self.agents_workspace.clone()))
+            .block_task()
+            .await;
+        Some(response.map_err(DiscussError::from).map(|response| {
+            plugins::for_agent(provider_name)
                 .initial_config_options(response.config_options, response.meta.as_ref())
-                .unwrap_or_default())
-        })
-        .await
-        .map_err(DiscussError::from)
-}
-
-async fn load_provider_session_short_lived(
-    agent_name: &str,
-    agent_spec: &AcpProvider,
-    acp_session_id: SessionId,
-    agents_workspace: PathBuf,
-) -> Result<Option<Vec<DiscussConfigOption>>, DiscussError> {
-    let agent_plugin = plugins::for_agent(agent_name);
-    let application_mcp_enabled = agent_spec.application_mcp_enabled();
-    let agent_key = json_to_string(agent_spec.server())?;
-    let agent = AcpAgent::from_str(&agent_key)?;
-
-    Client
-        .v1()
-        .name("acp-session-load")
-        .connect_with(agent, move |cx: ConnectionTo<Agent>| async move {
-            let init_response = cx.send_request(initialize_request()).block_task().await?;
-
-            // Missing-load fallback: a provider that does not advertise `load`
-            // is a graceful case for `acp.loadSession` — the caller returns the
-            // local row + bounded turns. Signal that with `Ok(None)` here rather
-            // than an `UnsupportedCapability` error so the load never fails on a
-            // missing capability. `UnsupportedCapability` is reserved for
-            // explicit provider-only mutations with no local fallback.
-            if !init_response.agent_capabilities.load_session {
-                return Ok(None);
-            }
-
-            if application_mcp_enabled && !init_response.agent_capabilities.mcp_capabilities.acp {
-                tracing::debug!(
-                    target: "application_acp",
-                    "short-lived ACP session load skipped MCP because the agent lacks MCP-over-ACP support"
-                );
-            }
-
-            // The cwd is the config-owned ACP agents workspace, matching the
-            // live session/new and session/load paths. Create it first so a
-            // missing directory cannot fail the provider load with a protocol
-            // error about a non-existent cwd.
-            ensure_agents_workspace_dir(&agents_workspace).await;
-            let response = cx
-                .send_request(load_session_request(acp_session_id, agents_workspace, &[]))
-                .block_task()
-                .await?;
-
-            Ok(agent_plugin.initial_config_options(response.config_options, None))
-        })
-        .await
-        .map_err(DiscussError::from)
+                .unwrap_or_default()
+        }))
+    }
 }
 
 /// Deduplicate session list rows by local identity, then by provider session id.

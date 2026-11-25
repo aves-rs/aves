@@ -45,7 +45,8 @@ pub(super) fn merged_config_preferences(
     preferences
 }
 
-/// Finds the Provider-advertised value selecting an Agent through the plugin-chosen config option.
+/// Selects an Agent through the plugin-chosen config option, even when the Agent is not yet listed:
+/// a Provider may cache a folder's Agents and only re-read them when asked for one it does not know.
 pub(super) fn primary_agent_option_selection(
     provider_options: &[DiscussConfigOption],
     config_id: &str,
@@ -54,12 +55,6 @@ pub(super) fn primary_agent_option_selection(
     provider_options
         .iter()
         .find(|option| option.id == config_id)
-        .filter(|option| {
-            option
-                .options
-                .iter()
-                .any(|candidate| candidate.value == agent_id)
-        })
         .map(|option| ConfigPreferenceSelection {
             config_id: option.id.clone(),
             value: agent_id.to_string(),

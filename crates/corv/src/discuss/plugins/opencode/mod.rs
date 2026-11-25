@@ -163,6 +163,15 @@ struct SessionConfigOwnership {
 }
 
 impl DiscussAgentPlugin for OpenCodePlugin {
+    fn is_missing_saved_session(&self, error: &agent_client_protocol::Error, session_id: &str) -> bool {
+        let message = error
+            .message
+            .strip_prefix("Invalid params: ")
+            .unwrap_or(&error.message);
+        error.code == agent_client_protocol::ErrorCode::INVALID_PARAMS
+            && message.strip_prefix("session not found: ") == Some(session_id)
+    }
+
     /// OpenCode's ACP usage reports non-cached input and visible output; cache and reasoning
     /// counts are separate and omitted when zero (`acp/translate.ts`, `session/usage.ts`).
     fn billing_semantics(&self) -> BillingCategorySemantics {
@@ -684,7 +693,6 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         let agent = resolve_agent(library, agent_id)?;
         Ok(vec![render_agent(
             &AgentSelectionView::from_builtin(agent),
-            Some(agent.role),
             member_settings,
         )?])
     }
@@ -735,9 +743,10 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         &self,
         root: &Path,
         agent: &CustomAgentDefinition,
+        role: Option<AgentRole>,
         member_settings: Option<&ConfigSettings>,
     ) -> Result<(), DiscussError> {
-        let file = render_agent(&AgentSelectionView::from_custom(agent), None, member_settings)?;
+        let file = render_agent(&AgentSelectionView::from_custom(agent, role), member_settings)?;
         write_rendered_files(self.workspace_label(), root, &[file])
     }
 
@@ -1003,7 +1012,6 @@ impl OpenCodeCaptureState {
 
 fn render_agent(
     agent: &AgentSelectionView<'_>,
-    role: Option<AgentRole>,
     member_settings: Option<&ConfigSettings>,
 ) -> Result<RenderedFile, DiscussError> {
     let path = PathBuf::from(AGENTS_DIRECTORY).join(format!("{}.md", agent.id.normalized_destination()));
@@ -1022,7 +1030,7 @@ fn render_agent(
     frontmatter.insert(
         "mode".to_string(),
         Value::String(
-            match role {
+            match agent.role {
                 Some(AgentRole::Leader) => "primary",
                 Some(AgentRole::Follower) => "subagent",
                 None => "all",
@@ -1140,8 +1148,9 @@ mod tests {
             id: &id,
             description: "Review",
             body: "Review code",
+            role: Some(AgentRole::Leader),
         };
-        let file = render_agent(&agent, Some(AgentRole::Leader), Some(&settings)).unwrap();
+        let file = render_agent(&agent, Some(&settings)).unwrap();
         write_rendered_files(OPENCODE_PLUGIN_NAME, root.path(), &[file]).unwrap();
         PLUGIN
             .materialize_session_config(root.path(), &[&id], &config)
@@ -1165,7 +1174,7 @@ mod tests {
         let settings = PLUGIN
             .session_member_settings(&overrides, &SessionLaunchConfig::default())
             .unwrap();
-        let file = render_agent(&agent, Some(AgentRole::Leader), Some(&settings)).unwrap();
+        let file = render_agent(&agent, Some(&settings)).unwrap();
         write_rendered_files(OPENCODE_PLUGIN_NAME, root.path(), &[file]).unwrap();
         PLUGIN
             .materialize_session_config(root.path(), &[&id], &SessionLaunchConfig::default())
@@ -1195,8 +1204,9 @@ mod tests {
             id: &id,
             description: "Review",
             body: "Review code",
+            role: Some(AgentRole::Leader),
         };
-        let file = render_agent(&agent, Some(AgentRole::Leader), Some(&settings)).unwrap();
+        let file = render_agent(&agent, Some(&settings)).unwrap();
         let yaml = file
             .contents
             .strip_prefix("---\n")

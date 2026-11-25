@@ -14,7 +14,9 @@ use super::super::launch_types::{
     Effect, LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject, LaunchPermissionOutcome, Operation,
     SessionLaunchConfig,
 };
-use super::super::library::{AgentId, AgentSelectionView, AssetLibrary, CustomAgentDefinition, SkillDefinition};
+use super::super::library::{
+    AgentId, AgentRole, AgentSelectionView, AssetLibrary, CustomAgentDefinition, SkillDefinition,
+};
 use super::super::types::DiscussConfigOption;
 use super::super::types::{DiscussSubagentSurfaceState, DiscussUtilityPayload};
 use super::files::{RenderedFile, write_rendered_files};
@@ -326,9 +328,10 @@ impl DiscussAgentPlugin for CodexPlugin {
         &self,
         root: &Path,
         agent: &CustomAgentDefinition,
+        role: Option<AgentRole>,
         member_settings: Option<&ConfigSettings>,
     ) -> Result<(), DiscussError> {
-        let file = render_agent(&AgentSelectionView::from_custom(agent), member_settings)?;
+        let file = render_agent(&AgentSelectionView::from_custom(agent, role), member_settings)?;
         write_rendered_files(CODEX_PLUGIN_NAME, root, &[file])
     }
 

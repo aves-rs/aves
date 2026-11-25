@@ -35,7 +35,7 @@ use super::database::{
     should_persist_assistant_turn, spawn_persistence_queue,
 };
 use super::elicitation::content_to_sdk_answer;
-use super::error::DiscussError;
+use super::error::{DiscussError, PROVIDER_SESSION_MISSING};
 use super::launch_types::LaunchLimitation;
 use super::mcp_direct::McpAcpShim;
 use super::mcp_relay::{McpHttpLease, descriptors_for_registration, endpoint_to_acp_descriptor};
@@ -151,7 +151,6 @@ pub(super) async fn run_connected_session(
         pending_elicitation_tx,
         pending_elicitation_cancel_tx,
         announce_desktop_association,
-        transient_connectivity,
         provider_title,
         title_supported,
         agent_capabilities,
@@ -193,7 +192,6 @@ pub(super) async fn run_connected_session(
         &session_settings,
         &worker_ready_tx,
         announce_desktop_association,
-        transient_connectivity,
         opened.supports_config_updates,
         launch_limitations,
     )
@@ -252,7 +250,6 @@ pub(super) async fn run_connected_session(
         &pending_permission_cancel_tx,
         &pending_elicitation_tx,
         &pending_elicitation_cancel_tx,
-        transient_connectivity,
         &agents_workspace,
         &mcp_descriptors,
         &callback_router,
@@ -317,7 +314,6 @@ async fn pump_connected_session(
     pending_permission_cancel_tx: &mpsc::Sender<PendingPermissionCancel>,
     pending_elicitation_tx: &mpsc::Sender<PendingElicitationRegistration>,
     pending_elicitation_cancel_tx: &mpsc::Sender<PendingElicitationCancel>,
-    transient_connectivity: bool,
     agents_workspace: &Path,
     mcp_descriptors: &[McpServer],
     callback_router: &Arc<Mutex<CallbackRouter>>,
@@ -403,17 +399,26 @@ async fn pump_connected_session(
                 )?;
             }
             Some(callback) = callback_rx.recv() => {
-                dispatch_callback(
-                    callback,
-                    pending_permission_tx,
-                    pending_permission_cancel_tx,
-                    position_allocator,
-                    pending_elicitation_tx,
-                    pending_elicitation_cancel_tx,
-                    stream_tx,
-                    transient_connectivity,
-                )
-                .await?;
+                // The user's answer can take minutes; awaiting it here would stop this worker
+                // serving commands, and the actor waits on those commands.
+                let (permission_tx, permission_cancel_tx) = (pending_permission_tx.clone(), pending_permission_cancel_tx.clone());
+                let (elicitation_tx, elicitation_cancel_tx) = (pending_elicitation_tx.clone(), pending_elicitation_cancel_tx.clone());
+                let (positions, stream) = ((**position_allocator).clone(), stream_tx.clone());
+                spawn(async move {
+                    if let Err(error) = dispatch_callback(
+                        callback,
+                        &permission_tx,
+                        &permission_cancel_tx,
+                        &positions,
+                        &elicitation_tx,
+                        &elicitation_cancel_tx,
+                        &stream,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%discuss_session_id, ?error, "Provider callback could not be answered");
+                    }
+                });
             }
             command = worker_command_rx.recv() => {
                 match command {
@@ -677,7 +682,6 @@ async fn acknowledge_worker_ready(
     session_settings: &ConfigSettings,
     worker_ready_tx: &mpsc::Sender<WorkerReady>,
     announce_desktop_association: bool,
-    transient_connectivity: bool,
     supports_config_updates: bool,
     launch_limitations: Vec<LaunchLimitation>,
 ) -> Result<(), AcpError> {
@@ -708,19 +712,15 @@ async fn acknowledge_worker_ready(
         )
         .await?;
     }
-    if !transient_connectivity {
-        persistence_queue
-            .persist_launch_limitations(launch_limitations)
-            .await
-            .map_err(AcpError::into_internal_error)?;
-    }
+    persistence_queue
+        .persist_launch_limitations(launch_limitations)
+        .await
+        .map_err(AcpError::into_internal_error)?;
     worker_ready_tx
         .send(WorkerReady {
             discuss_session_id,
             acp_session_id: acp_session_id.clone(),
             announce_desktop_association,
-            transient_connectivity,
-            config_options: Some(latest_config_options.to_vec()),
             supports_config_updates,
         })
         .await
@@ -882,6 +882,7 @@ async fn open_worker_session(
     ensure_agents_workspace_dir(agents_workspace).await;
     tracing::debug!(%discuss_session_id, provider = %agent_name, cwd = %agents_workspace.display(), mcp_servers = options.mcp_servers.len(), "Opening configured ACP session");
     let close_supported = options.close_supported;
+    let reconnecting = options.reconnect_session_id.is_some();
     let configured = open_configured_session(
         connection,
         agent_name,
@@ -894,8 +895,16 @@ async fn open_worker_session(
     .await
     .map_err(|error| {
         // The ACP boundary reduces this to a bare internal error; record the typed cause here.
-        tracing::warn!(%discuss_session_id, provider = %agent_name, %error, "Configured ACP session open failed");
-        AcpError::into_internal_error(error)
+        if matches!(error, DiscussError::ProviderSessionNotFound) {
+            AcpError::new(agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND, PROVIDER_SESSION_MISSING)
+        } else {
+            if reconnecting {
+                tracing::debug!(%discuss_session_id, provider = %agent_name, %error, "Configured ACP session open failed");
+            } else {
+                tracing::warn!(%discuss_session_id, provider = %agent_name, %error, "Configured ACP session open failed");
+            }
+            AcpError::into_internal_error(error)
+        }
     })?;
     let session = configured.session;
     tracing::debug!(%discuss_session_id, acp_session_id = %session.session_id(), "ACP session configuration completed");
@@ -1241,7 +1250,6 @@ async fn handle_elicitation_callback(
     pending_elicitation_tx: &mpsc::Sender<PendingElicitationRegistration>,
     pending_elicitation_cancel_tx: &mpsc::Sender<PendingElicitationCancel>,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
-    transient_connectivity: bool,
 ) -> Result<(), AcpError> {
     let CallbackRouteTarget::Chat {
         discuss_session_id: viewer_session_id,
@@ -1312,7 +1320,7 @@ async fn handle_elicitation_callback(
         elicitation_request_id,
         payload: Box::new(payload),
     };
-    if !transient_connectivity && stream_tx.send(stream_event).await.is_err() {
+    if stream_tx.send(stream_event).await.is_err() {
         let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
         if pending_elicitation_cancel_tx
             .send(PendingElicitationCancel {
@@ -1338,10 +1346,6 @@ async fn handle_elicitation_callback(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "preserve the single worker and existing ACP callback/stream context without introducing new shared state"
-)]
 async fn dispatch_callback(
     callback: CallbackEvent,
     pending_permission_tx: &mpsc::Sender<PendingPermissionRegistration>,
@@ -1350,7 +1354,6 @@ async fn dispatch_callback(
     pending_elicitation_tx: &mpsc::Sender<PendingElicitationRegistration>,
     pending_elicitation_cancel_tx: &mpsc::Sender<PendingElicitationCancel>,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
-    transient_connectivity: bool,
 ) -> Result<(), AcpError> {
     match callback {
         CallbackEvent::Permission {
@@ -1365,7 +1368,6 @@ async fn dispatch_callback(
                 pending_permission_tx,
                 pending_permission_cancel_tx,
                 stream_tx,
-                transient_connectivity,
             )
             .await?;
         }
@@ -1384,7 +1386,6 @@ async fn dispatch_callback(
                 pending_elicitation_tx,
                 pending_elicitation_cancel_tx,
                 stream_tx,
-                transient_connectivity,
             )
             .await?;
         }
@@ -1400,7 +1401,6 @@ async fn handle_permission_callback(
     pending_permission_tx: &mpsc::Sender<PendingPermissionRegistration>,
     pending_permission_cancel_tx: &mpsc::Sender<PendingPermissionCancel>,
     stream_tx: &mpsc::Sender<DiscussStreamEvent>,
-    transient_connectivity: bool,
 ) -> Result<(), AcpError> {
     let CallbackRouteTarget::Chat {
         discuss_session_id: viewer_session_id,
@@ -1449,7 +1449,7 @@ async fn handle_permission_callback(
         permission_request_id,
         payload: Box::new(request),
     };
-    if !transient_connectivity && stream_tx.send(stream_event).await.is_err() {
+    if stream_tx.send(stream_event).await.is_err() {
         let (cancellation_ack, cancellation_ack_rx) = oneshot::channel();
         if pending_permission_cancel_tx
             .send(PendingPermissionCancel {

@@ -7,7 +7,7 @@ use super::database::*;
 use super::error::DiscussError;
 use super::launch_types::SessionLaunchConfig;
 use super::library::{
-    AgentId, CustomTeamDefinition, ResolvedAgent, ResolvedSkill, ResolvedTeam, SkillId, TeamDefinition,
+    AgentId, AgentRole, CustomTeamDefinition, ResolvedAgent, ResolvedSkill, ResolvedTeam, SkillId, TeamDefinition,
     bump_custom_version, initial_custom_version,
 };
 use super::messages::DiscussResponse;
@@ -230,7 +230,7 @@ impl Actor {
                 if row.installed_version == version {
                     return Ok(());
                 }
-                self.materialize_member(plugin, &self.agents_workspace, &agent, None)
+                self.materialize_member(plugin, &self.agents_workspace, &agent, None, None)
                     .await?;
                 version
             }
@@ -379,10 +379,12 @@ impl Actor {
         settings: &BTreeMap<AgentId, plugins::ConfigSettings>,
         custom_only: bool,
     ) -> Result<(), DiscussError> {
-        for id in std::iter::once(&team.leader).chain(&team.followers) {
+        let members = std::iter::once((&team.leader, AgentRole::Leader))
+            .chain(team.followers.iter().map(|id| (id, AgentRole::Follower)));
+        for (id, role) in members {
             let agent = self.resolve_agent(id).await?;
             if !custom_only || matches!(agent, ResolvedAgent::Custom(_)) {
-                self.materialize_member(plugin, root, &agent, settings.get(id))
+                self.materialize_member(plugin, root, &agent, Some(role), settings.get(id))
                     .await?;
             }
         }
@@ -489,11 +491,12 @@ impl Actor {
         plugin: &dyn plugins::DiscussAgentPlugin,
         root: &Path,
         agent: &ResolvedAgent,
+        role: Option<AgentRole>,
         member_settings: Option<&plugins::ConfigSettings>,
     ) -> Result<(), DiscussError> {
         match agent {
             ResolvedAgent::Builtin(agent) => plugin.install_team_member(self.library, root, &agent.id, member_settings),
-            ResolvedAgent::Custom(agent) => plugin.install_custom_agent(root, agent, member_settings),
+            ResolvedAgent::Custom(agent) => plugin.install_custom_agent(root, agent, role, member_settings),
         }?;
         let id = match agent {
             ResolvedAgent::Builtin(agent) => &agent.id,
@@ -557,8 +560,14 @@ impl Actor {
     ) -> Result<(), DiscussError> {
         match kind {
             CustomInstallationKind::Agent => {
-                self.materialize_member(plugin, root, &self.resolve_agent(&AgentId::new(id)?).await?, settings)
-                    .await
+                self.materialize_member(
+                    plugin,
+                    root,
+                    &self.resolve_agent(&AgentId::new(id)?).await?,
+                    None,
+                    settings,
+                )
+                .await
             }
             CustomInstallationKind::Skill => {
                 self.materialize_skill(plugin, root, &self.resolve_skill(&SkillId::new(id)?).await?)

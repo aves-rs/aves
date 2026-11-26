@@ -1,6 +1,6 @@
 # Aves
 
-Build reliable Rust applications from independent, typed domains.
+Build reliable applications from independent, typed domains.
 
 Aves gives long-running applications one place to manage messaging, lifecycle, authentication, and workflows.
 Keep business logic in its owning domain while sharing dependable infrastructure.

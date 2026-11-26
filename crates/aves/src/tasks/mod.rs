@@ -20,6 +20,6 @@ pub use messages::{
 pub use shell::run_shell;
 pub use types::{
     ScriptNodeCompletion, ScriptNodeFailure, ScriptNodeOutputs, ScriptNodeTickResult, ShellNodeCompletion,
-    ShellNodeFailure, ShellNodeTickResult, ShellPostSpawnFailureKind, ShellRunSpec, ShellTerminal, ShellTerminalCause,
-    TasksError,
+    ShellNodeFailure, ShellNodeTickResult, ShellOutputFiles, ShellPostSpawnFailureKind, ShellRunSpec, ShellTerminal,
+    ShellTerminalCause, TasksError,
 };

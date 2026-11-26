@@ -23,6 +23,14 @@ Import helpers from concrete `aves::utils` modules; there are no root utility re
 - `importWorkspace` is host-local ingress. `downloadWorkspaceBlob` checks `PullCloudBlobs` or `AllBus` before network I/O; only Collection tickets are accepted.
 - Capture/load failure before `PreparedCheckpointCommit` can drop successor Start (accepted NO FIX). Native Collection transfer lacks an acceptance test (accepted NO FIX).
 
+## ScriptNode filesystem library
+
+- `application.fs` (`src/tasks/runtime/fs.js`) is a guest-side wrapper over the one preopen. It is not an RPC operation and adds no path policy; containment remains the preopen's job.
+- `fs.js` imports `qjs:std` and `qjs:os`. Keep those specifiers.
+- Keep the empty-content branch of `writeTextFile` (`std.open(..., "w")` then `close`). `std.writeFile` alone is a different path.
+- The staged fs module is created with `create_new`. Never overwrite it; cleanup removes only the file the current call created.
+- See [Aves Tasks Domain](../../docs/architecture/aves/tasks-domain.md) for the method table, staging, and evidence limits.
+
 ## ShellNode
 
 Tasks registers `ShellNode` beside `ScriptNode`: a host process, not a WASM guest. See [Using Shell Nodes](../../docs/guides/using-shell-nodes.md).

@@ -70,5 +70,6 @@ opencode.jsonc
 .cortexkit/
 .delta/
 .docs/external/
+*.local.toml
 ARCHITECTURE.md
 STRUCTURE.md

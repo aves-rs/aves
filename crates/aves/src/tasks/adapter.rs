@@ -175,6 +175,7 @@ pub(super) fn shell_node_registration(lifecycle: Arc<dyn TasksLifecycleSudoServi
                     commands: configuration.commands,
                     cwd: PathBuf::from(configuration.cwd),
                     timeout_secs: configuration.timeout_secs,
+                    output: configuration.output,
                     input: context.inputs.as_value(),
                 })
                 .await

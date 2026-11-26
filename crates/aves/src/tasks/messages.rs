@@ -8,7 +8,7 @@ use crate::auth::Jwt;
 use crate::bus::{BusIngress, BusRpcContext};
 use crate::flow::{LifecycleCorrelation, NodeExecutionId};
 
-use super::types::{ScriptNodeTickResult, ShellNodeTickResult, TasksError};
+use super::types::{ScriptNodeTickResult, ShellNodeTickResult, ShellOutputFiles, TasksError};
 
 pub struct TasksRequest {
     pub payload: TasksRequestPayload,
@@ -60,6 +60,7 @@ pub enum TasksRequestPayload {
         cwd: PathBuf,
         /// Configured execution timeout in seconds; zero selects the Tasks default.
         timeout_secs: u64,
+        output: Option<ShellOutputFiles>,
         input: Value,
     },
 

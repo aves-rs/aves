@@ -1,7 +1,8 @@
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -48,6 +49,19 @@ async fn collect<R: AsyncRead + Unpin>(mut reader: R, capture: Arc<Mutex<Capture
     }
 }
 
+async fn collect_file<R: AsyncRead + Unpin>(mut reader: R, mut file: File, capture: Arc<Mutex<Capture>>) {
+    let result = match tokio::io::copy(&mut reader, &mut file).await {
+        Ok(_) => file.flush().await,
+        Err(error) => Err(error),
+    };
+    let mut capture = capture.lock().unwrap_or_else(|error| error.into_inner());
+    if result.is_ok() {
+        capture.complete = true;
+    } else {
+        capture.failed = true;
+    }
+}
+
 fn failure(kind: ShellPostSpawnFailureKind) -> ShellTerminalCause {
     ShellTerminalCause::PostSpawnFailed { kind }
 }
@@ -86,6 +100,34 @@ async fn terminate_child(child: &mut Child, cause: ShellTerminalCause) -> ShellT
 /// Reaping after termination is bounded to 2s, followed by one shared 5s pipe drain.
 pub async fn run_shell(spec: ShellRunSpec, mut terminate: oneshot::Receiver<()>) -> ShellTerminal {
     let deadline = Instant::now() + spec.timeout;
+    let files = if let Some(paths) = &spec.output {
+        let stdout = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&paths.stdout)
+            .await;
+        let stderr = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&paths.stderr)
+            .await;
+        match (stdout, stderr) {
+            (Ok(stdout), Ok(stderr)) => Some((stdout, stderr)),
+            _ => {
+                return ShellTerminal {
+                    cause: ShellTerminalCause::OutputUnavailable,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_dropped_bytes: 0,
+                    stderr_dropped_bytes: 0,
+                    stdout_abandoned_tail: false,
+                    stderr_abandoned_tail: false,
+                };
+            }
+        }
+    } else {
+        None
+    };
     let mut child = match Command::new(&spec.interpreter)
         .arg("-c")
         .arg(&spec.script)
@@ -116,8 +158,16 @@ pub async fn run_shell(spec: ShellRunSpec, mut terminate: oneshot::Receiver<()>)
     let stderr = Arc::new(Mutex::new(Capture::default()));
     // JoinSet aborts both collectors if the runner itself is dropped.
     let mut collectors = JoinSet::new();
+    let (stdout_file, stderr_file) = match files {
+        Some((stdout, stderr)) => (Some(stdout), Some(stderr)),
+        None => (None, None),
+    };
     if let Some(pipe) = child.stdout.take() {
-        collectors.spawn(collect(pipe, Arc::clone(&stdout)));
+        if let Some(file) = stdout_file {
+            collectors.spawn(collect_file(pipe, file, Arc::clone(&stdout)));
+        } else {
+            collectors.spawn(collect(pipe, Arc::clone(&stdout)));
+        }
     } else {
         stdout
             .lock()
@@ -125,7 +175,11 @@ pub async fn run_shell(spec: ShellRunSpec, mut terminate: oneshot::Receiver<()>)
             .failed = true;
     }
     if let Some(pipe) = child.stderr.take() {
-        collectors.spawn(collect(pipe, Arc::clone(&stderr)));
+        if let Some(file) = stderr_file {
+            collectors.spawn(collect_file(pipe, file, Arc::clone(&stderr)));
+        } else {
+            collectors.spawn(collect(pipe, Arc::clone(&stderr)));
+        }
     } else {
         stderr
             .lock()

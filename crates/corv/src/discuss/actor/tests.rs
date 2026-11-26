@@ -47,7 +47,7 @@ use super::super::catalog_types::{
 use super::super::launch_types::{LaunchLimitation, LaunchLimitationReason, LaunchLimitationSubject};
 use super::super::library::AgentId;
 use super::super::migration::MIGRATIONS as DISCUSS_MIGRATIONS;
-use super::super::session_reads::dedupe_session_list;
+use super::super::session_reads::{dedupe_session_list, page_turns};
 use super::super::test_library;
 use super::super::{agents::*, config::*, database::*, elicitation::*, messages::*, session::*, storage::*, types::*};
 use super::*;
@@ -4521,7 +4521,7 @@ async fn assistant_turn_persists_at_stop_boundary_and_loads_after_reseed() {
         .worker_capabilities
         .insert(discuss_session_id, SessionCapabilitiesCache::default());
     let response = rebooted_actor
-        .handle_load_session(discuss_session_id)
+        .handle_load_session(discuss_session_id, None)
         .await
         .expect("reseed persisted session");
     let turns = match response {
@@ -4558,7 +4558,7 @@ async fn load_without_a_worker_returns_saved_history_without_the_provider() {
     let (mut actor, _reboot_temp) = make_migrated_actor(bus_requester, broadcast_tx).await;
     actor.persistence = persistence.clone();
     let response = actor
-        .handle_load_session(discuss_session_id)
+        .handle_load_session(discuss_session_id, None)
         .await
         .expect("saved history loads without a provider");
 
@@ -7113,4 +7113,76 @@ async fn cancel_without_a_live_turn_publishes_idle() {
         broadcasts.try_recv(),
         Ok(DiscussResponse::SessionActivity { discuss_session_id: id, active: false }) if id == discuss_session_id
     ));
+}
+
+fn paged_record(position: i64, content: serde_json::Value) -> DiscussChatTurnRecord {
+    DiscussChatTurnRecord {
+        discuss_session_id: DiscussSessionId::new(),
+        position,
+        role: "assistant".to_string(),
+        acp_session_id: None,
+        content_json: content.to_string(),
+        created_at: 0,
+    }
+}
+
+fn paged_parts(record: &DiscussChatTurnRecord) -> Vec<serde_json::Value> {
+    let content: serde_json::Value = serde_json::from_str(&record.content_json).expect("record JSON");
+    content["parts"].as_array().cloned().unwrap_or_default()
+}
+
+/// A page holds the newest entries, starts at a tool call's first entry and continues from its cursor.
+#[test]
+fn transcript_pages_walk_back_without_splitting_a_tool_call() {
+    let tool = |id: &str, update: bool| json!({"kind": "tool_call", "update": {"toolCallId": id}, "isUpdate": update});
+    let text = |text: &str| json!({"kind": "text", "text": text});
+    let turns = vec![
+        paged_record(0, json!({"role": "user", "text": "go"})),
+        paged_record(
+            1,
+            json!({"role": "assistant", "text": "abc", "thought": "", "stopReason": "end_turn", "parts": [
+                text("a"), tool("t1", false), text("b"), tool("t1", true), text("c"),
+            ]}),
+        ),
+    ];
+
+    let (page, earlier) = page_turns(
+        turns.clone(),
+        DiscussTranscriptPage {
+            part_limit: 2,
+            before: None,
+        },
+    );
+    assert_eq!(page.len(), 1);
+    assert_eq!(
+        paged_parts(&page[0]).len(),
+        4,
+        "the page reaches back to the tool call's start"
+    );
+    let content: serde_json::Value = serde_json::from_str(&page[0].content_json).expect("record JSON");
+    assert!(content.get("text").is_none());
+    assert_eq!(content["stopReason"], "end_turn");
+    assert_eq!(earlier, Some(DiscussTranscriptCursor { position: 1, part: 1 }));
+
+    let (page, earlier) = page_turns(
+        turns.clone(),
+        DiscussTranscriptPage {
+            part_limit: 2,
+            before: earlier,
+        },
+    );
+    assert_eq!(page.iter().map(|turn| turn.position).collect::<Vec<_>>(), vec![0, 1]);
+    assert_eq!(paged_parts(&page[1]), vec![text("a")]);
+    assert_eq!(earlier, None);
+
+    let (page, earlier) = page_turns(
+        turns,
+        DiscussTranscriptPage {
+            part_limit: 200,
+            before: None,
+        },
+    );
+    assert_eq!(page.len(), 2);
+    assert_eq!(paged_parts(&page[1]).len(), 5);
+    assert_eq!(earlier, None);
 }

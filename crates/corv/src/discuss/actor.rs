@@ -858,9 +858,10 @@ impl Actor {
                 .await
             }
             DiscussRequestPayload::ListSessions => self.handle_list_sessions().await,
-            DiscussRequestPayload::LoadSession { discuss_session_id } => {
-                self.handle_load_session(discuss_session_id).await
-            }
+            DiscussRequestPayload::LoadSession {
+                discuss_session_id,
+                page,
+            } => self.handle_load_session(discuss_session_id, page).await,
             DiscussRequestPayload::GetConfigOptions { discuss_session_id } => {
                 self.handle_get_config_options(discuss_session_id).await
             }

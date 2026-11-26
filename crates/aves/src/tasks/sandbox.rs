@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::{Error as IoError, ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -25,6 +25,7 @@ use super::client::GuestRpcBindingsHandle;
 use super::types::{ScriptNodeCompletion, TasksError};
 
 const QUICKJS_RUNTIME: &[u8] = include_bytes!("./runtime/qjs-wasi-reactor.wasm");
+const APPLICATION_FS: &str = include_str!("./runtime/fs.js");
 const STDOUT_CAPACITY: usize = 64 * 1024;
 const STDERR_CAPACITY: usize = 64 * 1024;
 const GUEST_RPC_PREFIX: &str = "\u{1e}APP_RPC ";
@@ -249,10 +250,11 @@ impl ScriptSandbox {
     }
 }
 
-fn staging_filenames(correlation: LifecycleCorrelation) -> (String, String) {
+fn staging_filenames(correlation: LifecycleCorrelation) -> (String, String, String) {
     (
         format!(".application-script-{}.mjs", correlation.node_execution_id),
         format!(".application-bootstrap-{}.mjs", correlation.node_execution_id),
+        format!(".application-fs-{}.mjs", correlation.node_execution_id),
     )
 }
 
@@ -260,7 +262,7 @@ fn staging_paths(
     workspace: &Path,
     filename: &str,
     correlation: LifecycleCorrelation,
-) -> Result<(PathBuf, PathBuf, String), TasksError> {
+) -> Result<(PathBuf, PathBuf, PathBuf, String, String), TasksError> {
     let entry_path = Path::new(filename);
     if filename.is_empty()
         || entry_path.is_absolute()
@@ -275,14 +277,16 @@ fn staging_paths(
             message: format!("invalid ScriptNode entry point: {filename}"),
         });
     }
-    let (script_name, bootstrap_name) = staging_filenames(correlation);
+    let (script_name, bootstrap_name, fs_name) = staging_filenames(correlation);
     let parent = entry_path.parent().unwrap_or_else(|| Path::new(""));
     let script_relative = parent.join(script_name);
     let script_guest_path = format!("/{}", script_relative.to_string_lossy().replace('\\', "/"));
     Ok((
         workspace.join(script_relative),
         workspace.join(bootstrap_name),
+        workspace.join(&fs_name),
         script_guest_path,
+        format!("/{fs_name}"),
     ))
 }
 
@@ -381,7 +385,7 @@ fn execute_bridge(
 /// Stages the module and bootstrap files required by QuickJS-NG's reactor.
 ///
 /// The reactor accepts a file entry point but does not reliably execute a
-/// module loaded from an `-e` expression; both staged files live under `/`.
+/// module loaded from an `-e` expression; staged files live under `/`.
 fn execute_bridge_with_runtime(
     execution: &BridgeExecution<'_>,
     streams: GuestStreams,
@@ -389,11 +393,12 @@ fn execute_bridge_with_runtime(
     module: Module,
     abort: &ScriptAbortHandle,
 ) -> Result<(), TasksError> {
-    let (script_path, bootstrap_path, script_guest_path) = staging_paths(
+    let (script_path, bootstrap_path, fs_path, script_guest_path, fs_guest_path) = staging_paths(
         execution.workspace_path,
         execution.filename,
         execution.correlation.clone(),
     )?;
+    let mut fs_created = false;
     let result = (|| {
         if let Some(parent) = script_path.parent() {
             fs::create_dir_all(parent).map_err(|error| TasksError::Execution {
@@ -416,15 +421,41 @@ fn execute_bridge_with_runtime(
         fs::write(&script_path, staged_source).map_err(|error| TasksError::Execution {
             message: format!("failed to stage ScriptNode module: {error}"),
         })?;
-        let bootstrap = wrapper(execution.correlation.clone(), execution.input, &script_guest_path)?;
+        let mut fs_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&fs_path)
+            .map_err(|error| TasksError::Execution {
+                message: format!(
+                    "failed to stage ScriptNode filesystem library {}: {error}",
+                    fs_path.display()
+                ),
+            })?;
+        fs_created = true;
+        fs_file
+            .write_all(APPLICATION_FS.as_bytes())
+            .map_err(|error| TasksError::Execution {
+                message: format!(
+                    "failed to stage ScriptNode filesystem library {}: {error}",
+                    fs_path.display()
+                ),
+            })?;
+        drop(fs_file);
+        let bootstrap = wrapper(
+            execution.correlation.clone(),
+            execution.input,
+            &script_guest_path,
+            &fs_guest_path,
+        )?;
         fs::write(&bootstrap_path, bootstrap).map_err(|error| TasksError::Execution {
             message: format!("failed to stage ScriptNode bootstrap: {error}"),
         })?;
 
         execute_bridge_store(execution, streams, engine, module, abort)
     })();
-    let cleanup = [script_path, bootstrap_path]
+    let cleanup = [fs_created.then_some(fs_path), Some(script_path), Some(bootstrap_path)]
         .into_iter()
+        .flatten()
         .filter_map(|path| fs::remove_file(path).err())
         .find(|error| error.kind() != ErrorKind::NotFound);
     match (result, cleanup) {
@@ -513,6 +544,7 @@ fn wrapper(
     correlation: LifecycleCorrelation,
     input: &Value,
     user_script_guest_path: &str,
+    fs_guest_path: &str,
 ) -> Result<String, TasksError> {
     Ok(format!(
         r#"
@@ -532,7 +564,9 @@ globalThis.console = {{
   debug: (...args) => __cap("debug", ...args),
 }};
 
+const __application_fs = await import({fs_library});
 globalThis.application = Object.freeze({{
+  fs: __application_fs,
   rpc: (operation, input) => {{
     std.out.puts({rpc_prefix} + JSON.stringify({{ operation, input }}) + "\n");
     std.out.flush();
@@ -561,6 +595,7 @@ std.out.flush();
         rpc_prefix = serde_json::to_string(GUEST_RPC_PREFIX)?,
         output_prefix = serde_json::to_string(GUEST_OUTPUT_PREFIX)?,
         user_script = serde_json::to_string(user_script_guest_path)?,
+        fs_library = serde_json::to_string(fs_guest_path)?,
     ))
 }
 
@@ -602,7 +637,7 @@ fn execute(
     timeout: u64,
     timed: &Arc<AtomicBool>,
 ) -> Result<(), TasksError> {
-    let (_, bootstrap_filename) = staging_filenames(correlation);
+    let (_, bootstrap_filename, _) = staging_filenames(correlation);
     let bootstrap_guest_path = format!("/{bootstrap_filename}");
     let (argv, arguments) = argv(store, e, ["qjs", "--std", &bootstrap_guest_path])?;
     let status = match e
@@ -833,11 +868,19 @@ mod tests {
     #[test]
     fn wrapper_emits_the_generic_script_node_completion_shape() {
         let correlation = correlation();
-        let (script_filename, _) = staging_filenames(correlation.clone());
-        let rendered = wrapper(correlation, &serde_json::json!({}), &format!("/{script_filename}")).unwrap();
+        let (script_filename, _, fs_filename) = staging_filenames(correlation.clone());
+        let rendered = wrapper(
+            correlation,
+            &serde_json::json!({}),
+            &format!("/{script_filename}"),
+            &format!("/{fs_filename}"),
+        )
+        .unwrap();
 
         assert!(rendered.contains("await Promise.resolve()"));
         assert!(rendered.contains(&format!("await import(\"/{script_filename}\")")));
+        assert!(rendered.contains(&format!("await import(\"/{fs_filename}\")")));
+        assert!(rendered.contains("fs: __application_fs"));
         assert!(!rendered.contains("(async () =>"));
         assert!(!rendered.contains("try {"));
         assert!(rendered.contains("outputs"));
@@ -1009,8 +1052,9 @@ mod tests {
             Some(&serde_json::json!("from workspace"))
         );
         assert_eq!(completion.outputs.get("async"), Some(&serde_json::json!("drained")));
-        let (script_filename, bootstrap_filename) = staging_filenames(completion.correlation);
+        let (script_filename, bootstrap_filename, fs_filename) = staging_filenames(completion.correlation);
         assert!(!workspace.path().join("src").join(script_filename).exists());
         assert!(!workspace.path().join(bootstrap_filename).exists());
+        assert!(!workspace.path().join(fs_filename).exists());
     }
 }

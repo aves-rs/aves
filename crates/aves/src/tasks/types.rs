@@ -29,6 +29,8 @@ pub(crate) struct ShellNodeConfig {
     pub cwd: String,
     #[serde(default)]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub output: Option<ShellOutputFiles>,
 }
 
 fn default_shell_interpreter() -> String {
@@ -44,6 +46,13 @@ pub(crate) fn resolve_shell_timeout(timeout_secs: u64) -> Duration {
     })
 }
 
+/// Files a shell run streams its output into instead of capturing it.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, Type)]
+pub struct ShellOutputFiles {
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
+}
+
 /// Input to the infallible runner entry in shell.rs:
 /// `pub async fn run_shell(spec: ShellRunSpec, terminate: tokio::sync::oneshot::Receiver<()>) -> ShellTerminal`.
 /// Every path yields exactly one terminal cause.
@@ -53,6 +62,7 @@ pub struct ShellRunSpec {
     pub script: String,
     pub cwd: PathBuf,
     pub timeout: Duration,
+    pub output: Option<ShellOutputFiles>,
 }
 
 /// Acknowledged shell outcome and bounded output capture.
@@ -75,6 +85,7 @@ pub enum ShellTerminalCause {
     TimedOut { seconds: u64 },
     Cancelled,
     SpawnFailed { interpreter: String },
+    OutputUnavailable,
     PostSpawnFailed { kind: ShellPostSpawnFailureKind },
 }
 
@@ -218,6 +229,8 @@ pub enum TasksError {
     RuntimeStopped,
     #[error("failed to spawn shell interpreter: {interpreter}")]
     ShellSpawnFailed { interpreter: String },
+    #[error("shell output files could not be opened")]
+    ShellOutputUnavailable,
     #[error("shell exited with nonzero status: {code}")]
     ShellExitedNonZero { code: i32 },
     #[error("shell terminated by signal: {description}")]

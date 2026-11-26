@@ -22,7 +22,8 @@ use super::shell::{join_shell_commands, run_shell};
 use super::types::{
     MAX_CONCURRENT_SHELL_EXECUTIONS, SHELL_SUPERVISION_DEADLINE, ScriptNodeCompletion, ScriptNodeFailure,
     ScriptNodeTerminalResult, ScriptNodeTickResult, ShellNodeCompletion, ShellNodeFailure, ShellNodeTerminalResult,
-    ShellNodeTickResult, ShellRunSpec, ShellTerminal, ShellTerminalCause, TasksError, resolve_shell_timeout,
+    ShellNodeTickResult, ShellOutputFiles, ShellRunSpec, ShellTerminal, ShellTerminalCause, TasksError,
+    resolve_shell_timeout,
 };
 
 /// The maximum number of concurrent script executions allowed.
@@ -72,6 +73,7 @@ struct ShellPending {
     commands: Vec<String>,
     cwd: PathBuf,
     timeout: Duration,
+    output: Option<ShellOutputFiles>,
     input: Value,
 }
 
@@ -200,8 +202,19 @@ impl Actor {
                 commands,
                 cwd,
                 timeout_secs,
+                output,
                 input,
-            } => self.start_shell(correlation, interpreter, commands, cwd, timeout_secs, input),
+            } => self.start_shell(
+                correlation,
+                ShellPending {
+                    interpreter,
+                    commands,
+                    cwd,
+                    timeout: resolve_shell_timeout(timeout_secs),
+                    output,
+                    input,
+                },
+            ),
             TasksRequestPayload::TickShell { correlation, input } => {
                 self.tick_shell(correlation, input, shell_completion_tx)
             }
@@ -443,11 +456,7 @@ impl Actor {
     fn start_shell(
         &mut self,
         correlation: LifecycleCorrelation,
-        interpreter: String,
-        commands: Vec<String>,
-        cwd: PathBuf,
-        timeout_secs: u64,
-        input: Value,
+        pending: ShellPending,
     ) -> Result<TasksResponse, TasksError> {
         if !self.runtime_started {
             return Err(TasksError::RuntimeStopped);
@@ -462,21 +471,12 @@ impl Actor {
         if self.shell_pending.contains_key(&id) || self.shell_running.contains_key(&id) {
             return Err(TasksError::IdempotencyConflict { node_execution_id: id });
         }
-        if !fs::metadata(&cwd).is_ok_and(|metadata| metadata.is_dir()) {
+        if !fs::metadata(&pending.cwd).is_ok_and(|metadata| metadata.is_dir()) {
             return Err(TasksError::ShellInvalidWorkingDirectory {
-                path: cwd.to_string_lossy().into_owned(),
+                path: pending.cwd.to_string_lossy().into_owned(),
             });
         }
-        self.shell_pending.insert(
-            id,
-            ShellPending {
-                interpreter,
-                commands,
-                cwd,
-                timeout: resolve_shell_timeout(timeout_secs),
-                input,
-            },
-        );
+        self.shell_pending.insert(id, pending);
         Ok(TasksResponse::Started { correlation })
     }
 
@@ -517,11 +517,16 @@ impl Actor {
                 .shell_pending
                 .remove(&id)
                 .expect("pending checked above");
+            let output = pending.output.map(|files| ShellOutputFiles {
+                stdout: pending.cwd.join(files.stdout),
+                stderr: pending.cwd.join(files.stderr),
+            });
             let spec = ShellRunSpec {
                 interpreter: pending.interpreter,
                 script: join_shell_commands(&pending.commands),
                 cwd: pending.cwd,
                 timeout: pending.timeout,
+                output,
             };
             let (terminate, terminate_rx) = oneshot::channel();
             let tx = completion_tx.clone();
@@ -652,6 +657,7 @@ impl Actor {
             ShellTerminalCause::TimedOut { seconds } => (TasksError::ShellTimeout { seconds }, None),
             ShellTerminalCause::Cancelled => (TasksError::ShellCancelled, None),
             ShellTerminalCause::SpawnFailed { interpreter } => (TasksError::ShellSpawnFailed { interpreter }, None),
+            ShellTerminalCause::OutputUnavailable => (TasksError::ShellOutputUnavailable, None),
             ShellTerminalCause::PostSpawnFailed { kind } => (TasksError::ShellPostSpawnFailed { kind }, None),
         };
         ShellNodeTerminalResult::Failed {

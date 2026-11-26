@@ -26,8 +26,9 @@ use super::types::{
     CleanupWarning, CustomMcpEntry, CustomMcpScope, DiscussAuthAccount, DiscussAuthState, DiscussChatTurnRecord,
     DiscussConfigOption, DiscussConfigValues, DiscussElicitationAnswer, DiscussImageAttachment, DiscussMcpStatus,
     DiscussMemberOverrides, DiscussPermissionOption, DiscussProviderConfig, DiscussResourceLink, DiscussSessionId,
-    DiscussSessionInfo, DiscussSessionModes, DiscussSessionSetup, DiscussSubagentRecord, ElicitationRequestId,
-    InspectorBinding, PermissionRequestId, ProviderRuntimeState, SensitiveMcpDescriptor,
+    DiscussSessionInfo, DiscussSessionModes, DiscussSessionSetup, DiscussSubagentRecord, DiscussTranscriptCursor,
+    DiscussTranscriptPage, ElicitationRequestId, InspectorBinding, PermissionRequestId, ProviderRuntimeState,
+    SensitiveMcpDescriptor,
 };
 
 /// Discuss domain request wrapper.
@@ -616,6 +617,9 @@ pub enum DiscussRequestPayload {
     LoadSession {
         /// Application-owned canonical session identity.
         discuss_session_id: DiscussSessionId,
+        /// One page of the transcript; absent returns every saved turn in full.
+        #[serde(default)]
+        page: Option<DiscussTranscriptPage>,
     },
 
     /// Get the provider-exposed config options for a live or loaded session.
@@ -937,6 +941,10 @@ pub enum DiscussResponse {
         session: DiscussSessionInfo,
         turns: Vec<DiscussChatTurnRecord>,
         subagents: Vec<DiscussSubagentRecord>,
+        /// Where the saved transcript continues before a requested page; absent when the page
+        /// reached its start or no page was requested.
+        #[serde(default)]
+        earlier: Option<DiscussTranscriptCursor>,
     },
 
     /// Provider-exposed config options for a live or loaded session.

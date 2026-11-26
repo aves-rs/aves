@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use agent_client_protocol::v1::schema::{SessionId, SessionOptionsRequest};
+use serde_json::Value;
 use tokio::sync::oneshot;
 
 use super::actor::Actor;
@@ -15,7 +16,95 @@ use super::storage::{
     present_acp_session_id, provider_updated_at_ms,
 };
 use super::supervisor::ProviderSupervisorResources;
-use super::types::{DiscussChatTurnRecord, DiscussConfigOption, DiscussSessionId, DiscussSessionInfo, WorkerCommand};
+use super::types::{
+    DiscussChatTurnRecord, DiscussConfigOption, DiscussSessionId, DiscussSessionInfo, DiscussTranscriptCursor,
+    DiscussTranscriptPage, WorkerCommand,
+};
+
+/// Cuts saved turns, oldest first, down to one page: the newest `part_limit` entries before the
+/// page's cursor. Returns the page and, when older entries remain, the cursor that continues it.
+pub(super) fn page_turns(
+    turns: Vec<DiscussChatTurnRecord>,
+    page: DiscussTranscriptPage,
+) -> (Vec<DiscussChatTurnRecord>, Option<DiscussTranscriptCursor>) {
+    let mut budget = page.part_limit.max(1) as usize;
+    let mut kept = Vec::new();
+    let mut first = None;
+    let mut more = false;
+    for mut turn in turns.into_iter().rev() {
+        let position = turn.position;
+        let cut = match page.before {
+            Some(before) if position > before.position => continue,
+            Some(before) if position == before.position => Some(before.part as usize),
+            _ => None,
+        };
+        if cut == Some(0) {
+            continue;
+        }
+        if budget == 0 {
+            more = true;
+            break;
+        }
+        let mut content = serde_json::from_str::<Value>(&turn.content_json).unwrap_or(Value::Null);
+        let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+            budget -= 1;
+            first = Some(DiscussTranscriptCursor { position, part: 0 });
+            kept.push(turn);
+            continue;
+        };
+        let end = cut.unwrap_or(parts.len()).min(parts.len());
+        let start = tool_safe_start(parts, end.saturating_sub(budget), end);
+        budget = budget.saturating_sub(end - start);
+        if start > 0 || end < parts.len() {
+            parts.truncate(end);
+            parts.drain(..start);
+            if let Some(record) = content.as_object_mut() {
+                record.remove("text");
+                record.remove("thought");
+            }
+            turn.content_json = content.to_string();
+        }
+        first = Some(DiscussTranscriptCursor {
+            position,
+            part: u32::try_from(start).unwrap_or(u32::MAX),
+        });
+        kept.push(turn);
+        if start > 0 {
+            more = true;
+            break;
+        }
+    }
+    kept.reverse();
+    (kept, first.filter(|_| more))
+}
+
+/// Moves a page's first entry back until every tool call in `start..end` begins inside the page.
+fn tool_safe_start(parts: &[Value], mut start: usize, end: usize) -> usize {
+    fn tool_id(part: &Value) -> Option<&str> {
+        if part.get("kind").and_then(Value::as_str) != Some("tool_call") {
+            return None;
+        }
+        part.get("update")?.get("toolCallId")?.as_str()
+    }
+    let mut begins: HashMap<&str, usize> = HashMap::new();
+    for (index, part) in parts[..end].iter().enumerate() {
+        if let Some(id) = tool_id(part) {
+            begins.entry(id).or_insert(index);
+        }
+    }
+    let mut scanned = end;
+    while start < scanned {
+        let earliest = parts[start..scanned]
+            .iter()
+            .filter_map(tool_id)
+            .filter_map(|id| begins.get(id).copied())
+            .min()
+            .unwrap_or(start);
+        scanned = start;
+        start = start.min(earliest);
+    }
+    start
+}
 
 impl Actor {
     /// List local ACP chat sessions ordered by most recent interaction.
@@ -138,6 +227,7 @@ impl Actor {
     pub(super) async fn handle_load_session(
         &mut self,
         discuss_session_id: DiscussSessionId,
+        page: Option<DiscussTranscriptPage>,
     ) -> Result<DiscussResponse, DiscussError> {
         tracing::debug!(
             target: "application_acp",
@@ -165,6 +255,10 @@ impl Actor {
                 })
             })
             .collect();
+        let (turn_records, earlier) = match page {
+            Some(page) => page_turns(turn_records, page),
+            None => (turn_records, None),
+        };
 
         // Without a live worker the saved row is the answer; the reconnect that follows refreshes it.
         if self.worker_registry.contains_key(&discuss_session_id)
@@ -180,6 +274,7 @@ impl Actor {
             session: self.loaded_session_info(discuss_session_id, row)?,
             turns: turn_records,
             subagents,
+            earlier,
         })
     }
 

@@ -102,7 +102,8 @@ pub use types::{
     DiscussChatTurnRecord, DiscussConfigOption, DiscussConfigOptionValue, DiscussImageAttachment, DiscussMcpStatus,
     DiscussMemberOverrides, DiscussPermissionOption, DiscussResourceLink, DiscussSessionId, DiscussSessionInfo,
     DiscussSessionModes, DiscussSessionSetup, DiscussStreamEvent, DiscussSubagentRecord, DiscussSubagentSurfaceState,
-    DiscussTerminalAuthMethod, DiscussTodoItem, DiscussTodoSnapshot, DiscussTodoStatus, DiscussTurnUsage,
-    DiscussUtilityPayload, DiscussUtilityUpdate, ElicitationRequestId, InspectorBinding, PermissionRequestId,
-    ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus, SensitiveMcpDescriptor,
+    DiscussTerminalAuthMethod, DiscussTodoItem, DiscussTodoSnapshot, DiscussTodoStatus, DiscussTranscriptCursor,
+    DiscussTranscriptPage, DiscussTurnUsage, DiscussUtilityPayload, DiscussUtilityUpdate, ElicitationRequestId,
+    InspectorBinding, PermissionRequestId, ProviderRuntimeFailure, ProviderRuntimeState, ProviderRuntimeStatus,
+    SensitiveMcpDescriptor,
 };

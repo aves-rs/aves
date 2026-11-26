@@ -766,6 +766,34 @@ pub struct DiscussChatTurnRecord {
     pub created_at: i64,
 }
 
+/// A point in a chat's saved transcript: entry `part` of the record at `position`.
+///
+/// A record without ordered parts counts as one entry at part 0.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussTranscriptCursor {
+    /// Per-session turn position of the record.
+    pub position: i64,
+    /// Index into the record's stored `parts`.
+    pub part: u32,
+}
+
+/// Asks `loadSession` for one page of the saved transcript instead of all of it.
+///
+/// The page holds the newest `part_limit` entries before `before`, or the newest of all when
+/// `before` is absent. A page starts a little earlier when needed so that every tool call in it
+/// begins inside it. A record cut by the page keeps its other fields but drops the aggregated
+/// `text` and `thought`, which repeat the parts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussTranscriptPage {
+    /// How many entries the page holds at most.
+    pub part_limit: u32,
+    /// Return only entries before this point; the `earlier` cursor of the previous page.
+    #[serde(default)]
+    pub before: Option<DiscussTranscriptCursor>,
+}
+
 /// Modes advertised for a session.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type, ::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]

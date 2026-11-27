@@ -83,6 +83,7 @@ async fn session_launch_context_survives_anchor_updates() {
         &session_id,
         Some(serde_json::to_string(&cwd).unwrap()),
         Some(false),
+        Some(true),
     )
     .await
     .expect("launch context");
@@ -98,7 +99,7 @@ async fn session_launch_context_survives_anchor_updates() {
         cwd
     );
     assert_eq!(row.session_mcp_enabled, Some(0));
-    update_session_launch_context(&conn, &session_id, None, None)
+    update_session_launch_context(&conn, &session_id, None, None, None)
         .await
         .unwrap();
     let row = load_discuss_session(&conn, &session_id)
@@ -3299,6 +3300,7 @@ async fn spawn_session_returns_error_for_unknown_agent_key() {
             DiscussSessionId::new(),
             "nonexistent-agent",
             SpawnSessionOptions {
+                requires_mcp_isolation: false,
                 launch_config: None,
                 name: Some("Test Session".to_string()),
                 setup: None,
@@ -5750,6 +5752,7 @@ async fn desktop_attach_reuses_ready_warmed_worker() {
             discuss_session_id,
             "agent",
             SpawnSessionOptions {
+                requires_mcp_isolation: false,
                 launch_config: None,
                 name: Some("local-session".to_string()),
                 setup: None,
@@ -5802,6 +5805,7 @@ async fn desktop_attach_waits_for_warming_worker_readiness() {
             discuss_session_id,
             "agent",
             SpawnSessionOptions {
+                requires_mcp_isolation: false,
                 launch_config: None,
                 name: Some("local-session".to_string()),
                 setup: None,

@@ -260,6 +260,7 @@ pub struct DiscussSessionRow {
     pub(super) launch_limitations: Vec<LaunchLimitation>,
     pub(super) is_task_session: bool,
     pub(super) session_cwd_json: Option<String>,
+    pub(super) requires_mcp_isolation: bool,
     pub(super) session_mcp_enabled: Option<i64>,
     pub(super) session_launch_config_json: Option<String>,
     pub(super) session_setup_kind: Option<String>,
@@ -539,10 +540,11 @@ pub(super) async fn update_session_launch_context(
     session_id: &str,
     cwd_json: Option<String>,
     mcp_enabled: Option<bool>,
+    requires_mcp_isolation: Option<bool>,
 ) -> Result<(), DiscussError> {
     conn.execute(
         DISCUSS_SESSIONS_LAUNCH_CONTEXT_SQL,
-        (session_id.to_string(), cwd_json, mcp_enabled.map(i64::from)),
+        (session_id.to_string(), cwd_json, mcp_enabled.map(i64::from), requires_mcp_isolation.map(i64::from)),
     )
     .await?;
     Ok(())
@@ -958,6 +960,7 @@ fn decode_discuss_session_row(row: &turso::Row) -> Result<DiscussSessionRow, Dis
         launch_limitations,
         is_task_session: row_get::<i64>(row, 13, "discuss_sessions.is_task_session")? != 0,
         session_cwd_json: row_get(row, 14, "discuss_sessions.session_cwd_json")?,
+        requires_mcp_isolation: row_get::<i64>(row, 19, "discuss_sessions.requires_mcp_isolation")? != 0,
         session_mcp_enabled: row_get(row, 15, "discuss_sessions.session_mcp_enabled")?,
         session_launch_config_json: row_get(row, 16, "discuss_sessions.session_launch_config_json")?,
         session_setup_kind: row_get(row, 17, "discuss_sessions.session_setup_kind")?,

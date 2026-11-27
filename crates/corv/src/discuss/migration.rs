@@ -51,4 +51,9 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "session_modes",
         sql: include_str!("../../migrations/0010_session_modes.sql"),
     },
+    Migration {
+        version: 11,
+        name: "session_mcp_isolation",
+        sql: include_str!("../../migrations/0011_session_mcp_isolation.sql"),
+    },
 ];

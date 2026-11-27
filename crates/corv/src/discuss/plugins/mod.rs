@@ -469,6 +469,11 @@ pub trait DiscussAgentPlugin: Sync {
         ConnectionStrategy::Isolated
     }
 
+    /// Whether session-local MCP credentials require a private provider process.
+    fn needs_process_for_mcp_isolation(&self) -> bool {
+        false
+    }
+
     /// Capture a tool call using worker-local state.
     fn capture_tool_call(&self, call: &ToolCall, state: &mut PluginCaptureState) -> Option<DiscussUtilityPayload> {
         let _ = (call, state);

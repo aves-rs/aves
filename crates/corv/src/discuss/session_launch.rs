@@ -339,7 +339,10 @@ impl Actor {
             .map(json_from_str::<SessionLaunchConfig>)
             .transpose()?;
         Ok(ResolvedLaunchInputs {
-            requires_mcp_isolation: options.requires_mcp_isolation || stored.as_ref().is_some_and(|row| row.requires_mcp_isolation),
+            requires_mcp_isolation: options.requires_mcp_isolation
+                || stored
+                    .as_ref()
+                    .is_some_and(|row| row.requires_mcp_isolation),
             reconnect_acp_session_id: acp_session_id.map(SessionId::from),
             provider_title: initial_provider_title(
                 stored.as_ref().and_then(|row| row.display_title.as_deref()),

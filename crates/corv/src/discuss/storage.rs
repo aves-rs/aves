@@ -544,7 +544,12 @@ pub(super) async fn update_session_launch_context(
 ) -> Result<(), DiscussError> {
     conn.execute(
         DISCUSS_SESSIONS_LAUNCH_CONTEXT_SQL,
-        (session_id.to_string(), cwd_json, mcp_enabled.map(i64::from), requires_mcp_isolation.map(i64::from)),
+        (
+            session_id.to_string(),
+            cwd_json,
+            mcp_enabled.map(i64::from),
+            requires_mcp_isolation.map(i64::from),
+        ),
     )
     .await?;
     Ok(())

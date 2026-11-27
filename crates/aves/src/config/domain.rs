@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::bus::EventBus;
 use crate::runtime::{ConstructionFacade, DomainCallbacks, DomainDescriptorFactory, DomainFuture, ServicePublisher};
@@ -34,9 +35,16 @@ aves::domain! {
 
 pub(super) use __Config_generated_routing::ConfigGeneratedHandler;
 
-/// Directory handed to the runtime by the embedding application.
-#[derive(Clone)]
-pub struct ConfigDirectory(pub PathBuf);
+/// Resolved application directories supplied at boot and shared with domains.
+#[derive(Clone, Debug)]
+pub struct BootDirectories {
+    /// Directory containing application configuration.
+    pub config_dir: PathBuf,
+    /// Directory containing durable application data.
+    pub data_dir: PathBuf,
+    /// Directory containing regenerable application data.
+    pub cache_dir: PathBuf,
+}
 
 impl<Root> DomainDescriptorFactory<EventBus<Root>> for ConfigDomain
 where
@@ -51,15 +59,19 @@ where
             Root: Clone + Send + 'static,
             ConfigBroadcast: Into<Root> + Clone + Send + 'static,
         {
-            let directory = facade
-                .input::<ConfigDirectory>()
-                .expect("Config directory must be supplied")
-                .0
+            let directories = facade
+                .input::<BootDirectories>()
+                .expect("Config boot directories must be supplied")
                 .clone();
+            let directory = directories.config_dir.clone();
+            let directories_publisher = facade.publisher::<BootDirectories>();
             let registration: ServicePublisher<dyn ConfigRegistrationSudoService> = facade.publisher();
             let future = handle::new(facade.bus_mut(), directory, registration);
             Box::pin(async move {
                 let handler = future.await;
+                directories_publisher
+                    .publish(Arc::new(directories))
+                    .expect("Config boot directories must be published once");
                 tokio::spawn(async move { handler.run().await });
             })
         }

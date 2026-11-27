@@ -6,7 +6,7 @@ mod handle;
 mod messages;
 mod types;
 
-pub use domain::{ConfigDirectory, ConfigDomain, ConfigRegistrationSudoService};
+pub use domain::{BootDirectories, ConfigDomain, ConfigRegistrationSudoService};
 pub use messages::{
     ConfigBroadcast, ConfigRequest, ConfigRequestPayload, ConfigResponse, GetConfigSectionInput, RegisterSectionInput,
     SaveConfigSectionInput, SealRegistrationInput, config_operation_descriptors_with_root_error,

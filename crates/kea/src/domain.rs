@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use aves::bus::{BusRpcContext, EventBus};
 use aves::config::{
-    ConfigBroadcast, ConfigDirectory, ConfigRegistrationSudoService, GetConfigSectionInput, RegisterSectionInput,
+    BootDirectories, ConfigBroadcast, ConfigRegistrationSudoService, GetConfigSectionInput, RegisterSectionInput,
     SectionRegistration, dispatch_get_config_section,
 };
 use aves::flow::FlowWorkspaceSourceService;
@@ -88,16 +88,17 @@ where
             let root_context = facade.root_context().clone();
             let publisher = facade.publisher::<dyn FlowWorkspaceSourceService>();
 
-            let directory = facade
-                .input::<ConfigDirectory>()
-                .expect("config directory")
-                .0
-                .clone();
+            let directories = facade.reader::<BootDirectories>();
 
             let registration = facade.reader::<dyn ConfigRegistrationSudoService>();
             let bus = facade.bus_mut();
 
             Box::pin(async move {
+                let directory = directories
+                    .get()
+                    .expect("Config boot directories must be published first")
+                    .data_dir
+                    .clone();
                 registration
                     .get()
                     .expect("Config registration service must be published first")

@@ -421,6 +421,9 @@ impl Actor {
             let result = self
                 .complete_custom_import(pending.kind, pending.id, pending.url, completion.result)
                 .await;
+            if result.is_ok() {
+                self.publish_catalog_changed().await;
+            }
             let _ = pending.reply_to.send(result);
         }
     }

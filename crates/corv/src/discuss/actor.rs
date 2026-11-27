@@ -460,6 +460,26 @@ impl Actor {
             self.start_custom_import(&payload, reply_to);
             return;
         }
+        let catalog_write = matches!(
+            &payload,
+            DiscussRequestPayload::CreateCustomAgent { .. }
+                | DiscussRequestPayload::UpdateCustomAgent { .. }
+                | DiscussRequestPayload::DeleteCustomAgent { .. }
+                | DiscussRequestPayload::InstallCustomAgent { .. }
+                | DiscussRequestPayload::UninstallCustomAgent { .. }
+                | DiscussRequestPayload::CreateCustomSkill { .. }
+                | DiscussRequestPayload::UpdateCustomSkill { .. }
+                | DiscussRequestPayload::DeleteCustomSkill { .. }
+                | DiscussRequestPayload::InstallCustomSkill { .. }
+                | DiscussRequestPayload::UninstallCustomSkill { .. }
+                | DiscussRequestPayload::CreateCustomTeam { .. }
+                | DiscussRequestPayload::UpdateCustomTeam { .. }
+                | DiscussRequestPayload::DeleteCustomTeam { .. }
+                | DiscussRequestPayload::InstallTeam { .. }
+                | DiscussRequestPayload::EditTeam { .. }
+                | DiscussRequestPayload::UninstallTeam { .. }
+                | DiscussRequestPayload::InstallTeamAndStartSession { .. }
+        );
         let result: Result<DiscussResponse, DiscussError> = match payload {
             DiscussRequestPayload::ResolveSessionIdentity { issuer, subject } => {
                 resolve_identity(&self.persistence, issuer, subject).await
@@ -983,7 +1003,17 @@ impl Actor {
             );
         }
 
+        if catalog_write && result.is_ok() {
+            self.publish_catalog_changed().await;
+        }
         let _ = reply_to.send(result);
+    }
+
+    /// Announces that custom agents, skills, teams or their installations changed.
+    pub(super) async fn publish_catalog_changed(&self) {
+        if let Err(error) = self.broadcast_tx.send(DiscussResponse::CatalogChanged).await {
+            tracing::warn!(target: "application_acp", ?error, "could not publish catalog change");
+        }
     }
 
     /// Reconnect every recoverable persisted session without announcing a

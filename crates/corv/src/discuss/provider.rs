@@ -310,7 +310,7 @@ impl Actor {
                 self.provider_supervisors.remove(provider_name);
                 self.agents.remove(provider_name);
                 let _ = plugins::for_agent(provider_name).remove_config(&self.agents_workspace);
-                self.publish_provider_runtime(provider_name).await;
+                self.publish_provider_removed(provider_name).await;
             }
         }
         if let Err(error) = self.persist_agents().await {
@@ -1053,6 +1053,19 @@ impl Actor {
         }
     }
 
+    /// Announces that a Provider is gone, so held provider lists drop it.
+    async fn publish_provider_removed(&self, provider_name: &str) {
+        if let Err(error) = self
+            .broadcast_tx
+            .send(DiscussResponse::ProviderRemoved {
+                provider_name: provider_name.to_owned(),
+            })
+            .await
+        {
+            tracing::warn!(target: "application_acp", ?error, provider_name, "could not publish Provider removal");
+        }
+    }
+
     pub(super) async fn handle_get_provider_config(
         &self,
         provider_name: &str,
@@ -1253,6 +1266,7 @@ impl Actor {
             ));
         }
         self.provider_supervisors.remove(provider_name);
+        self.publish_provider_removed(provider_name).await;
 
         Ok(DiscussResponse::ProviderRemoveSuccess { warnings })
     }

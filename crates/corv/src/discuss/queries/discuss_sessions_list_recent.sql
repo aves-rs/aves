@@ -19,6 +19,7 @@ SELECT
     session_mcp_enabled,
     session_launch_config_json,
     session_setup_kind,
-    launch_limitations_json
+    launch_limitations_json,
+    requires_mcp_isolation
 FROM discuss_sessions
 ORDER BY last_interaction_at DESC NULLS LAST

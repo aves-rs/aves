@@ -187,6 +187,10 @@ impl DiscussAgentPlugin for OpenCodePlugin {
         &[("claude-agent", "anthropic")]
     }
 
+    fn needs_process_for_mcp_isolation(&self) -> bool {
+        true
+    }
+
     fn connection_strategy(&self) -> ConnectionStrategy {
         ConnectionStrategy::Shared
     }

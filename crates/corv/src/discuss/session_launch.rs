@@ -144,6 +144,7 @@ struct SharedWorkerResources {
 
 /// Launch inputs after the persisted anchor's stored values take precedence over the caller's.
 struct ResolvedLaunchInputs {
+    requires_mcp_isolation: bool,
     reconnect_acp_session_id: Option<SessionId>,
     provider_title: Option<String>,
     launch_config: Option<SessionLaunchConfig>,
@@ -262,7 +263,8 @@ impl Actor {
                 (composed_config.as_ref(), launch.launch_config.is_some()),
             )
             .await?;
-        let shared = self.shared_worker_resources(key, prepared.isolated_configured);
+        let isolate_mcp = launch.requires_mcp_isolation && plugins::for_agent(key).needs_process_for_mcp_isolation();
+        let shared = self.shared_worker_resources(key, prepared.isolated_configured || isolate_mcp);
         let configured_defaults = config_settings_from_value(agent_spec.default_session_config());
         let (next_usage_ordinal, agent_defaults) = self
             .session_agent_defaults(discuss_session_id, key, configured_defaults)
@@ -337,6 +339,10 @@ impl Actor {
             .map(json_from_str::<SessionLaunchConfig>)
             .transpose()?;
         Ok(ResolvedLaunchInputs {
+            requires_mcp_isolation: options.requires_mcp_isolation
+                || stored
+                    .as_ref()
+                    .is_some_and(|row| row.requires_mcp_isolation),
             reconnect_acp_session_id: acp_session_id.map(SessionId::from),
             provider_title: initial_provider_title(
                 stored.as_ref().and_then(|row| row.display_title.as_deref()),
@@ -442,6 +448,7 @@ impl Actor {
                 .map(json_to_string)
                 .transpose()?,
             launch.application_mcp_enabled,
+            Some(launch.requires_mcp_isolation),
         )
         .await?;
         update_session_launch_config(&conn, &session_id, launch.launch_config.as_ref()).await?;
@@ -1014,6 +1021,7 @@ mod team_at_root_setup_tests {
             is_task_session: false,
             session_cwd_json: None,
             session_mcp_enabled: None,
+            requires_mcp_isolation: false,
             session_launch_config_json: None,
             launch_limitations: Vec::new(),
             session_setup_kind: setup_kind.map(str::to_string),

@@ -60,6 +60,7 @@ pub(super) const CANCEL_TURN_DEADLINE: Duration = Duration::from_secs(1);
 pub(super) const PROVIDER_CHILD_REAP_DEADLINE: Duration = Duration::from_secs(1);
 
 pub(super) struct SpawnSessionOptions {
+    pub(super) requires_mcp_isolation: bool,
     pub(super) launch_config: Option<SessionLaunchConfig>,
     pub(super) name: Option<String>,
     pub(super) setup: Option<DiscussSessionSetup>,
@@ -786,6 +787,7 @@ impl Actor {
                         discuss_session_id,
                         &provider_name,
                         SpawnSessionOptions {
+                            requires_mcp_isolation: false,
                             launch_config,
                             name: session_name,
                             setup: Some(setup),
@@ -803,6 +805,7 @@ impl Actor {
                 .await
             }
             DiscussRequestPayload::NewSession {
+                requires_mcp_isolation,
                 launch_config,
                 discuss_session_id,
                 agent_key,
@@ -815,6 +818,7 @@ impl Actor {
                     discuss_session_id,
                     &agent_key,
                     SpawnSessionOptions {
+                        requires_mcp_isolation,
                         launch_config,
                         name: session_name,
                         setup,
@@ -843,6 +847,7 @@ impl Actor {
                     discuss_session_id,
                     &agent_key,
                     SpawnSessionOptions {
+                        requires_mcp_isolation: false,
                         launch_config,
                         name: session_name,
                         setup,
@@ -1100,6 +1105,7 @@ impl Actor {
             discuss_session_id,
             &row.agent_name,
             SpawnSessionOptions {
+                requires_mcp_isolation: false,
                 launch_config: None,
                 name: Some(row.session_name),
                 setup: None,

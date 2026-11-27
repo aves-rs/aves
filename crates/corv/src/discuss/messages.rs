@@ -303,6 +303,9 @@ pub enum DiscussRequestPayload {
 
     #[operation(name = "newSession", kind = "mutation", response = SuccessOutput, response_variant = "Success")]
     NewSession {
+        /// Require session-local application MCP credentials on providers that otherwise share them.
+        #[serde(default)]
+        requires_mcp_isolation: bool,
         /// Optional session-specific launch inputs.
         #[serde(default)]
         launch_config: Option<SessionLaunchConfig>,

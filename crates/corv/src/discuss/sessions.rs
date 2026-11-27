@@ -69,6 +69,7 @@ impl Actor {
             session_id,
             &provider_name,
             SpawnSessionOptions {
+                requires_mcp_isolation: false,
                 launch_config,
                 name: Some(session_name.unwrap_or_else(|| agent_name.clone())),
                 setup,
@@ -220,7 +221,7 @@ impl Actor {
             self.cancel_pending_elicitations_for_session(&discuss_session_id);
         }
         if cwd_changed {
-            update_session_launch_context(&conn, &session_id, Some(json_to_string(&session_cwd)?), None).await?;
+            update_session_launch_context(&conn, &session_id, Some(json_to_string(&session_cwd)?), None, None).await?;
         }
         let setup = match Self::restored_team_setup(&row) {
             Some(DiscussSessionSetup::Team { leader_id }) => {
@@ -234,6 +235,7 @@ impl Actor {
             discuss_session_id,
             &row.agent_name,
             SpawnSessionOptions {
+                requires_mcp_isolation: false,
                 launch_config: None,
                 name: Some(row.session_name.clone()),
                 setup,

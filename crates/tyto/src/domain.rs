@@ -1,5 +1,5 @@
 use aves::bus::{BusRpcContext, EventBus};
-use aves::config::ConfigDirectory;
+use aves::config::BootDirectories;
 use aves::flow::{FlowTriggerSourceService, NodeRegistrationSupply, TriggerRegistrationError, TriggerRegistry};
 use aves::runtime::{
     ConstructionFacade, DomainCallbacks, DomainDescriptorFactory, DomainFuture, ServicePublisher, ServiceReader,
@@ -60,11 +60,7 @@ where
             MessagingBroadcast: Into<Root> + Clone + Send + 'static,
         {
             let context = facade.root_context().clone();
-            let config_dir = facade
-                .input::<ConfigDirectory>()
-                .expect("ConfigDirectory is a construction input")
-                .0
-                .clone();
+            let directories = facade.reader::<BootDirectories>();
 
             let node_registration_supply = facade
                 .input::<NodeRegistrationSupply>()
@@ -78,7 +74,12 @@ where
 
             let bus = facade.bus_mut();
             Box::pin(async move {
-                let handler = new_handle(bus, config_dir, node_registration_supply, services, context.clone()).await;
+                let data_dir = directories
+                    .get()
+                    .expect("Config boot directories must be published first")
+                    .data_dir
+                    .clone();
+                let handler = new_handle(bus, data_dir, node_registration_supply, services, context.clone()).await;
                 tokio::spawn(async move { handler.run().await });
             })
         }

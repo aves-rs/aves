@@ -1,5 +1,5 @@
 use crate::bus::{BusRpcContext, EventBus};
-use crate::config::ConfigDirectory;
+use crate::config::BootDirectories;
 use crate::machine::MachinePeerService;
 use crate::runtime::{
     ConstructionFacade, DomainCallbacks, DomainDescriptorFactory, DomainFuture, dispatch_lifecycle_request,
@@ -53,16 +53,17 @@ where
             Root: Clone + Send + 'static,
             CoordinationBroadcast: Into<Root>,
         {
-            let config_dir = facade
-                .input::<ConfigDirectory>()
-                .expect("Config directory must be supplied")
-                .0
-                .clone();
+            let directories = facade.reader::<BootDirectories>();
             let sync_services = facade.reader::<dyn MachinePeerService>();
             let signing_service = facade.publisher::<dyn CoordinationSigningService>();
-            let future = Handle::new(facade.bus_mut(), config_dir, sync_services, signing_service);
+            let bus = facade.bus_mut();
             Box::pin(async move {
-                let handle = future.await;
+                let data_dir = directories
+                    .get()
+                    .expect("Config boot directories must be published first")
+                    .data_dir
+                    .clone();
+                let handle = Handle::new(bus, data_dir, sync_services, signing_service).await;
                 tokio::spawn(handle.run());
             })
         }

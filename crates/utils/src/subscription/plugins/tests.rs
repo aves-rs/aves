@@ -10,6 +10,7 @@ use tempfile::{TempDir, tempdir};
 use super::claude::CLAUDE_CREDENTIAL;
 use super::cursor::{CURSOR_CREDENTIAL, V10_IV, V10_KEY, V10_PREFIX};
 use super::grok::GROK_CREDENTIAL;
+use super::ollama::OLLAMA_CREDENTIAL;
 use super::*;
 
 const FUTURE_MS: i64 = 4_102_444_800_000;
@@ -26,6 +27,7 @@ fn home_with(claude: Option<&str>, grok: Option<&str>) -> (TempDir, CliCredentia
     }
     let credentials = CliCredentials {
         home: home.path().to_path_buf(),
+        ollama: OllamaPlugin::new(|| None),
     };
     (home, credentials)
 }
@@ -109,6 +111,31 @@ async fn missing_and_malformed_files_are_not_listed() {
 }
 
 #[tokio::test]
+async fn exposes_ollama_key_as_a_scoped_api_credential() {
+    let (_home, mut credentials) = home_with(None, None);
+    credentials.ollama = OllamaPlugin::new(|| {
+        Some(CliLogin {
+            token: "fixture-key".to_owned(),
+            expires_at_ms: None,
+            record_version: 7,
+            account_id: None,
+            email: None,
+        })
+    });
+
+    let snapshot = credentials.list_scoped().await.unwrap();
+    let [row] = snapshot.rows.as_slice() else {
+        panic!("expected only the Ollama credential");
+    };
+    assert_eq!(row.credential_id, OLLAMA_CREDENTIAL);
+    assert_eq!(row.credential_type, "apikey");
+    assert_eq!(row.state, "ready");
+    let credential = credentials.get_scoped(OLLAMA_CREDENTIAL, 0).await.unwrap();
+    assert_eq!(credential.payload.as_slice(), b"fixture-key");
+    assert_eq!(credential.record_version, row.record_version);
+}
+
+#[tokio::test]
 async fn lists_both_valid_logins_under_insula_families() {
     let (_home, credentials) = home_with(Some(&claude_file(FUTURE_MS)), Some(&grok_file("2100-01-01T00:00:00Z")));
 
@@ -130,6 +157,7 @@ fn home_with_grok_bot(body: &str) -> (TempDir, CliCredentials) {
     fs::write(home.path().join(".config/Grok Bot/sand-secrets.json"), body).unwrap();
     let credentials = CliCredentials {
         home: home.path().to_path_buf(),
+        ollama: OllamaPlugin::new(|| None),
     };
     (home, credentials)
 }

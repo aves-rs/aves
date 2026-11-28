@@ -21,6 +21,7 @@ use corv::{
 
 use super::messages::{SubscriptionRequest, SubscriptionRequestPayload, SubscriptionResponse};
 use super::plugins::CliCredentials;
+use super::types::SubscriptionError;
 
 /// Minimum gap between recorded allowance snapshots; quota-core observes every few seconds.
 const RECORD_INTERVAL: Duration = Duration::from_secs(300);
@@ -30,7 +31,12 @@ pub(super) struct Actor {
     receiver: mpsc::Receiver<SubscriptionRequest>,
     broadcast_tx: mpsc::Sender<SubscriptionResponse>,
     root_context: BusRpcContext,
-    running: Option<CancellationToken>,
+    running: Option<Observation>,
+}
+
+struct Observation {
+    registry: Arc<Registry>,
+    cancel: CancellationToken,
 }
 
 impl Actor {
@@ -58,6 +64,30 @@ impl Actor {
                 self.stop_server();
                 SubscriptionResponse::ServerStopped
             }
+            SubscriptionRequestPayload::UseSavedReset {
+                provider,
+                account,
+                request_id,
+                kind,
+            } => {
+                let Some(observation) = &self.running else {
+                    let _ = reply_to.send(Err(SubscriptionError::NotRunning));
+                    return;
+                };
+                let registry = Arc::clone(&observation.registry);
+                tokio::spawn(async move {
+                    let response = registry
+                        .use_saved_reset(&provider, &account, &request_id, kind.as_deref())
+                        .await
+                        .map(|(outcome, decided_at)| SubscriptionResponse::SavedResetUsed {
+                            outcome: outcome.into(),
+                            decided_at_ms: decided_at.timestamp_millis(),
+                        })
+                        .map_err(SubscriptionError::from);
+                    let _ = reply_to.send(response);
+                });
+                return;
+            }
         };
         let _ = reply_to.send(Ok(response.clone()));
         let _ = self.broadcast_tx.send(response).await;
@@ -69,24 +99,24 @@ impl Actor {
             return;
         }
         let cancel = CancellationToken::new();
-        observe(self.root_context.clone(), cancel.clone());
-        self.running = Some(cancel);
+        let credentials = home_dir().map(|home| Arc::new(CliCredentials::new(home)) as Arc<dyn CredentialSource>);
+        let registry = Arc::new(Registry::with_defaults(QuotaConfig::default(), credentials));
+        observe(Arc::clone(&registry), self.root_context.clone(), cancel.clone());
+        self.running = Some(Observation { registry, cancel });
     }
 
     fn stop_server(&mut self) {
-        if let Some(cancel) = self.running.take() {
-            cancel.cancel();
+        if let Some(observation) = self.running.take() {
+            observation.cancel.cancel();
         }
     }
 }
 
 /// Run the registry until `cancel` fires and forward each snapshot to Discuss.
-fn observe(context: BusRpcContext, cancel: CancellationToken) {
+fn observe(registry: Arc<Registry>, context: BusRpcContext, cancel: CancellationToken) {
     let (sender, mut receiver) = mpsc::channel::<Vec<ProviderUsage>>(DEFAULT_BUFFER_SIZE);
 
     tokio::spawn(async move {
-        let credentials = home_dir().map(|home| Arc::new(CliCredentials::new(home)) as Arc<dyn CredentialSource>);
-        let registry = Registry::with_defaults(QuotaConfig::default(), credentials);
         registry
             .refresh_loop_observed(cancel, move |entries| {
                 let _ = sender.try_send(entries);
@@ -127,7 +157,7 @@ fn projection(entry: &ProviderUsage) -> DiscussAllowanceProjection {
     DiscussAllowanceProjection {
         provider: entry.provider.clone(),
         display_provider: display_provider(&entry.provider).to_owned(),
-        api_provider: entry.api_provider.clone(),
+        api_provider: catalog_provider(&entry.provider, entry.api_provider.as_deref()).map(str::to_owned),
         account: entry.account.clone(),
         account_info: entry
             .account_info
@@ -172,6 +202,14 @@ fn projection(entry: &ProviderUsage) -> DiscussAllowanceProjection {
                     })
                     .collect(),
             }),
+    }
+}
+
+/// Cursor is the fallback observation source for the same Grok account in this domain.
+fn catalog_provider<'a>(source: &str, reported: Option<&'a str>) -> Option<&'a str> {
+    match source {
+        "grok" | "cursor" => Some("xai"),
+        _ => reported,
     }
 }
 
@@ -246,3 +284,6 @@ pub(super) async fn run_actor(mut actor: Actor) {
     }
     actor.stop_server();
 }
+
+#[cfg(test)]
+mod tests;

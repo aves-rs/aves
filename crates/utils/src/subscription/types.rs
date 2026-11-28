@@ -4,14 +4,67 @@ use aves::auth::AvesAuthError;
 use aves::bus::DispatchContextError;
 use aves::runtime::GeneratedCallError;
 use aves::utils::errors::SharedInfraError;
+use quota_core::codex_resets::{ConsumeOutcome, SavedResetError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use thiserror::Error;
 
+/// The provider's decision when asked to spend a saved reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SavedResetOutcome {
+    /// A saved reset was spent.
+    Reset,
+    /// The account had no usage eligible for a reset.
+    NothingToReset,
+    /// No saved reset was available.
+    NoCredit,
+    /// This request had already redeemed a reset.
+    AlreadyRedeemed,
+}
+
+impl From<ConsumeOutcome> for SavedResetOutcome {
+    fn from(outcome: ConsumeOutcome) -> Self {
+        match outcome {
+            ConsumeOutcome::Reset => Self::Reset,
+            ConsumeOutcome::NothingToReset => Self::NothingToReset,
+            ConsumeOutcome::NoCredit => Self::NoCredit,
+            ConsumeOutcome::AlreadyRedeemed => Self::AlreadyRedeemed,
+        }
+    }
+}
+
 /// Serializable errors at the Subscription domain boundary.
 #[derive(Error, Debug, Clone, Serialize, Deserialize, Type, JsonSchema)]
 pub enum SubscriptionError {
+    /// There is no running allowance observer.
+    #[error("Subscription observation is not running")]
+    NotRunning,
+    /// Insula cannot redeem a reset for this provider.
+    #[error("Provider does not support saved resets")]
+    ResetUnsupportedProvider,
+    /// The requested account isn't known to the live observer.
+    #[error("No observed account matches the saved-reset request")]
+    ResetUnknownAccount,
+    /// Insula refused another reset too soon after a prior redemption.
+    #[error("Account recently redeemed a saved reset")]
+    ResetRecentlyUsed { last_reset_at_ms: i64 },
+    /// The provider refused the reset request.
+    #[error("Provider refused the saved reset")]
+    ResetRefused,
+    /// Insula could not obtain a definitive provider response.
+    #[error("Saved-reset service is unavailable")]
+    ResetUnavailable,
+    /// The supplied reset request is not valid for the provider.
+    #[error("Invalid saved-reset request")]
+    ResetInvalidRequest,
+    /// The provider imposed its own cooldown.
+    #[error("Provider cooldown blocks the saved reset")]
+    ResetCooldown { retry_at_ms: Option<i64> },
+    /// The provider returned a bounded refusal result and optional reason code.
+    #[error("Provider declined the saved reset")]
+    ResetDeclined { result: String, reason: Option<String> },
     /// The bus rejected or could not route a request.
     #[error("Bus error")]
     Bus { message: String },
@@ -38,11 +91,39 @@ impl SubscriptionError {
     /// Stable low-cardinality RPC code.
     pub fn rpc_code(&self) -> &'static str {
         match self {
+            Self::NotRunning => "not_running",
+            Self::ResetUnsupportedProvider => "reset_unsupported_provider",
+            Self::ResetUnknownAccount => "reset_unknown_account",
+            Self::ResetRecentlyUsed { .. } => "reset_recently_used",
+            Self::ResetRefused => "reset_refused",
+            Self::ResetUnavailable => "reset_unavailable",
+            Self::ResetInvalidRequest => "reset_invalid_request",
+            Self::ResetCooldown { .. } => "reset_cooldown",
+            Self::ResetDeclined { .. } => "reset_declined",
             Self::Bus { .. } => "bus",
             Self::ChannelSend => "channel_send",
             Self::OneshotReply => "oneshot_reply",
             Self::Serialization { .. } => "serialization",
             Self::Infrastructure { .. } => "infrastructure",
+        }
+    }
+}
+
+impl From<SavedResetError> for SubscriptionError {
+    fn from(error: SavedResetError) -> Self {
+        match error {
+            SavedResetError::UnsupportedProvider => Self::ResetUnsupportedProvider,
+            SavedResetError::UnknownAccount => Self::ResetUnknownAccount,
+            SavedResetError::RecentlyReset(last_reset_at) => Self::ResetRecentlyUsed {
+                last_reset_at_ms: last_reset_at.timestamp_millis(),
+            },
+            SavedResetError::ProviderRefused(_) => Self::ResetRefused,
+            SavedResetError::ProviderUnavailable(_) => Self::ResetUnavailable,
+            SavedResetError::InvalidRequest(_) => Self::ResetInvalidRequest,
+            SavedResetError::ProviderCooldown(retry_at) => Self::ResetCooldown {
+                retry_at_ms: retry_at.map(|at| at.timestamp_millis()),
+            },
+            SavedResetError::ProviderDeclined { result, reason } => Self::ResetDeclined { result, reason },
         }
     }
 }

@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 use aves::bus::BusRpcContext;
 
 use super::domain::SubscriptionDomain;
-use super::types::SubscriptionError;
+use super::types::{SavedResetOutcome, SubscriptionError};
 
 /// Internal actor request and reply channel.
 pub(super) struct SubscriptionRequest {
@@ -14,7 +14,7 @@ pub(super) struct SubscriptionRequest {
     pub(super) reply_to: oneshot::Sender<Result<SubscriptionResponse, SubscriptionError>>,
 }
 
-/// Subscription lifecycle requests.
+/// Subscription lifecycle and allowance requests.
 #[aves::bus_requests(marker = SubscriptionDomain, context = BusRpcContext, root_error = SubscriptionError, domain_error = SubscriptionError)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SubscriptionRequestPayload {
@@ -24,6 +24,18 @@ pub enum SubscriptionRequestPayload {
     /// Stops provider allowance observation.
     #[operation(name = "stopServer", kind = "mutation", response = ServerStoppedOutput, response_variant = "ServerStopped")]
     StopServer,
+    /// Spend one saved reset on the specified observed account.
+    #[privileged(reason = "spends a saved provider reset on the user's account")]
+    UseSavedReset {
+        /// Insula provider identifier.
+        provider: String,
+        /// Account label from the allowance observation.
+        account: String,
+        /// Stable caller-supplied identity for this redemption attempt.
+        request_id: String,
+        /// Provider-defined reset kind, when required.
+        kind: Option<String>,
+    },
 }
 
 /// Results returned by Subscription requests.
@@ -34,6 +46,11 @@ pub enum SubscriptionResponse {
     ServerStarted,
     /// Allowance observation has stopped.
     ServerStopped,
+    /// Provider decision for the requested reset.
+    SavedResetUsed {
+        outcome: SavedResetOutcome,
+        decided_at_ms: i64,
+    },
 }
 
 /// Events broadcast by the Subscription domain.

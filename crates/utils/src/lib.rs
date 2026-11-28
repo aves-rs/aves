@@ -3,6 +3,6 @@
 mod subscription;
 
 pub use subscription::{
-    SubscriptionBroadcast, SubscriptionDomain, SubscriptionError, rpc_router,
-    subscription_operation_descriptors_with_root_error,
+    SavedResetOutcome, SavedResetUsedOutput, SubscriptionBroadcast, SubscriptionDomain, SubscriptionError,
+    SubscriptionSudoService, UseSavedResetInput, rpc_router, subscription_operation_descriptors_with_root_error,
 };

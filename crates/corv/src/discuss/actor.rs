@@ -1011,7 +1011,11 @@ impl Actor {
 
     /// Announces that custom agents, skills, teams or their installations changed.
     pub(super) async fn publish_catalog_changed(&self) {
-        if let Err(error) = self.broadcast_tx.send(DiscussResponse::CatalogChanged).await {
+        if let Err(error) = self
+            .broadcast_tx
+            .send(DiscussResponse::CatalogChanged)
+            .await
+        {
             tracing::warn!(target: "application_acp", ?error, "could not publish catalog change");
         }
     }

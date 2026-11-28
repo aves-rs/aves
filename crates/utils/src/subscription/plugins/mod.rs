@@ -74,7 +74,9 @@ impl CliCredentials {
     }
 
     fn plugins(&self) -> impl Iterator<Item = &dyn CredentialPlugin> {
-        PLUGINS.into_iter().chain(std::iter::once(&self.ollama as &dyn CredentialPlugin))
+        PLUGINS
+            .into_iter()
+            .chain(std::iter::once(&self.ollama as &dyn CredentialPlugin))
     }
 
     fn login(&self, credential_id: &str) -> Option<CliLogin> {
@@ -105,7 +107,8 @@ impl CredentialSource for CliCredentials {
     /// Every present login lists as `ready`, expired or not: insula skips `needs_reauth` rows entirely,
     /// whereas a ready row is fetched, refused locally by `get_scoped`, and published as `credential_unusable`.
     async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
-        let rows = self.plugins()
+        let rows = self
+            .plugins()
             .filter_map(|plugin| {
                 let login = plugin.login(&self.home)?;
                 Some(ScopedRowState {

@@ -5,7 +5,10 @@ use aves::runtime::{
 use aves::utils::errors::SharedInfraError;
 
 use super::handle::new as construct_subscription_domain;
-use super::messages::{SubscriptionBroadcast, SubscriptionRequest, SubscriptionRequestPayload, SubscriptionResponse};
+use super::messages::{
+    SavedResetUsedOutput, SubscriptionBroadcast, SubscriptionPrivilegedUseSavedReset, SubscriptionRequest,
+    SubscriptionRequestPayload, SubscriptionResponse, SubscriptionSudoServicePrivilegeMapping, UseSavedResetInput,
+};
 use super::types::SubscriptionError;
 
 /// Subscription lifecycle marker; runtime state belongs to the domain actor.
@@ -18,6 +21,10 @@ aves::domain! {
     error = SubscriptionError
     transport = SharedInfraError
     target = "subscription";
+
+    pub service SubscriptionSudoService {
+        UseSavedReset => SavedResetUsed,
+    }
 
     outbound SubscriptionResponse => SubscriptionBroadcast {
         SubscriptionResponse::ServerStarted => SubscriptionBroadcast::ServerStarted,
@@ -41,7 +48,8 @@ where
             SubscriptionBroadcast: Into<Root> + Clone + Send + 'static,
         {
             let root_context = facade.root_context().clone();
-            let handler = construct_subscription_domain(facade.bus_mut(), root_context);
+            let service = facade.publisher::<dyn SubscriptionSudoService>();
+            let handler = construct_subscription_domain(facade.bus_mut(), root_context, service);
             Box::pin(async move {
                 tokio::spawn(async move { handler.run().await });
             })

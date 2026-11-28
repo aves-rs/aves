@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use aves::auth::{AuthSudoService, Jwt};
 use aves::bus::{BusMcpEndpoint, BusRpcContext, BusSudoService};
+use aves::config::BootDirectories;
 use aves::flow::NodeExecutionId;
 use aves::runtime::ServiceReader;
 use aves::utils::buffers::DEFAULT_BUFFER_SIZE;
@@ -221,6 +222,7 @@ pub(super) struct Actor {
     accounting_cancel: Option<CancellationToken>,
     allowance: Option<AllowanceService>,
     pricing_task: Option<JoinHandle<()>>,
+    pub(super) directories: Option<ServiceReader<BootDirectories>>,
     accounting_retention_days: u32,
 }
 
@@ -403,6 +405,7 @@ impl Actor {
             accounting_cancel: None,
             allowance: None,
             pricing_task: None,
+            directories: None,
             accounting_retention_days,
         };
 
@@ -1032,6 +1035,10 @@ impl Actor {
                 self.persistence.clone(),
                 cancel.clone(),
                 self.price_index.clone(),
+                self.directories
+                    .as_ref()
+                    .and_then(ServiceReader::get)
+                    .map(|roots| roots.cache_dir.clone()),
             ));
             self.allowance = Some(spawn_allowance(self.persistence.clone()));
             self.accounting_cancel = Some(cancel);

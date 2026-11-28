@@ -3,7 +3,7 @@
 
 use aves::auth::AuthSudoService;
 use aves::bus::{BusRpcContext, BusSudoService, EventBus};
-use aves::config::{ConfigRegistrationSudoService, RegisterSectionInput, SectionRegistration};
+use aves::config::{BootDirectories, ConfigRegistrationSudoService, RegisterSectionInput, SectionRegistration};
 use aves::flow::NodeRegistrationSupply;
 use aves::runtime::{
     ConstructionFacade, DomainCallbacks, DomainDescriptorFactory, DomainFuture, ServicePublisher, ServiceReader,
@@ -42,6 +42,7 @@ pub struct DiscussDomain;
 pub(super) struct DiscussKernelServices {
     pub(super) root_context: BusRpcContext,
     pub(super) boot: DiscussBootOptions,
+    pub(super) directories: ServiceReader<BootDirectories>,
     pub(super) bus_service: ServiceReader<dyn BusSudoService>,
     pub(super) auth_service: ServiceReader<dyn AuthSudoService>,
     pub(super) streaming_service: ServicePublisher<dyn DiscussStreamingService>,
@@ -184,6 +185,7 @@ where
             let services = DiscussKernelServices {
                 root_context: facade.root_context().clone(),
                 boot,
+                directories: facade.reader(),
                 bus_service: facade.reader(),
                 auth_service: facade.reader(),
                 streaming_service: facade.publisher(),

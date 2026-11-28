@@ -777,6 +777,7 @@ async fn make_actor(
         accounting_cancel: None,
         allowance: None,
         pricing_task: None,
+        directories: None,
         accounting_retention_days: 0,
     }
 }
@@ -3613,6 +3614,7 @@ async fn make_migrated_actor(
         accounting_cancel: None,
         allowance: None,
         pricing_task: None,
+        directories: None,
         accounting_retention_days: 0,
     };
     (actor, temp_dir)

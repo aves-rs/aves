@@ -21,6 +21,7 @@ where
 {
     let DiscussKernelServices {
         boot,
+        directories,
         streaming_service,
         identity_service,
         provider_config_service,
@@ -55,7 +56,7 @@ where
 
     let (broadcast_tx, actor_broadcast_rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
 
-    let actor = Actor::new(
+    let mut actor = Actor::new(
         actor_tasks_rx,
         ActorInboundPorts {
             workspace_copy_source_rx,
@@ -67,6 +68,7 @@ where
         boot,
     )
     .await;
+    actor.directories = Some(directories);
     tokio::spawn(run_actor(actor));
 
     let _ = streaming_service.publish(streaming_service_impl);

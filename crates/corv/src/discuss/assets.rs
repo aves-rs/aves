@@ -1374,7 +1374,7 @@ fn collect_tree(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) 
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), DiscussError> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), DiscussError> {
     let parent = path
         .parent()
         .ok_or_else(|| import_error("write cache", "missing parent"))?;

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -11,6 +12,7 @@ use serde_json::value::RawValue;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::assets::atomic_write;
 use super::database::persist_models_catalog;
 use super::plugins::{
     BILLING_CACHED_READ, BILLING_CACHED_WRITE, BILLING_INPUT, BILLING_OUTPUT, BILLING_THOUGHT, BILLING_TOTAL,
@@ -403,8 +405,14 @@ fn charge(tokens: u64, rate: &Price) -> Option<Decimal> {
 }
 
 /// Start the catalog service; the shared index remains empty until a catalog loads.
-pub(super) fn spawn(persistence: DiscussPersistence, cancel: CancellationToken, index: PriceIndex) -> JoinHandle<()> {
+pub(super) fn spawn(
+    persistence: DiscussPersistence,
+    cancel: CancellationToken,
+    index: PriceIndex,
+    cache_root: Option<PathBuf>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let cache_file = cache_root.map(|root| root.join("models.dev/catalog.json"));
         let mut persisted = match persistence.acquire_connection().await {
             Ok(conn) => match load_models_catalog(&conn).await {
                 Ok(value) => value,
@@ -420,7 +428,10 @@ pub(super) fn spawn(persistence: DiscussPersistence, cancel: CancellationToken, 
         };
         if let Some(row) = &persisted {
             match parse_catalog(&row.body) {
-                Ok(catalog) => set_index(&index, catalog, row.fetched_at_ms),
+                Ok(catalog) => {
+                    set_index(&index, catalog, row.fetched_at_ms);
+                    publish_catalog(cache_file.as_deref(), &row.body).await;
+                }
                 Err(error) => {
                     tracing::warn!(?error, "Invalid stored models catalog");
                     persisted = None;
@@ -441,7 +452,7 @@ pub(super) fn spawn(persistence: DiscussPersistence, cancel: CancellationToken, 
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = refresh(&client, &persistence, &index, &mut persisted) => {}
+                _ = refresh(&client, &persistence, &index, &mut persisted, cache_file.as_deref()) => {}
             }
             tokio::select! { _ = cancel.cancelled() => break, _ = tokio::time::sleep(DAY) => {} }
         }
@@ -453,6 +464,7 @@ async fn refresh(
     persistence: &DiscussPersistence,
     index: &PriceIndex,
     row: &mut Option<DiscussModelsCatalog>,
+    cache_file: Option<&Path>,
 ) {
     let metadata = row
         .as_ref()
@@ -519,7 +531,7 @@ async fn refresh(
             }
         }
     }
-    save_download(persistence, index, row, body, validators).await;
+    save_download(persistence, index, row, body, validators, cache_file).await;
 }
 
 async fn save_download(
@@ -528,6 +540,7 @@ async fn save_download(
     row: &mut Option<DiscussModelsCatalog>,
     body: Vec<u8>,
     validators: CacheValidators,
+    cache_file: Option<&Path>,
 ) {
     let (Ok(body), Ok(metadata_json)) = (String::from_utf8(body), serde_json::to_string(&validators)) else {
         tracing::warn!("Could not encode models catalog");
@@ -548,14 +561,43 @@ async fn save_download(
     match persist_models_catalog(persistence, &updated).await {
         Ok(()) => {
             set_index(index, catalog, updated.fetched_at_ms);
+            publish_catalog(cache_file, &updated.body).await;
             *row = Some(updated);
         }
         Err(error) => tracing::warn!(?error, "Could not persist models catalog"),
     }
 }
 
+/// Publish a disposable copy without coupling it to accounting persistence.
+async fn publish_catalog(path: Option<&Path>, body: &str) {
+    let Some(path) = path else { return };
+    let (path, body) = (path.to_owned(), body.as_bytes().to_vec());
+    match tokio::task::spawn_blocking(move || atomic_write(&path, &body)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(?error, "Could not write models catalog cache"),
+        Err(error) => tracing::warn!(?error, "Models catalog cache writer stopped"),
+    }
+}
+
 fn set_index(index: &PriceIndex, catalog: Catalog, fetched_at_ms: i64) {
     if let Ok(mut guard) = index.0.write() {
         *guard = Some(Arc::new(PriceCatalog { catalog, fetched_at_ms }));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::publish_catalog;
+
+    #[tokio::test]
+    async fn catalog_copy_is_created_and_replaced_with_raw_json() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("models.dev/catalog.json");
+        let first = r#"{"openai":{"models":{}}}"#;
+        let second = r#"{"anthropic":{"models":{}}}"#;
+        publish_catalog(Some(&file), first).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
+        publish_catalog(Some(&file), second).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), second);
     }
 }

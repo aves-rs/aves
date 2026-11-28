@@ -127,6 +127,8 @@ aves::domain! {
         DiscussResponse::ServerStarted => DiscussBroadcast::ServerStarted,
         DiscussResponse::ServerStopped => DiscussBroadcast::ServerStopped,
         DiscussResponse::ProviderRuntimeChanged { state } => DiscussBroadcast::ProviderRuntimeChanged { state },
+        DiscussResponse::ProviderRemoved { provider_name } => DiscussBroadcast::ProviderRemoved { provider_name },
+        DiscussResponse::CatalogChanged => DiscussBroadcast::CatalogChanged,
     }
 }
 

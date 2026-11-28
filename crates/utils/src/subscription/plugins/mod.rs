@@ -1,12 +1,13 @@
 //! Credential plugin boundary for allowance observation.
 //!
-//! Each plugin reads one login file and serves it to insula under that
+//! Each plugin reads a local CLI credential and serves it to insula under that
 //! provider's vault credential id. Tokens are never refreshed or written back; an
 //! expired login stays unusable until its CLI refreshes it.
 
 mod claude;
 mod cursor;
 mod grok;
+mod ollama;
 
 #[cfg(test)]
 mod tests;
@@ -22,6 +23,7 @@ use aves::utils::time::now_ms;
 use claude::PLUGIN as CLAUDE_PLUGIN;
 use cursor::PLUGIN as CURSOR_PLUGIN;
 use grok::PLUGIN as GROK_PLUGIN;
+use ollama::OllamaPlugin;
 
 const PLUGINS: [&dyn CredentialPlugin; 3] = [&CLAUDE_PLUGIN, &GROK_PLUGIN, &CURSOR_PLUGIN];
 
@@ -30,7 +32,12 @@ trait CredentialPlugin: Sync {
     /// insula vault credential id this login is served under.
     fn credential_id(&self) -> &'static str;
 
-    /// Read the login under `home`; absent or malformed files yield `None`.
+    /// Insula's credential kind for this plugin's scoped row.
+    fn credential_type(&self) -> &'static str {
+        "oauth"
+    }
+
+    /// Read the CLI login; absent or malformed credentials yield `None`.
     fn login(&self, home: &Path) -> Option<CliLogin>;
 }
 
@@ -55,16 +62,25 @@ impl CliLogin {
 /// Read-only credential source over every plugin's CLI login.
 pub(super) struct CliCredentials {
     home: PathBuf,
+    ollama: OllamaPlugin,
 }
 
 impl CliCredentials {
     pub(super) fn new(home: PathBuf) -> Self {
-        Self { home }
+        Self {
+            home,
+            ollama: OllamaPlugin::new(ollama::read_login),
+        }
+    }
+
+    fn plugins(&self) -> impl Iterator<Item = &dyn CredentialPlugin> {
+        PLUGINS
+            .into_iter()
+            .chain(std::iter::once(&self.ollama as &dyn CredentialPlugin))
     }
 
     fn login(&self, credential_id: &str) -> Option<CliLogin> {
-        PLUGINS
-            .iter()
+        self.plugins()
             .find(|plugin| plugin.credential_id() == credential_id)?
             .login(&self.home)
     }
@@ -91,13 +107,13 @@ impl CredentialSource for CliCredentials {
     /// Every present login lists as `ready`, expired or not: insula skips `needs_reauth` rows entirely,
     /// whereas a ready row is fetched, refused locally by `get_scoped`, and published as `credential_unusable`.
     async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
-        let rows = PLUGINS
-            .iter()
+        let rows = self
+            .plugins()
             .filter_map(|plugin| {
                 let login = plugin.login(&self.home)?;
                 Some(ScopedRowState {
                     credential_id: plugin.credential_id().to_owned(),
-                    credential_type: "oauth".to_owned(),
+                    credential_type: plugin.credential_type().to_owned(),
                     record_version: login.record_version,
                     state: "ready".to_owned(),
                     account_id: login.account_id,

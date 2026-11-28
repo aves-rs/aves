@@ -867,6 +867,14 @@ pub enum DiscussResponse {
     #[serde(skip)]
     ProviderRuntimeChanged { state: ProviderRuntimeState },
 
+    /// Internal broadcast: a Provider was removed and has no runtime projection any more.
+    #[serde(skip)]
+    ProviderRemoved { provider_name: String },
+
+    /// Internal broadcast: custom agents, skills, teams or their installations changed.
+    #[serde(skip)]
+    CatalogChanged,
+
     /// Database-backed provider menu and user defaults for one provider.
     ProviderConfig {
         config: DiscussProviderConfig,
@@ -1048,4 +1056,8 @@ pub enum DiscussBroadcast {
     },
     /// One Provider runtime lifecycle projection changed.
     ProviderRuntimeChanged { state: ProviderRuntimeState },
+    /// A Provider was removed; it no longer appears in `listProviders`.
+    ProviderRemoved { provider_name: String },
+    /// Custom agents, skills, teams or their installations changed.
+    CatalogChanged,
 }
